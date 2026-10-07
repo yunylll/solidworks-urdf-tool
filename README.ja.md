@@ -140,4 +140,4 @@ print(result["bridge"]["urdf"])
 
 ## ライセンス
 
-MIT。[LICENSE](LICENSE) を参照してください（上流の ros/solidworks_urdf_exporter のライセンスも併記しています）。
+MIT。[LICENSE](LICENSE) を参照してください（上流の ros/solidworks_urdf_exporter のライセンスは [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) にあります）。

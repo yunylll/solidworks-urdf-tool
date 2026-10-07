@@ -140,4 +140,4 @@ A previously downloaded `solidworks_urdf_exporter2` is kept in `vendor` for refe
 
 ## License
 
-MIT — see [LICENSE](LICENSE), which also reproduces the upstream ros/solidworks_urdf_exporter license.
+MIT — see [LICENSE](LICENSE); the upstream ros/solidworks_urdf_exporter license is in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).

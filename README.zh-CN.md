@@ -140,4 +140,4 @@ Codex 客户端需要重新加载 MCP 配置后才会把新服务加入当前工
 
 ## 许可证
 
-MIT，见 [LICENSE](LICENSE)；其中同时附有上游 ros/solidworks_urdf_exporter 的许可证。
+MIT，见 [LICENSE](LICENSE)；上游 ros/solidworks_urdf_exporter 的许可证见 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)。
