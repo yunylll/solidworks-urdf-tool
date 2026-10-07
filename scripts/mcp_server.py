@@ -1,6 +1,7 @@
 """Local stdio MCP interface to the actual installed SW2URDF export code."""
 from mcp.server import MCPServer
 import asyncio
+import functools
 import json
 import os
 import time
@@ -20,8 +21,8 @@ POLL_SECONDS = 3
 server = MCPServer("solidworks-urdf-2026", version="2.0.0", instructions="Use inspect_model_configuration to inspect CAD and obtain an editable Link/Joint JSON config. Exports run in private SolidWorks 2026 sessions using protected snapshots. Never infer successful export from a job_id: poll get_export_job until terminal and check passed. If a blocking tool returns still_running=true, keep polling get_export_job with its job_id. Prefer start_urdf_export for long models. CAD operations are queued and run one at a time. Source CAD is never intentionally saved. Joint intent and limits must be supplied or reviewed; do not invent them.")
 
 
-async def run_and_wait(operation, model_path, package_name="robot_description", config_path=None, reference_urdf=None, timeout_seconds=900):
-    started = await asyncio.to_thread(start_job, operation, model_path, package_name, config_path, reference_urdf, timeout_seconds)
+async def run_and_wait(operation, model_path, package_name="robot_description", *, config_path=None, reference_urdf=None, timeout_seconds=900):
+    started = await asyncio.to_thread(functools.partial(start_job, operation, model_path, package_name, config_path=config_path, reference_urdf=reference_urdf, timeout_seconds=timeout_seconds))
     deadline = time.monotonic() + SYNC_WAIT_SECONDS
     while True:
         state = await asyncio.to_thread(get_job, started["job_id"])
@@ -49,7 +50,7 @@ async def export_urdf(model_path: str, package_name: str = "robot_description", 
     Returns validation, source hashes, settings recovery and a persistent job_id.
     If the job outlasts the tool call, returns still_running=true; poll get_export_job.
     """
-    return await run_and_wait("export", model_path, package_name, config_path, reference_urdf, timeout_seconds)
+    return await run_and_wait("export", model_path, package_name, config_path=config_path, reference_urdf=reference_urdf, timeout_seconds=timeout_seconds)
 
 
 @server.tool(structured_output=True)
@@ -67,7 +68,7 @@ async def prepare_model(model_path: str, timeout_seconds: int = 900) -> dict[str
 @server.tool(structured_output=True)
 async def start_urdf_export(model_path: str, package_name: str = "robot_description", config_path: str | None = None, reference_urdf: str | None = None, timeout_seconds: int = 900) -> dict[str, Any]:
     """Start a long export and return a job_id immediately. Poll get_export_job for progress."""
-    return await asyncio.to_thread(start_job, "export", model_path, package_name, config_path, reference_urdf, timeout_seconds)
+    return await asyncio.to_thread(functools.partial(start_job, "export", model_path, package_name, config_path=config_path, reference_urdf=reference_urdf, timeout_seconds=timeout_seconds))
 
 
 @server.tool(structured_output=True)

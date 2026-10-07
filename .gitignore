@@ -13,7 +13,6 @@ validation/nested-fixture/
 
 # Unused reference clone; the build uses the pinned submodule only.
 vendor/solidworks_urdf_exporter2/
-# Raw run logs (large, machine-specific); reports and JSON summaries are tracked.
 validation/*.log
 *.tmp
 
@@ -23,3 +22,4 @@ validation/*
 !validation/TOOL_REPORT.md
 examples/robot-configuration-template.json
 mcp-connection.json
+validation/pending-preference-restore/

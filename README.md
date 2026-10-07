@@ -90,6 +90,8 @@ sys.path.insert(0, r"C:\path\to\solidworks-urdf-tool\scripts")
 from tool_service import inspect_model, export_urdf, start_export, get_job
 
 result = export_urdf(r"C:\path\robot.SLDASM", "robot_description")
+# config_path / reference_urdf / timeout_seconds 只能按关键字传入
+result = export_urdf(r"C:\path\robot.SLDASM", "robot_description", config_path=r"C:\path\robot-config.json")
 assert result["passed"], result.get("error")
 print(result["bridge"]["urdf"])
 ```
@@ -110,7 +112,9 @@ Codex 客户端需要重新加载 MCP 配置后才会把新服务加入当前工
 
 对于已保存且正在打开的装配体，可用只读活动模型清单识别旧配置/导入缓存留下的失效路径。此路径只有在快照的配置名、组件数和原生质量与清单一致，且实际组件完整加载时才接受。未保存的活动模型会被拒绝，需用户明确保存后再导出。
 
-操作串行执行，避免多个导出相互覆盖全局 STL 设置：后到的任务保持 queued（result.json 中 queue=waiting_for_cad_lock）最多 3600 秒，超时返回 CAD_BUSY；不保证先到先得。执行进程会登记 PID 与启动时间，进程消失或 120 秒内未登记的任务由 get_export_job 标记为 interrupted。任务超时会返回失败并核对 PID+启动时间后清理独立会话；强制中断无法保证仍执行所有恢复逻辑，因此不能把 timed_out/interrupted 的输出用于正式模型。
+操作串行执行，避免多个导出相互覆盖全局 STL 设置：后到的任务保持 queued（result.json 中 queue=waiting_for_cad_lock）最多 3600 秒，超时返回 CAD_BUSY；不保证先到先得。执行进程会登记 PID 与启动时间，进程消失或 120 秒内未登记的任务由 get_export_job 标记为 interrupted。任务超时会返回失败并核对 PID+启动时间后清理独立会话；不能把 timed_out/interrupted 的输出用于正式模型。
+
+私有会话与本机 SolidWorks 共用用户设置。原生核心启动后立即把 STL 相关设置保存到 output/preferences-snapshot.json；任务超时或失败而未确认恢复时，工具会另起私有会话把设置恢复为该快照，结果写入 result.json 的 preference_restore（changed_keys 为实际改回的项）。worker 意外退出的任务由 get_export_job 标记为待恢复，在下一个 CAD 任务开始前执行。
 
 当前输出是原项目传统 ROS URDF 包。ROS 2 启动脚本、MJCF/USD、自动建模和全自动关节推断不属于本版本功能。模型仍应在实际目标仿真环境验证。
 

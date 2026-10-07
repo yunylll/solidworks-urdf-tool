@@ -88,6 +88,33 @@ class JobChecks(unittest.TestCase):
         write_json(directory / "worker.json", identity)
         self.assertEqual(get_job(identifier)["status"], "interrupted")
 
+    def test_preference_restore_decision(self):
+        _, directory = self.fake_job(5)
+        needed = tool_service.preference_restore_needed
+        self.assertFalse(needed(directory, {}), "no snapshot means nothing was changed")
+        write_json(directory / "output" / "preferences-snapshot.json", {})
+        self.assertTrue(needed(directory, {}), "killed run without a report")
+        self.assertFalse(needed(directory, {"bridge": {"status": "failed"}}), "failed before preferences were touched")
+        self.assertTrue(needed(directory, {"bridge": {"preferencesBefore": {}, "preferencesRestored": False}}))
+        self.assertFalse(needed(directory, {"bridge": {"preferencesBefore": {}, "preferencesRestored": True}}))
+
+    def test_interrupted_job_queues_restore(self):
+        identifier, directory = self.fake_job(tool_service.WORKER_START_GRACE_SECONDS + 30)
+        write_json(directory / "output" / "preferences-snapshot.json", {})
+        marker = tool_service.PENDING_RESTORES / f"{identifier}.json"
+        try:
+            state = get_job(identifier)
+            self.assertTrue(state["preference_restore"]["pending"])
+            self.assertTrue(marker.is_file())
+        finally:
+            marker.unlink(missing_ok=True)
+
+    def test_optional_paths_are_keyword_only(self):
+        with self.assertRaises(TypeError):
+            tool_service.export_urdf("robot.SLDASM", "robot_description", "config.json")
+        with self.assertRaises(TypeError):
+            tool_service.start_export("robot.SLDASM", "robot_description", "config.json")
+
     def test_live_worker_kept(self):
         identifier, directory = self.fake_job(5)
         write_json(directory / "worker.json", process_identity(tool_service.os.getpid()))

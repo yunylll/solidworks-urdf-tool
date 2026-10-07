@@ -23,6 +23,7 @@ WORKSPACE = Path(__file__).resolve().parent.parent
 JOBS = WORKSPACE / "validation" / "jobs"
 NATIVE = WORKSPACE / "build" / "bin" / "SolidWorksUrdf.exe"
 PROBE = WORKSPACE / "build" / "bin" / "SolidWorksProbe.exe"
+PENDING_RESTORES = WORKSPACE / "validation" / "pending-preference-restore"
 TERMINAL = {"succeeded", "failed", "timed_out", "interrupted", "rejected"}
 # Jobs wait this long in "queued" for an earlier CAD operation to finish.
 QUEUE_WAIT_SECONDS = 3600
@@ -102,7 +103,7 @@ def native_lock(wait_seconds=QUEUE_WAIT_SECONDS, on_wait=None):
             msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
 
 
-def create_job(operation, model_path, package_name="robot_description", config_path=None, reference_urdf=None, timeout_seconds=900):
+def create_job(operation, model_path, package_name="robot_description", *, config_path=None, reference_urdf=None, timeout_seconds=900):
     source = Path(model_path).expanduser().resolve()
     if not source.is_file() or source.suffix.lower() not in {".sldasm", ".sldprt"}:
         raise ValueError("model_path must be an existing .SLDASM or .SLDPRT.")
@@ -134,13 +135,57 @@ def create_job(operation, model_path, package_name="robot_description", config_p
     return identifier
 
 
-def cleanup_private_session(directory):
-    manifest = directory / "output" / "session.json"
+def cleanup_private_session(directory, output_name="output"):
+    manifest = directory / output_name / "session.json"
     if not manifest.is_file():
         return {"passed": True, "message": "No private session was created."}
     result = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(WORKSPACE / "scripts" / "cleanup-test-session.ps1"), "-Manifest", str(manifest)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
-    (directory / "cleanup.log").write_text(result.stdout + result.stderr, encoding="utf-8")
+    (directory / output_name / "cleanup.log").write_text(result.stdout + result.stderr, encoding="utf-8")
     return {"passed": result.returncode == 0, "message": result.stdout.strip(), "error": result.stderr.strip() or None}
+
+
+def preference_restore_needed(directory, record):
+    """A run changed nothing until it saved a snapshot; after that only a confirmed restore counts."""
+    if not (directory / "output" / "preferences-snapshot.json").is_file():
+        return False
+    bridge = record.get("bridge")
+    return bridge is None or ("preferencesBefore" in bridge and bridge.get("preferencesRestored") is not True)
+
+
+def restore_preferences(directory):
+    """Reset the user's STL export preferences to a job's startup snapshot. Caller holds the CAD lock."""
+    output = directory / "preference-restore"
+    output.mkdir(exist_ok=True)
+    request = directory / "restore-request.json"
+    write_json(request, {"operation": "restore_preferences", "preferences_path": str(directory / "output" / "preferences-snapshot.json"), "output_dir": str(output)})
+    try:
+        code = subprocess.run([str(NATIVE), str(request)], cwd=WORKSPACE, capture_output=True, timeout=300, creationflags=subprocess.CREATE_NO_WINDOW).returncode
+    except subprocess.TimeoutExpired:
+        code = None
+    cleanup = cleanup_private_session(directory, "preference-restore")
+    report_path = output / "restore-result.json"
+    report = json.loads(report_path.read_text(encoding="utf-8-sig")) if report_path.is_file() else {}
+    passed = code == 0 and report.get("preferencesRestored") is True and cleanup["passed"]
+    return {"passed": passed, "changed_keys": report.get("changedKeys"), "error": None if passed else (report.get("error") or "Restore session failed; see preference-restore/."), "session_cleanup": cleanup, "finished_at": stamp()}
+
+
+def mark_preference_restore(identifier):
+    PENDING_RESTORES.mkdir(parents=True, exist_ok=True)
+    (PENDING_RESTORES / f"{identifier}.json").write_text(json.dumps({"job_id": identifier, "marked_at": stamp()}), encoding="utf-8")
+
+
+def process_pending_restores():
+    """Restore preferences left by interrupted jobs, once each. Caller holds the CAD lock."""
+    if not PENDING_RESTORES.is_dir():
+        return
+    for marker in sorted(PENDING_RESTORES.glob("*.json")):
+        directory = JOBS / marker.stem
+        if (directory / "result.json").is_file():
+            outcome = restore_preferences(directory)
+            result = json.loads((directory / "result.json").read_text(encoding="utf-8"))
+            result["preference_restore"] = outcome
+            write_json(directory / "result.json", result)
+        marker.unlink(missing_ok=True)
 
 
 def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
@@ -166,6 +211,7 @@ def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
             record.pop("queue", None)
             record.update(status="running", started_at=stamp())
             write_json(directory / "result.json", record)
+            process_pending_restores()
             request_path = directory / "request.json"
             request_data = json.loads(request_path.read_text(encoding="utf-8"))
             reusable = Path(request_data["model_path"]).parent / "solidworks-urdf-snapshot.json"
@@ -257,6 +303,11 @@ def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
                     write_json(prepared.parent / "solidworks-urdf-snapshot.json", snapshot)
             elif record["status"] != "timed_out":
                 record.update(status="failed", error={"code": "NATIVE_NO_REPORT", "message": "Native tool produced no result; see stderr.log."})
+            # A killed or failed run may leave the user's shared STL preferences changed.
+            if preference_restore_needed(directory, record):
+                record["preference_restore"] = {"passed": False, "running": True}
+                write_json(directory / "result.json", record)
+                record["preference_restore"] = restore_preferences(directory)
     except Exception as exc:
         if process is not None and process.poll() is None:
             process.kill()
@@ -265,6 +316,9 @@ def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
             record["session_cleanup"] = cleanup_private_session(directory)
         except Exception as cleanup_error:
             record["cleanup_error"] = str(cleanup_error)
+        if record.get("preference_restore", {}).get("passed") is not True and preference_restore_needed(directory, record):
+            mark_preference_restore(identifier)
+            record["preference_restore"] = {"passed": False, "pending": True, "message": "Will be restored before the next CAD job starts."}
         record.pop("queue", None)
         record.update(status="failed", passed=False, error={"code": "CAD_BUSY" if isinstance(exc, CadBusyError) else "TOOL_ERROR", "message": str(exc)})
     finally:
@@ -303,6 +357,9 @@ def get_job(identifier):
                 result.pop("queue", None)
                 result.update(status="interrupted", passed=False, finished_at=stamp(), error={"code": "WORKER_INTERRUPTED", "message": "The worker exited (or never started) before producing a terminal result. Create a new job to retry."})
                 result["session_cleanup"] = cleanup_private_session(directory)
+                if preference_restore_needed(directory, result):
+                    mark_preference_restore(identifier)
+                    result["preference_restore"] = {"passed": False, "pending": True, "message": "Will be restored before the next CAD job starts."}
                 write_json(directory / "result.json", result)
     log = directory / "stderr.log"
     if log.is_file():
@@ -310,29 +367,31 @@ def get_job(identifier):
     return result
 
 
-def operation(operation_name, model_path, package_name="robot_description", config_path=None, reference_urdf=None, timeout_seconds=900):
-    return run_job(create_job(operation_name, model_path, package_name, config_path, reference_urdf, timeout_seconds))
+# Optional settings are keyword-only: config_path and reference_urdf are both
+# path strings, so positional calls could silently swap them.
+def operation(operation_name, model_path, package_name="robot_description", *, config_path=None, reference_urdf=None, timeout_seconds=900):
+    return run_job(create_job(operation_name, model_path, package_name, config_path=config_path, reference_urdf=reference_urdf, timeout_seconds=timeout_seconds))
 
 
-def export_urdf(model_path, package_name="robot_description", reference_urdf=None, config_path=None, timeout_seconds=900):
-    return operation("export", model_path, package_name, config_path, reference_urdf, timeout_seconds)
+def export_urdf(model_path, package_name="robot_description", *, config_path=None, reference_urdf=None, timeout_seconds=900):
+    return operation("export", model_path, package_name, config_path=config_path, reference_urdf=reference_urdf, timeout_seconds=timeout_seconds)
 
 
-def inspect_model(model_path, timeout_seconds=900):
+def inspect_model(model_path, *, timeout_seconds=900):
     return operation("inspect", model_path, timeout_seconds=timeout_seconds)
 
 
-def prepare_model(model_path, timeout_seconds=900):
+def prepare_model(model_path, *, timeout_seconds=900):
     return operation("prepare", model_path, timeout_seconds=timeout_seconds)
 
 
-def start_export(model_path, package_name="robot_description", config_path=None, reference_urdf=None, timeout_seconds=900):
-    return start_job("export", model_path, package_name, config_path, reference_urdf, timeout_seconds)
+def start_export(model_path, package_name="robot_description", *, config_path=None, reference_urdf=None, timeout_seconds=900):
+    return start_job("export", model_path, package_name, config_path=config_path, reference_urdf=reference_urdf, timeout_seconds=timeout_seconds)
 
 
-def start_job(operation_name, model_path, package_name="robot_description", config_path=None, reference_urdf=None, timeout_seconds=900):
+def start_job(operation_name, model_path, package_name="robot_description", *, config_path=None, reference_urdf=None, timeout_seconds=900):
     """Run any CAD operation in a detached worker and return its job_id at once."""
-    identifier = create_job(operation_name, model_path, package_name, config_path, reference_urdf, timeout_seconds)
+    identifier = create_job(operation_name, model_path, package_name, config_path=config_path, reference_urdf=reference_urdf, timeout_seconds=timeout_seconds)
     process = subprocess.Popen([sys.executable, str(WORKSPACE / "scripts" / "tool_cli.py"), "worker", identifier], cwd=WORKSPACE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
     identity = process_identity(process.pid)
     if identity:

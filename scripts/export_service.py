@@ -26,6 +26,6 @@ if __name__ == "__main__":
     parser.add_argument("--reference")
     parser.add_argument("--config")
     args = parser.parse_args()
-    result = export_urdf(args.model, args.package, args.reference, args.config)
+    result = export_urdf(args.model, args.package, reference_urdf=args.reference, config_path=args.config)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     raise SystemExit(0 if result["passed"] else 1)

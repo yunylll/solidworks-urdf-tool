@@ -25,9 +25,9 @@ def main():
     arguments = parser.parse_args()
     try:
         if arguments.command == "inspect":
-            result = inspect_model(arguments.model, arguments.timeout)
+            result = inspect_model(arguments.model, timeout_seconds=arguments.timeout)
         elif arguments.command == "prepare":
-            result = prepare_model(arguments.model, arguments.timeout)
+            result = prepare_model(arguments.model, timeout_seconds=arguments.timeout)
         elif arguments.command in {"export", "start-export"}:
             fn = export_urdf if arguments.command == "export" else start_export
             result = fn(arguments.model, arguments.package, reference_urdf=arguments.reference, config_path=arguments.config, timeout_seconds=arguments.timeout)

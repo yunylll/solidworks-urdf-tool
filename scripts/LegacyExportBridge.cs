@@ -68,16 +68,40 @@ public static partial class LegacyExportBridge
             if (context != null) Marshal.ReleaseComObject(context);
         }
     }
+    private static readonly string[] TogglePreferences = { "swSTLBinaryFormat", "swSTLDontTranslateToPositive", "swSTLShowInfoOnSave", "swSTLPreview", "swSTLComponentsIntoOneFile" };
+    private static readonly string[] IntegerPreferences = { "swExportStlUnits", "swSTLQuality" };
+    private static readonly string[] DoublePreferences = { "swViewTransitionHideShowComponent", "swSTLDeviation", "swSTLAngleTolerance" };
+
     private static Dictionary<string, object> Snapshot(ISldWorks app)
     {
         var values = new Dictionary<string, object>();
-        foreach (string name in new[] { "swSTLBinaryFormat", "swSTLDontTranslateToPositive", "swSTLShowInfoOnSave", "swSTLPreview", "swSTLComponentsIntoOneFile" })
+        foreach (string name in TogglePreferences)
             values[name] = app.GetUserPreferenceToggle((int)Enum.Parse(typeof(swUserPreferenceToggle_e), name));
-        foreach (string name in new[] { "swExportStlUnits", "swSTLQuality" })
+        foreach (string name in IntegerPreferences)
             values[name] = app.GetUserPreferenceIntegerValue((int)Enum.Parse(typeof(swUserPreferenceIntegerValue_e), name));
-        foreach (string name in new[] { "swViewTransitionHideShowComponent", "swSTLDeviation", "swSTLAngleTolerance" })
+        foreach (string name in DoublePreferences)
             values[name] = app.GetUserPreferenceDoubleValue((int)Enum.Parse(typeof(swUserPreferenceDoubleValue_e), name));
         return values;
+    }
+
+    // JSON round trips turn numbers into int/decimal; restore the API value types.
+    private static Dictionary<string, object> NormalizePreferences(Dictionary<string, object> raw)
+    {
+        var values = new Dictionary<string, object>();
+        foreach (string name in TogglePreferences) values[name] = Convert.ToBoolean(raw[name]);
+        foreach (string name in IntegerPreferences) values[name] = Convert.ToInt32(raw[name]);
+        foreach (string name in DoublePreferences) values[name] = Convert.ToDouble(raw[name], System.Globalization.CultureInfo.InvariantCulture);
+        return values;
+    }
+
+    private static bool SamePreference(object expected, object actual)
+    {
+        if (expected is double && actual is double)
+        {
+            double a = (double)expected, b = (double)actual;
+            return Math.Abs(a - b) <= 1e-12 * Math.Max(1.0, Math.Max(Math.Abs(a), Math.Abs(b)));
+        }
+        return object.Equals(expected, actual);
     }
 
     private static void Restore(ISldWorks app, Dictionary<string, object> values)
@@ -112,6 +136,105 @@ public static partial class LegacyExportBridge
         log4net.Config.BasicConfigurator.Configure(appender);
     }
 
+    // Starts a hidden SolidWorks owned by this run and records it for PID+start-time cleanup.
+    private static SldWorks StartPrivateSession(string output, string workingDirectory, Dictionary<string, object> report, out Process privateProcess)
+    {
+        privateProcess = null;
+        string swFolder = Microsoft.Win32.Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\SolidWorks\SOLIDWORKS 2026\Setup", "SolidWorks Folder", null) as string;
+        if (string.IsNullOrEmpty(swFolder)) throw new InvalidOperationException("SolidWorks 2026 installation was not found.");
+        var startInfo = new ProcessStartInfo(Path.Combine(swFolder, "SLDWORKS.exe"), "/r") {
+            UseShellExecute = false, WindowStyle = ProcessWindowStyle.Hidden,
+            WorkingDirectory = workingDirectory
+        };
+        // Any auto-loaded legacy add-in must write its logs inside this run.
+        string root = Path.GetPathRoot(output);
+        startInfo.EnvironmentVariables["HOMEDRIVE"] = root.TrimEnd('\\');
+        startInfo.EnvironmentVariables["HOMEPATH"] = output.Substring(root.Length - 1);
+        privateProcess = Process.Start(startInfo);
+        int pid = privateProcess.Id;
+        report["solidworksPid"] = pid;
+        File.WriteAllText(Path.Combine(output, "session.json"), new JavaScriptSerializer().Serialize(new { pid = pid, started = privateProcess.StartTime.ToString("o") }));
+        SldWorks app = null;
+        var startup = Stopwatch.StartNew();
+        while (app == null && startup.Elapsed.TotalSeconds < 120)
+        {
+            if (privateProcess.HasExited) throw new InvalidOperationException("Private SolidWorks exited during startup.");
+            try { app = FindSession(pid); }
+            catch (InvalidCastException) { app = null; } // ROT may appear before COM is ready.
+            catch (COMException e)
+            {
+                if (e.ErrorCode != unchecked((int)0x80010114) && e.ErrorCode != unchecked((int)0x800401E3)) throw;
+                app = null;
+            }
+            if (app == null) Thread.Sleep(500);
+        }
+        if (app == null) throw new TimeoutException("Private SolidWorks did not register its COM session within 120 seconds.");
+        if (app.GetProcessID() != pid) throw new InvalidOperationException("SolidWorks session PID mismatch.");
+        return app;
+    }
+
+    private static void RequireSolidWorks2026(SldWorks app, Dictionary<string, object> report)
+    {
+        string revision = app.RevisionNumber();
+        report["revision"] = revision;
+        if (!revision.StartsWith("34.")) throw new InvalidOperationException("This build requires SolidWorks 2026 (API major 34).");
+        app.Visible = false;
+    }
+
+    // Recovery for a run that was killed before restoring the user's STL preferences.
+    private static int RestorePreferencesMain(Dictionary<string, object> request)
+    {
+        string output = Path.GetFullPath(Convert.ToString(request["output_dir"]));
+        Directory.CreateDirectory(output);
+        var report = new Dictionary<string, object> { { "operation", "restore_preferences" }, { "status", "failed" } };
+        SldWorks app = null;
+        Process privateProcess = null;
+        bool owned = false;
+        int code = 1;
+        try
+        {
+            var target = NormalizePreferences(new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(File.ReadAllText(Convert.ToString(request["preferences_path"]))));
+            report["target"] = target;
+            Console.Error.WriteLine("Starting private SolidWorks session to restore STL preferences...");
+            app = StartPrivateSession(output, output, report, out privateProcess);
+            owned = true;
+            RequireSolidWorks2026(app, report);
+            var found = Snapshot(app);
+            report["preferencesFound"] = found;
+            var changed = new List<string>();
+            foreach (var item in target) if (!SamePreference(item.Value, found[item.Key])) changed.Add(item.Key);
+            report["changedKeys"] = changed;
+            if (changed.Count != 0) Restore(app, target);
+            var after = Snapshot(app);
+            report["preferencesAfter"] = after;
+            bool restored = true;
+            foreach (var item in target) if (!SamePreference(item.Value, after[item.Key])) restored = false;
+            report["preferencesRestored"] = restored;
+            report["status"] = restored ? "restored" : "failed";
+            code = restored ? 0 : 1;
+        }
+        catch (Exception e)
+        {
+            report["error"] = e.ToString();
+            Console.Error.WriteLine(e.Message);
+        }
+        finally
+        {
+            if (app != null && owned)
+            {
+                // A normal exit persists the restored values to the user profile.
+                try { app.ExitApp(); report["cleanup"] = "private_session_closed"; }
+                catch (Exception e) { report["cleanupError"] = e.Message; code = 1; }
+            }
+            if (app != null) Marshal.ReleaseComObject(app);
+            if (privateProcess != null) privateProcess.Dispose();
+            string json = new JavaScriptSerializer().Serialize(report);
+            File.WriteAllText(Path.Combine(output, "restore-result.json"), json);
+            Console.WriteLine(json);
+        }
+        return code;
+    }
+
     [STAThread]
     public static int Main(string[] args)
     {
@@ -120,6 +243,7 @@ public static partial class LegacyExportBridge
         if (args.Length == 1 && File.Exists(args[0]))
         {
             request = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(File.ReadAllText(args[0]));
+            if (request.ContainsKey("operation") && Convert.ToString(request["operation"]) == "restore_preferences") return RestorePreferencesMain(request);
             args = new[] { Convert.ToString(request["model_path"]), Convert.ToString(request["output_dir"]), request.ContainsKey("package_name") ? Convert.ToString(request["package_name"]) : "robot_description" };
         }
         if (request == null || args.Length != 3) { Console.Error.WriteLine("Usage: SolidWorksUrdf.exe <request.json>; use tool_cli.py for normal calls."); return 2; }
@@ -156,41 +280,12 @@ public static partial class LegacyExportBridge
             ConfigureWorkspaceLog(output);
             URDFPackage.MessageBox = new HeadlessPackageMessages();
             Console.Error.WriteLine("Starting private SolidWorks session...");
-            string swFolder = Microsoft.Win32.Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\SolidWorks\SOLIDWORKS 2026\Setup", "SolidWorks Folder", null) as string;
-            if (string.IsNullOrEmpty(swFolder)) throw new InvalidOperationException("SolidWorks 2026 installation was not found.");
-            var startInfo = new ProcessStartInfo(Path.Combine(swFolder, "SLDWORKS.exe"), "/r") {
-                UseShellExecute = false, WindowStyle = ProcessWindowStyle.Hidden,
-                WorkingDirectory = Path.GetDirectoryName(modelPath)
-            };
-            // Any auto-loaded legacy add-in must write its logs inside this run.
-            string root = Path.GetPathRoot(output);
-            startInfo.EnvironmentVariables["HOMEDRIVE"] = root.TrimEnd('\\');
-            startInfo.EnvironmentVariables["HOMEPATH"] = output.Substring(root.Length - 1);
-            privateProcess = Process.Start(startInfo);
-            int pid = privateProcess.Id;
-            report["solidworksPid"] = pid;
-            File.WriteAllText(Path.Combine(output, "session.json"), new JavaScriptSerializer().Serialize(new { pid = pid, started = privateProcess.StartTime.ToString("o") }));
-            var startup = Stopwatch.StartNew();
-            while (app == null && startup.Elapsed.TotalSeconds < 120)
-            {
-                if (privateProcess.HasExited) throw new InvalidOperationException("Private SolidWorks exited during startup.");
-                try { app = FindSession(pid); }
-                catch (InvalidCastException) { app = null; } // ROT may appear before COM is ready.
-                catch (COMException e)
-                {
-                    if (e.ErrorCode != unchecked((int)0x80010114) && e.ErrorCode != unchecked((int)0x800401E3)) throw;
-                    app = null;
-                }
-                if (app == null) Thread.Sleep(500);
-            }
-            if (app == null) throw new TimeoutException("Private SolidWorks did not register its COM session within 120 seconds.");
-            if (app.GetProcessID() != pid) throw new InvalidOperationException("SolidWorks session PID mismatch.");
+            app = StartPrivateSession(output, Path.GetDirectoryName(modelPath), report, out privateProcess);
             owned = true;
-            report["solidworksPid"] = pid;
-            report["revision"] = app.RevisionNumber();
-            if (!app.RevisionNumber().StartsWith("34.")) throw new InvalidOperationException("This build requires SolidWorks 2026 (API major 34).");
-            app.Visible = false;
+            RequireSolidWorks2026(app, report);
             report["startupPreferences"] = Snapshot(app);
+            // Persist before any change so a killed run can still be restored.
+            File.WriteAllText(Path.Combine(output, "preferences-snapshot.json"), new JavaScriptSerializer().Serialize(report["startupPreferences"]));
             if (request != null && request.ContainsKey("source_manifest"))
             {
                 currentSourceManifest = new JavaScriptSerializer().Deserialize<SourceManifest>(File.ReadAllText(Convert.ToString(request["source_manifest"])));
@@ -357,7 +452,7 @@ public static partial class LegacyExportBridge
                         var after = Snapshot(app);
                         report["preferencesAfter"] = after;
                         bool restored = true;
-                        foreach (var item in preferences) if (!object.Equals(item.Value, after[item.Key])) restored = false;
+                        foreach (var item in preferences) if (!SamePreference(item.Value, after[item.Key])) restored = false;
                         report["preferencesRestored"] = restored;
                         if (!restored) code = 1;
                     }
