@@ -137,3 +137,7 @@ The output is the original project's traditional ROS URDF package. ROS 2 launch 
 Original export source snapshot: 882169e28952f0d17c87d7eab98826454421aabf, MIT. `build/core-source-manifest.json` records the hash and adaptation marker of every upstream file, and `build/core-source` holds the generated source for review. The source preparation rules are in `scripts/prepare-core.py`.
 
 A previously downloaded `solidworks_urdf_exporter2` is kept in `vendor` for reference; this version does not use it for exports. The upstream license is kept in `vendor`, and `SW2URDF-LICENSE.txt` ships with the local native build.
+
+## License
+
+MIT — see [LICENSE](LICENSE), which also reproduces the upstream ros/solidworks_urdf_exporter license.

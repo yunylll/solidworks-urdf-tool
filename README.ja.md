@@ -137,3 +137,7 @@ print(result["bridge"]["urdf"])
 元のエクスポートソースのスナップショット：882169e28952f0d17c87d7eab98826454421aabf（MIT）。`build/core-source-manifest.json` に上流の各ファイルのハッシュと改造マーカーが記録され、`build/core-source` で生成後のソースを確認できます。ソース準備のルールは `scripts/prepare-core.py` にあります。
 
 以前ダウンロードした `solidworks_urdf_exporter2` は参考用として `vendor` に置いてありますが、このバージョンではエクスポートに使っていません。上流のライセンスは `vendor` に保存され、ローカルのネイティブビルドには `SW2URDF-LICENSE.txt` が同梱されます。
+
+## ライセンス
+
+MIT。[LICENSE](LICENSE) を参照してください（上流の ros/solidworks_urdf_exporter のライセンスも併記しています）。

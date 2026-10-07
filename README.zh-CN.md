@@ -137,3 +137,7 @@ Codex 客户端需要重新加载 MCP 配置后才会把新服务加入当前工
 原导出源码快照：882169e28952f0d17c87d7eab98826454421aabf，MIT。build/core-source-manifest.json 记录每个上游文件的哈希和适配标记，build/core-source 可审查生成后的源码。源码准备规则在 scripts/prepare-core.py。
 
 此前下载的 solidworks_urdf_exporter2 保留在 vendor 供参考，本版本未使用它执行导出。上游许可证保留在 vendor，并随本地原生构建保留 SW2URDF-LICENSE.txt。
+
+## 许可证
+
+MIT，见 [LICENSE](LICENSE)；其中同时附有上游 ros/solidworks_urdf_exporter 的许可证。
