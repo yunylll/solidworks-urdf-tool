@@ -307,6 +307,7 @@ public static partial class LegacyExportBridge
             report["openWarnings"] = warnings;
             if (doc == null || errors != 0) throw new InvalidOperationException("Assembly open failed: " + errors);
             if (documentType == 2) ((AssemblyDoc)doc).ResolveAllLightWeightComponents(false);
+            if (documentType == 2) RequireLoadedComponents(doc, report);
             if (pack)
             {
                 string copiedAssembly = PrepareAssemblyCopy(doc, modelPath, output, report);
@@ -423,8 +424,11 @@ public static partial class LegacyExportBridge
             helper.SetComputeVisualCollision(true);
             helper.SavePath = output;
             helper.PackageName = package;
+            PrepareLinkFrames(helper, node, supplied == null || supplied.recompute_kinematics, report);
             Console.Error.WriteLine("Building links through original ExportHelper...");
             if (!helper.CreateRobotFromTreeView(node)) throw new InvalidOperationException("Robot construction failed.");
+            if (supplied != null && supplied.recompute_kinematics) RequireConfiguredJointTypes(node, supplied, report);
+            ApplyComponentMassProperties(helper, doc, node, report);
             Console.Error.WriteLine("Exporting URDF and STL through original ExportHelper...");
             helper.ExportRobot(true, MeshExportFormat.STL);
             string urdf = Path.Combine(output, package, "urdf", package + ".urdf");

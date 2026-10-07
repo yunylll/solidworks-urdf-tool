@@ -35,6 +35,12 @@ class ConfigChecks(unittest.TestCase):
         self.config["links"][1]["joint"].update(name={}, type={})
         self.assertFalse(validate_config(self.config)["passed"])
 
+    def test_assembly_origin_root_only(self):
+        self.config["links"][0]["coordinate_system"] = "Assembly Origin"
+        self.assertTrue(validate_config(self.config)["passed"])
+        self.config["links"][1]["coordinate_system"] = "Assembly Origin"
+        self.assertFalse(validate_config(self.config)["passed"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

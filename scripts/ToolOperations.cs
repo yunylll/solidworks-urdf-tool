@@ -5,8 +5,13 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using MathNet.Numerics.LinearAlgebra;
+using MathNet.Numerics.LinearAlgebra.Double;
 using SolidWorks.Interop.sldworks;
+using SolidWorks.Interop.swconst;
 using SW2URDF.URDF;
+using SW2URDF.URDFExport;
+using SW2URDF.Utilities;
 
 public sealed class ConfigDocument
 {
@@ -75,8 +80,10 @@ public static partial class LegacyExportBridge
                 // 3D Interconnect's saved importer cache is not an assembly part.
                 // The native part must still load its saved bodies below.
                 if (IsInterconnectCache(file)) { staleCaches.Add(file); continue; }
-                if (currentSourceManifest != null) { unusedReferences.Add(file); ignoredSavedReferences.Add(file); continue; }
-                throw new FileNotFoundException("An assembly dependency is missing.", file);
+                // Saved references can outlive the files of inactive configurations or
+                // suppressed components. The opened snapshot is checked for missing
+                // active components before anything is exported.
+                unusedReferences.Add(file); ignoredSavedReferences.Add(file); continue;
             }
             files.Add(Path.GetFullPath(file));
         }
@@ -116,12 +123,12 @@ public static partial class LegacyExportBridge
             {
                 string copiedReference;
                 string originalReference = stored[i];
-                if (!mapping.TryGetValue(originalReference, out copiedReference))
+                if (!mapping.TryGetValue(originalReference, out copiedReference) && (i >= resolved.Length || !mapping.TryGetValue(resolved[i], out copiedReference)))
                 {
-                    if (IsInterconnectCache(originalReference) && !File.Exists(originalReference)) continue;
-                    if (currentSourceManifest != null && !File.Exists(originalReference)) continue;
-                    if (i >= resolved.Length || !mapping.TryGetValue(resolved[i], out copiedReference))
-                        throw new IOException("Cannot map snapshot reference: " + originalReference);
+                    // Absent saved paths (old locations, importer sources) are not snapshot
+                    // files; Pack and Go below still rejects any real external dependency.
+                    if (!File.Exists(originalReference)) continue;
+                    throw new IOException("Cannot map snapshot reference: " + originalReference);
                 }
                 if (!app.ReplaceReferencedDocument(entry.Value, originalReference, copiedReference))
                     throw new IOException("Cannot rewrite snapshot reference: " + originalReference);
@@ -392,5 +399,240 @@ public static partial class LegacyExportBridge
             throw new InvalidOperationException(overlapping.Count + " component(s) are assigned both directly and through a parent sub-assembly: " + sample(overlapping));
         if (unassigned.Count != 0)
             throw new InvalidOperationException(unassigned.Count + " solid part component(s) are not assigned to any Link; assign them (e.g. to the base link) so the URDF mass matches the CAD: " + sample(unassigned));
+    }
+    // Saved references to absent files are tolerated only if no active component uses them.
+    private static void RequireLoadedComponents(ModelDoc2 model, Dictionary<string, object> report)
+    {
+        var missing = new List<string>();
+        var suppressedMissing = new List<string>();
+        foreach (Component2 component in ((AssemblyDoc)model).GetComponents(false) as object[] ?? new object[0])
+        {
+            string path = component.GetPathName() ?? "";
+            bool absent = !File.Exists(path);
+            if (component.IsSuppressed()) { if (absent) suppressedMissing.Add(component.Name2 + " (" + path + ")"); }
+            else if (absent || component.GetModelDoc2() == null) missing.Add(component.Name2 + " (" + path + ")");
+        }
+        report["suppressedMissingComponents"] = suppressedMissing;
+        if (missing.Count != 0)
+            throw new FileNotFoundException(missing.Count + " active component(s) reference files that are not on this computer: " + string.Join("; ", missing.Take(20)) + ". Restore the files, or suppress the components in the active configuration and save.");
+    }
+
+    public const string AssemblyOriginFrame = "Assembly Origin";
+    private const string AutomaticFrame = "Automatically Generate";
+
+    private static Matrix<double> FramePose(ExportHelper helper, string name)
+    {
+        MathTransform transform = null;
+        try { transform = helper.GetToolFrameTransform(name); }
+        catch (NullReferenceException) { }
+        if (transform == null) throw new InvalidOperationException("Coordinate system not found in the assembly: " + name);
+        return MathOps.GetTransformation(transform);
+    }
+
+    private static double PoseDifference(Matrix<double> a, Matrix<double> b)
+    {
+        double worst = 0;
+        for (int row = 0; row < 3; row++)
+            for (int column = 0; column < 4; column++)
+                worst = Math.Max(worst, Math.Abs(a[row, column] - b[row, column]));
+        return worst;
+    }
+
+    private static string FormatVector(double[] values)
+    {
+        return "[" + string.Join(", ", values.Select(v => (Math.Abs(v) < 1e-12 ? 0 : v).ToString("0.#########", System.Globalization.CultureInfo.InvariantCulture))) + "]";
+    }
+
+    // The exporter builds Link frames only while it recomputes kinematics. Configured
+    // joints would otherwise leave "Automatically Generate" meshes and inertia in
+    // assembly coordinates (and the base Link alone in its Y-up Origin_global), so
+    // every frame is built from the configured joint chain instead.
+    private static void PrepareLinkFrames(ExportHelper helper, LinkNode root, bool recompute, Dictionary<string, object> report)
+    {
+        var rootJoint = root.Link.Joint;
+        if (rootJoint.CoordinateSystemName == AssemblyOriginFrame)
+            rootJoint.CoordinateSystemName = helper.CreateToolFrame(DenseMatrix.CreateIdentity(4), "Origin_assembly");
+        else if (!recompute && rootJoint.CoordinateSystemName == AutomaticFrame)
+            rootJoint.CoordinateSystemName = helper.CreateToolBaseFrame(true);
+        report["baseCoordinateSystem"] = rootJoint.CoordinateSystemName;
+        if (recompute) return;
+        var frames = new Dictionary<string, object>();
+        var mismatches = new List<string>();
+        Action<LinkNode, Matrix<double>> visit = null;
+        visit = (node, pose) => {
+            frames[node.Link.Name] = new Dictionary<string, object> { { "coordinate_system", node.Link.Joint.CoordinateSystemName }, { "assembly_xyz", MathOps.GetXYZ(pose) }, { "assembly_rpy", MathOps.GetRPY(pose) } };
+            foreach (LinkNode child in node.Nodes)
+            {
+                var joint = child.Link.Joint;
+                var configured = pose * MathOps.GetTransformation(joint.Origin.GetXYZ(), joint.Origin.GetRPY());
+                var childPose = configured;
+                if (joint.CoordinateSystemName == AutomaticFrame)
+                {
+                    joint.CoordinateSystemName = helper.CreateToolFrame(configured, "Origin_" + joint.Name);
+                    if (PoseDifference(FramePose(helper, joint.CoordinateSystemName), configured) > 1e-6)
+                        throw new InvalidOperationException("The coordinate system created for " + joint.Name + " does not match its configured origin.");
+                }
+                else
+                {
+                    childPose = FramePose(helper, joint.CoordinateSystemName);
+                    if (PoseDifference(childPose, configured) > 1e-6)
+                    {
+                        var local = pose.Inverse() * childPose;
+                        mismatches.Add(joint.Name + ": coordinate system '" + joint.CoordinateSystemName + "' is at xyz " + FormatVector(MathOps.GetXYZ(local)) + " rpy " + FormatVector(MathOps.GetRPY(local)) + " in its parent Link frame, but the configuration gives xyz " + FormatVector(joint.Origin.GetXYZ()) + " rpy " + FormatVector(joint.Origin.GetRPY()));
+                    }
+                }
+                visit(child, childPose);
+            }
+        };
+        visit(root, FramePose(helper, rootJoint.CoordinateSystemName));
+        report["linkFrames"] = frames;
+        if (mismatches.Count != 0)
+            throw new InvalidOperationException("Configured joint origins disagree with named coordinate systems. Use the coordinate system values, or set coordinate_system to \"Automatically Generate\": " + string.Join("; ", mismatches));
+    }
+
+    // Recomputed kinematics come from the remaining degrees of freedom of each child
+    // Link's first component, with the parent Link's components held fixed. Anything
+    // the exporter cannot see becomes a fixed joint without an error.
+    private static void RequireConfiguredJointTypes(LinkNode root, ConfigDocument supplied, Dictionary<string, object> report)
+    {
+        var configured = supplied.links.Where(l => l.joint != null).ToDictionary(l => l.name, l => l.joint.type);
+        var detected = new Dictionary<string, object>();
+        var problems = new List<string>();
+        Action<LinkNode> visit = null;
+        visit = node => {
+            foreach (LinkNode child in node.Nodes)
+            {
+                var link = child.Link;
+                string wanted;
+                detected[link.Joint.Name] = link.Joint.Type;
+                if (!link.isFixedFrame && configured.TryGetValue(link.Name, out wanted) && wanted != link.Joint.Type)
+                    problems.Add(link.Joint.Name + ": configured " + wanted + ", detected " + link.Joint.Type + " from '" + (link.SWMainComponent == null ? "?" : link.SWMainComponent.Name2) + "'");
+                visit(child);
+            }
+        };
+        visit(root);
+        report["detectedJointTypes"] = detected;
+        if (problems.Count != 0)
+            throw new InvalidOperationException("recompute_kinematics detected different joint types than configured: " + string.Join("; ", problems) + ". Motion is detected only from the first component of each child Link; mates inside flexible sub-assemblies or through other Links are not seen. List a component mated directly to the parent Link first, or set recompute_kinematics to false and give each joint's xyz, rpy and axis.");
+    }
+
+    private static void CollectBodies(Component2 component, List<Body2> bodies)
+    {
+        object info;
+        foreach (Body2 body in component.GetBodies3((int)swBodyType_e.swSolidBody, out info) as object[] ?? new object[0]) bodies.Add(body);
+        foreach (Component2 child in component.GetChildren() as object[] ?? new object[0]) CollectBodies(child, bodies);
+    }
+
+    private static double GeometricMass(ModelDoc2 model, IEnumerable<Component2> components)
+    {
+        var bodies = new List<Body2>();
+        foreach (var component in components) CollectBodies(component, bodies);
+        if (bodies.Count == 0) return 0;
+        var extension = model.Extension;
+        var mass = extension.CreateMassProperty();
+        try
+        {
+            mass.UseSystemUnits = true;
+            if (!mass.AddBodies(bodies.ToArray())) throw new InvalidOperationException("Failed to add bodies to mass properties.");
+            return mass.Mass;
+        }
+        finally
+        {
+            Marshal.ReleaseComObject(mass);
+            Marshal.ReleaseComObject(extension);
+        }
+    }
+
+    // Returns mass, center of mass (3) and the 3x3 moment of inertia at the center of mass.
+    private static double[] ComponentMassProperties(ModelDoc2 model, IEnumerable<Component2> components, MathTransform frame)
+    {
+        var extension = model.Extension;
+        var mass = (IMassProperty2)extension.CreateMassProperty2();
+        try
+        {
+            mass.UseSystemUnits = true;
+            mass.IncludeHiddenBodiesOrComponents = true;
+            mass.SelectedItems = components.Select(c => new DispatchWrapper(c)).ToArray();
+            if (frame != null) mass.SetCoordinateSystem(frame);
+            // Without this the properties still describe the previous selection.
+            if (!mass.Recalculate()) throw new InvalidOperationException("Component mass properties could not be recalculated.");
+            var center = (double[])mass.CenterOfMass;
+            var moment = (double[])mass.GetMomentOfInertia((int)swMomentsOfInertiaReferenceFrame_e.swMomentsOfInertiaReferenceFrame_CenterOfMass);
+            return new[] { mass.Mass, center[0], center[1], center[2] }.Concat(moment).ToArray();
+        }
+        finally
+        {
+            Marshal.ReleaseComObject(mass);
+            Marshal.ReleaseComObject(extension);
+        }
+    }
+
+    private static bool Close(double a, double b, double relative, double absolute)
+    {
+        return Math.Abs(a - b) <= absolute + relative * Math.Max(Math.Abs(a), Math.Abs(b));
+    }
+
+    // The exporter's Link inertia comes from summing body moments, which on Links
+    // of several parts came out 3-5x below the inertia of the exported meshes, and
+    // its masses ignore mass properties overridden in the CAD. Component mass
+    // properties match the meshes and honor overrides. They replace the exporter's
+    // values once mass and center of mass agree on every Link without an override
+    // and the Links sum to the assembly mass.
+    private static void ApplyComponentMassProperties(ExportHelper helper, ModelDoc2 model, LinkNode root, Dictionary<string, object> report)
+    {
+        report["massPropertiesSource"] = "exporter";
+        try { TransferComponentMassProperties(helper, model, root, report); }
+        catch (Exception e) when (e is COMException || e is InvalidOperationException)
+        {
+            // The exporter's own values stay; the CAD mass check then reports any gap.
+            report["massPropertiesError"] = e.Message;
+        }
+        report["massOverridesApplied"] = Convert.ToString(report["massPropertiesSource"]) == "components" && report.ContainsKey("massOverrides") && ((List<object>)report["massOverrides"]).Count != 0;
+    }
+
+    private static void TransferComponentMassProperties(ExportHelper helper, ModelDoc2 model, LinkNode root, Dictionary<string, object> report)
+    {
+        var links = new List<Link>();
+        Action<LinkNode> collect = null;
+        collect = node => { if (!node.Link.isFixedFrame && node.Link.SWComponents.Count != 0) links.Add(node.Link); foreach (LinkNode child in node.Nodes) collect(child); };
+        collect(root);
+        var cad = links.ToDictionary(l => l, l => ComponentMassProperties(model, l.SWComponents, helper.GetToolFrameTransform(l.Joint.CoordinateSystemName)));
+        var disagreeing = new List<string>();
+        var overrides = new List<object>();
+        foreach (var link in links)
+        {
+            var values = cad[link];
+            if (Close(values[0], link.Inertial.Mass.Value, 1e-5, 1e-12))
+            {
+                var center = link.Inertial.Origin.GetXYZ();
+                if (!Enumerable.Range(0, 3).All(i => Close(values[1 + i], center[i], 0, 1e-6))) disagreeing.Add(link.Name + " center of mass");
+                continue;
+            }
+            var components = link.SWComponents
+                .Select(c => new { name = c.Name2, cad = ComponentMassProperties(model, new[] { c }, null)[0], geometric = GeometricMass(model, new[] { c }) })
+                .Where(c => !Close(c.cad, c.geometric, 1e-5, 1e-12))
+                .Select(c => new Dictionary<string, object> { { "component", c.name }, { "cad_mass_kg", c.cad }, { "geometric_mass_kg", c.geometric } }).ToList();
+            overrides.Add(new Dictionary<string, object> { { "link", link.Name }, { "cad_mass_kg", values[0] }, { "geometric_mass_kg", link.Inertial.Mass.Value }, { "components", components } });
+        }
+        report["massOverrides"] = overrides;
+        double total = links.Sum(l => cad[l][0]), assembly = Convert.ToDouble(report["cadAssemblyMassKg"]);
+        if (!Close(total, assembly, 1e-6, 1e-8)) disagreeing.Add("sum of Link masses " + total + " kg != assembly " + assembly + " kg");
+        if (disagreeing.Count != 0)
+        {
+            report["massPropertiesCrossCheckFailed"] = disagreeing;
+            return;
+        }
+        var exporterInertia = new Dictionary<string, object>();
+        foreach (var link in links)
+        {
+            var values = cad[link];
+            var old = link.Inertial.Inertia;
+            exporterInertia[link.Name] = new[] { link.Inertial.Mass.Value, old.Ixx, old.Ixy, old.Ixz, old.Iyy, old.Iyz, old.Izz };
+            link.Inertial.Mass.Value = values[0];
+            link.Inertial.Origin.SetXYZ(new[] { values[1], values[2], values[3] });
+            link.Inertial.Inertia.SetMomentMatrix(values.Skip(4).Take(9).ToArray());
+        }
+        report["exporterInertia"] = exporterInertia;
+        report["massPropertiesSource"] = "components";
     }
 }

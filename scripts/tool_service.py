@@ -286,9 +286,16 @@ def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
                         delta = abs(checks["total_mass_kg"] - cad_mass)
                         checks["cad_mass_delta_kg"] = delta
                         if delta > max(1e-8, abs(cad_mass) * 1e-6):
-                            checks["errors"].append("URDF link masses do not sum to native CAD assembly mass.")
+                            message = "URDF link masses do not sum to native CAD assembly mass."
+                            overrides = bridge.get("massOverrides") or []
+                            if overrides and not bridge.get("massOverridesApplied"):
+                                message += " Overridden CAD mass properties could not be transferred for Links: " + ", ".join(o["link"] for o in overrides) + " (see bridge.massOverrides)."
+                            elif bridge.get("massPropertiesError"):
+                                message += " Component mass properties could not be read: " + bridge["massPropertiesError"]
+                            checks["errors"].append(message)
                     checks["passed"] = not checks["errors"]
                     record["validation"] = checks
+                record["warnings"] = bridge_warnings(bridge)
                 validation_ok = record.get("validation", {"passed": True})["passed"]
                 record["passed"] = bool(native_ok and preferences_ok and cleanup["passed"] and record["source_unchanged"] and bool(before) and validation_ok)
                 if record["status"] != "timed_out":
@@ -325,6 +332,23 @@ def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
         record["finished_at"] = stamp()
         write_json(directory / "result.json", record)
     return record
+
+
+def bridge_warnings(bridge):
+    """Results that passed but differ from the plain CAD files, for the user to confirm."""
+    warnings = []
+    absent = bridge.get("inactiveOrCachedSavedReferences") or []
+    if absent:
+        warnings.append(f"{len(absent)} saved reference(s) point to files not on this computer; no active component uses them: " + ", ".join(absent))
+    suppressed = bridge.get("suppressedMissingComponents") or []
+    if suppressed:
+        warnings.append(f"{len(suppressed)} suppressed component(s) have no file and were left out: " + ", ".join(suppressed))
+    if bridge.get("massPropertiesSource") == "exporter" and (bridge.get("massPropertiesCrossCheckFailed") or bridge.get("massPropertiesError")):
+        warnings.append("Link inertia is the original exporter's, which underestimates Links of several parts: component mass properties were not used (" + "; ".join(bridge.get("massPropertiesCrossCheckFailed") or [bridge["massPropertiesError"]]) + ")")
+    if bridge.get("massOverridesApplied"):
+        parts = [c["component"] for o in bridge.get("massOverrides", []) for c in o["components"]]
+        warnings.append("Mass properties overridden in the CAD were used instead of geometry for Links " + ", ".join(o["link"] for o in bridge["massOverrides"]) + (f" (components: {', '.join(parts)})" if parts else ""))
+    return warnings
 
 
 def job_directory(identifier):

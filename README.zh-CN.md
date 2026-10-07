@@ -76,8 +76,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-tool.ps1
 
 配置格式为 schema_version=1、robot_name、recompute_kinematics 和 links。每个 Link 指定 name、parent、components、coordinate_system、mesh_quality、frame_only 和 joint；组件名采用检查返回的完整实例名。
 
-- recompute_kinematics=true：从配置中指定的 CAD 坐标系/轴重算关节变换。
-- recompute_kinematics=false：采用 JSON 中的局部 xyz、rpy 和 axis；坐标系仍用于网格及惯量定位。
+- recompute_kinematics=true：从配置中指定的 CAD 坐标系/轴重算关节变换；坐标系或轴为 "Automatically Generate" 时由原导出器根据配合推断。推断只看每个子 Link 的**第一个组件**在父 Link 固定时剩余的自由度，柔性子装配内部或经过其他 Link 的配合看不到。推断出的关节类型与 JSON 的 type 不一致时，导出直接失败并列出每个关节，不会静默生成 fixed。
+- recompute_kinematics=false：采用 JSON 中的局部 xyz、rpy 和 axis（axis 在子 Link 坐标系中）。coordinate_system 为 "Automatically Generate" 的 Link，工具按关节链在 CAD 副本中创建坐标系 Origin_<关节名>，网格和惯量都按该 Link 自己的坐标系导出；指定了已有坐标系的 Link 必须与 JSON 原点一致，否则报错并给出该坐标系对应的 xyz/rpy。continuous/revolute 关节的 xyz 应位于转轴上。
+- 根 Link 的 coordinate_system 取 "Automatically Generate" 时沿用原导出器的 Origin_global：它假定模型 Y 轴朝上，把 CAD 的 +Y 转成 URDF 的 +Z。按 Z 轴朝上建模的装配体应改用 "Assembly Origin"，直接使用装配体原点和坐标轴。
+- 质量、质心和惯量取自 SolidWorks 组件质量属性。原导出器把各实体的惯量直接相加，由多个零件组成的 Link 惯量比导出网格实际算得的小 3–5 倍；它还按几何和密度计算质量，丢失 SolidWorks 中覆盖的质量。组件质量属性与网格一致，也计入覆盖值。工具先确认未覆盖的 Link 两种算法的质量和质心一致、各 Link 质量之和等于装配体质量，才替换；否则保留原导出器的值并在 warnings 中说明。用到覆盖值的 Link 和组件列在 warnings 与 bridge.massOverrides 中，原导出器的惯量保留在 bridge.exporterInertia。
 - revolute/prismatic 必须给出有限的 lower/upper 与正的 effort/velocity；角度使用弧度、平移使用米。
 - frame_only=true 的 Link 不导出质量、视觉或碰撞几何；它的子树仍正常处理。
 - 坐标系和参考轴应来自模型已有参考几何。工具不会凭空推断真实机器人关节意图或执行器参数。
@@ -110,9 +112,11 @@ Codex 客户端需要重新加载 MCP 配置后才会把新服务加入当前工
 
 ## 模型保护与边界
 
-原文件只做读取和哈希。工具先复制原模型和依赖，仅对快照做引用重写、Pack and Go 和导出；API 即使在打包时保存模型，也只会保存快照。真实缺失 CAD 默认返回失败。
+原文件只做读取和哈希。工具先复制原模型和依赖，仅对快照做引用重写、Pack and Go 和导出；API 即使在打包时保存模型，也只会保存快照。
 
-对于已保存且正在打开的装配体，可用只读活动模型清单识别旧配置/导入缓存留下的失效路径。此路径只有在快照的配置名、组件数和原生质量与清单一致，且实际组件完整加载时才接受。未保存的活动模型会被拒绝，需用户明确保存后再导出。
+模型保存的引用指向本机不存在的文件时（旧配置、导入源文件、库零件等），无需先在 SolidWorks 中打开模型：工具跳过这些路径建立快照，打开快照后检查每个未压缩组件都已加载。只有活动组件缺文件时才失败，并列出组件名和路径；被跳过的引用和缺文件的压缩组件写入 result.json 的 warnings。
+
+若该装配体已保存且正在 SolidWorks 中打开，工具另外读取只读活动模型清单，要求快照的配置名、组件数和原生质量与之一致。未保存的活动模型会被拒绝，需用户明确保存后再导出。
 
 操作串行执行，避免多个导出相互覆盖全局 STL 设置：后到的任务保持 queued（result.json 中 queue=waiting_for_cad_lock）最多 3600 秒，超时返回 CAD_BUSY；不保证先到先得。执行进程会登记 PID 与启动时间，进程消失或 120 秒内未登记的任务由 get_export_job 标记为 interrupted。任务超时会返回失败并核对 PID+启动时间后清理独立会话；不能把 timed_out/interrupted 的输出用于正式模型。
 

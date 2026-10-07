@@ -8,6 +8,9 @@ import re
 LINK_KEYS = {"name", "parent", "components", "coordinate_system", "mesh_quality", "frame_only", "joint"}
 JOINT_KEYS = {"name", "type", "axis_name", "axis", "xyz", "rpy", "lower", "upper", "effort", "velocity", "damping", "friction"}
 NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+# Base-link coordinate system that keeps the assembly's own axes (the exporter's
+# automatic base frame assumes a Y-up model and turns it Z-up).
+ASSEMBLY_ORIGIN = "Assembly Origin"
 RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
 
 
@@ -49,6 +52,8 @@ def validate_config(config: dict) -> dict:
             parents[name] = None
         if not isinstance(link.get("coordinate_system"), str) or not link["coordinate_system"].strip():
             errors.append(f"{name}.coordinate_system is required")
+        elif link["coordinate_system"] == ASSEMBLY_ORIGIN and parent is not None:
+            errors.append(f"{name}.coordinate_system: {ASSEMBLY_ORIGIN!r} applies only to the root Link")
         if link.get("mesh_quality", "coarse") not in ("coarse", "fine"):
             errors.append(f"{name}.mesh_quality must be coarse or fine")
         if not isinstance(link.get("frame_only", False), bool):
