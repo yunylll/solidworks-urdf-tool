@@ -1,0 +1,25 @@
+.venv/
+validation/bin/
+validation/bridge-bin/
+validation/jobs/
+validation/runs/
+validation/fixtures/
+validation/export.lock
+__pycache__/
+build/
+tools/
+validation/tool-regression/
+validation/nested-fixture/
+
+# Unused reference clone; the build uses the pinned submodule only.
+vendor/solidworks_urdf_exporter2/
+# Raw run logs (large, machine-specific); reports and JSON summaries are tracked.
+validation/*.log
+*.tmp
+
+# Machine-specific or private run data; never commit.
+validation/*
+!validation/FEASIBILITY.md
+!validation/TOOL_REPORT.md
+examples/robot-configuration-template.json
+mcp-connection.json

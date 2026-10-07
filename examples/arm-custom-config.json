@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "robot_name": "arm_tool",
+  "recompute_kinematics": false,
+  "links": [
+    {
+      "name": "base_link",
+      "parent": null,
+      "components": [
+        "3_DOF_ARM_BASE-1"
+      ],
+      "coordinate_system": "Origin_global",
+      "mesh_quality": "coarse",
+      "frame_only": false,
+      "joint": null
+    },
+    {
+      "name": "prox_link",
+      "parent": "base_link",
+      "components": [
+        "3_DOF_ARM_SEGMENT-1"
+      ],
+      "coordinate_system": "Origin_prox_joint",
+      "mesh_quality": "coarse",
+      "frame_only": false,
+      "joint": {
+        "name": "prox_joint",
+        "type": "revolute",
+        "axis_name": "Axis_prox_joint",
+        "axis": [
+          0,
+          1,
+          0
+        ],
+        "xyz": [
+          0.0024911538461538374,
+          0,
+          0
+        ],
+        "rpy": [
+          -1.5707963267948968,
+          0,
+          -1.5707963267948966
+        ],
+        "lower": -1.2,
+        "upper": 1.2,
+        "effort": 10.0,
+        "velocity": 2.0,
+        "damping": null,
+        "friction": null
+      }
+    },
+    {
+      "name": "dist_Link",
+      "parent": "prox_link",
+      "components": [
+        "3_DOF_ARM_SEGMENT-2"
+      ],
+      "coordinate_system": "Origin_dist_joint",
+      "mesh_quality": "coarse",
+      "frame_only": false,
+      "joint": {
+        "name": "dist_joint",
+        "type": "continuous",
+        "axis_name": "Axis_dist_joint",
+        "axis": [
+          -1,
+          0,
+          0
+        ],
+        "xyz": [
+          0,
+          -0.18920972027972024,
+          0
+        ],
+        "rpy": [
+          -1.5707963267948966,
+          0,
+          0
+        ],
+        "lower": null,
+        "upper": null,
+        "effort": null,
+        "velocity": null,
+        "damping": null,
+        "friction": null
+      }
+    },
+    {
+      "name": "effector_link",
+      "parent": "dist_Link",
+      "components": [
+        "3_DOF_ARM_END_EFFECTOR-1"
+      ],
+      "coordinate_system": "Origin_effector_joint",
+      "mesh_quality": "coarse",
+      "frame_only": false,
+      "joint": {
+        "name": "effector_joint",
+        "type": "continuous",
+        "axis_name": "Axis_effector_joint",
+        "axis": [
+          0,
+          0,
+          -1
+        ],
+        "xyz": [
+          0,
+          -0.18,
+          0
+        ],
+        "rpy": [
+          1.5707963267948966,
+          0,
+          0
+        ],
+        "lower": null,
+        "upper": null,
+        "effort": null,
+        "velocity": null,
+        "damping": null,
+        "friction": null
+      }
+    },
+    {
+      "name": "tool_frame",
+      "parent": "effector_link",
+      "components": [],
+      "coordinate_system": "Origin_effector_joint",
+      "mesh_quality": "coarse",
+      "frame_only": true,
+      "joint": {
+        "name": "tool_fixed",
+        "type": "fixed",
+        "axis_name": "",
+        "axis": [
+          0,
+          0,
+          1
+        ],
+        "xyz": [
+          0,
+          0,
+          0
+        ],
+        "rpy": [
+          0,
+          0,
+          0
+        ],
+        "lower": null,
+        "upper": null,
+        "effort": null,
+        "velocity": null,
+        "damping": null,
+        "friction": null
+      }
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+mcp==2.3.0
+numpy==2.5.3
+trimesh==5.1.1
+scipy==1.18.1

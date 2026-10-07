@@ -1,0 +1,12 @@
+{
+  "command": "<REPO_ROOT>\.venv\Scripts\python.exe",
+  "args": ["<REPO_ROOT>\scripts\mcp_server.py"],
+  "cwd": "<REPO_ROOT>",
+  "env": {
+    "PYTHONIOENCODING": "utf-8",
+    "WINDIR": "C:\Windows",
+    "SystemRoot": "C:\Windows",
+    "ProgramFiles": "C:\Program Files",
+    "CommonProgramFiles": "C:\Program Files\Common Files"
+  }
+}

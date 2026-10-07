@@ -1,0 +1,3 @@
+[submodule "vendor/solidworks_urdf_exporter"]
+	path = vendor/solidworks_urdf_exporter
+	url = https://github.com/ros/solidworks_urdf_exporter.git
