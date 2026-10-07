@@ -18,7 +18,7 @@
 - 永続的なジョブ記録、非同期エクスポート、状態の問い合わせ、明確なタイムアウト/失敗の返却。
 - ローカル stdio MCP の 8 ツール。Codex に `solidworks_urdf_2026` として登録できます。
 
-検証記録は [ツールレポート](validation/TOOL_REPORT.md) を参照してください。以前のブリッジ実現性テストは [初期レポート](validation/FEASIBILITY.md) に残してあります（どちらのレポートも中国語です）。
+検証記録は [ツールレポート](validation/TOOL_REPORT.ja.md) を参照してください。以前のブリッジ実現性テストは [初期レポート](validation/FEASIBILITY.ja.md) に残してあります。
 
 ## 環境の準備
 

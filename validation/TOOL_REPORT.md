@@ -1,45 +1,47 @@
-# SolidWorks URDF 2026 Tool 2.0.0 开发与验收报告
+# SolidWorks URDF 2026 Tool 2.0.0 — Development and Acceptance Report
 
-日期：2026-10-07。目标：继续开发成适配 SolidWorks 2026、可通过代码/MCP 调用的工具。
+**English** | [简体中文](TOOL_REPORT.zh-CN.md) | [日本語](TOOL_REPORT.ja.md)
 
-结论：**已实现并验证可运行的本地工具。** 原生导出核心从上游源码构建，正式入口通过隔离快照处理模型；本机 Codex 的 MCP 服务已经注册并通过启动/调用检查。
+Date: 2026-10-07. Goal: continue development into a tool that supports SolidWorks 2026 and can be called from code/MCP.
 
-## 实现与验收
+Conclusion: **a working local tool has been implemented and verified.** The native export core is built from the upstream source, and the official entry point processes models through an isolated snapshot; the MCP service has been registered in the local Codex and passed startup/call checks.
 
-| 功能 | 验收证据 | 结果 |
+## Implementation and acceptance
+
+| Feature | Acceptance evidence | Result |
 | --- | --- | --- |
-| 2026 API / 原生无界面核心 | build/bin/SolidWorksUrdf.exe，版本 2.0.0.0；本机 RevisionNumber=34.3.2 | 通过 |
-| 消除导出核心内交互错误弹窗 | build/core-source 的显式异常适配；正常与无效配置检查 | 实现 |
-| 跨目录快照、引用重写与打包 | 跨目录机械臂任务 da02cd59494c4fe2891ec019f726209f | 通过 |
-| JSON Link/Joint 配置与修改 | MCP 任务 9b976223f6f14d8b98c075184b5a9fa3：revolute 限位、固定坐标框架 | 通过 |
-| prepare 后再 export | MCP 准备任务 dead2e22c80d42b58668659ca3db1de4，后续导出复用其副本 | 通过 |
-| 单零件导出 | MCP 异步任务 62560d14e2ec4647ab8b1bc1db179959：1 Link、0 Joint | 通过 |
-| 持久任务与异步状态 | 真实 queued → running → succeeded，worker PID/创建时间检查 | 通过 |
-| 源文件保护 | 原文件及全部已枚举依赖 SHA-256 审计；正式调用只修改快照 | 通过 |
-| STL 设置与私有会话清理 | 集成任务 preferencesRestored=true、session_cleanup.passed=true | 通过 |
-| 质量、惯量、轴与网格校验 | 参考机械臂、带限位模型、单零件及错误注入测试 | 通过 |
-| 本地 MCP 调用 | 8 个工具，实际客户端完成检查、准备、导出、异步任务、校验 | 通过 |
-| Codex 注册配置 | solidworks_urdf_2026 注册与启动检查 | 通过 |
-| 一键准备 | scripts/setup.ps1 -SkipDependencies 在本机编译与只读探针 | 通过 |
+| 2026 API / native headless core | build/bin/SolidWorksUrdf.exe, version 2.0.0.0; local RevisionNumber=34.3.2 | Passed |
+| No interactive error pop-ups inside the export core | Explicit exception adaptation in build/core-source; checks with valid and invalid configurations | Implemented |
+| Cross-directory snapshot, reference rewriting and packaging | Cross-directory arm job da02cd59494c4fe2891ec019f726209f | Passed |
+| JSON Link/Joint configuration and editing | MCP job 9b976223f6f14d8b98c075184b5a9fa3: revolute limits, fixed coordinate frame | Passed |
+| export after prepare | MCP prepare job dead2e22c80d42b58668659ca3db1de4; the later export reuses its copy | Passed |
+| Single-part export | MCP async job 62560d14e2ec4647ab8b1bc1db179959: 1 Link, 0 Joints | Passed |
+| Persistent jobs and async status | Real queued → running → succeeded; worker PID/creation-time checks | Passed |
+| Source file protection | SHA-256 audit of the original files and all enumerated dependencies; the official call only modifies the snapshot | Passed |
+| STL settings and private-session cleanup | Integration job: preferencesRestored=true, session_cleanup.passed=true | Passed |
+| Mass, inertia, axis and mesh validation | Reference arm, a model with limits, a single part and error-injection tests | Passed |
+| Local MCP calls | 8 tools; a real client completed inspect, prepare, export, async jobs and validation | Passed |
+| Codex registration | solidworks_urdf_2026 registration and startup check | Passed |
+| One-step setup | scripts/setup.ps1 -SkipDependencies: local build and read-only probe | Passed |
 
-测试包括 6 项配置检查、5 项文件校验错误场景，以及真实 CAD/MCP 集成。数据来源为原生 SolidWorks 文件与 API，不使用模拟实验数据。
+The tests include 6 configuration checks, 5 file-validation error scenarios and real CAD/MCP integration. The data come from native SolidWorks files and the API; no simulated experimental data is used.
 
-原始运行记录含本机路径，未纳入仓库。
+The raw run records contain local paths and are not included in the repository.
 
-## 关键修正
+## Key fixes
 
-1. 原型只调用安装目录 DLL；本版本编译独立核心并采用 JSON 作为跨进程接口，避开嵌入 COM 泛型类型的程序集边界限制。
-2. Pack and Go 即使只读打开源模型也可能保存元数据。正式工具先复制文件，仅对快照执行打包，避免源文件修改。
-3. 简单的保存依赖列表可能包含旧配置或导入缓存。提供已保存活动模型的组件/配置/质量清单，只有副本几何通过核验才继续。
-4. 反序列化旧配置后恢复组件持久引用；空组件 Link 不能被当成完整模型计算质量。
-5. 修复核心坐标框架节点跳过子树、错误弹窗阻塞、空属性值处理及关节成功判断。
-6. 强制使用 SI 质量单位，采用 2026 的 MassProperty2 做整体质量核验，保存并恢复相关 STL 参数。
-7. 保留持久 JSON 结果、日志、超时处理、私有进程身份核验及工作进程终态检查。
+1. The prototype only called the DLL in the installation directory; this version builds a standalone core and uses JSON as the cross-process interface, avoiding the assembly-boundary limitation on embedded COM generic types.
+2. Pack and Go can save metadata even when the source model is opened read-only. The official tool copies the files first and runs packaging only on the snapshot, so the source files are never modified.
+3. A plain saved-dependency list may contain stale configurations or import caches. An inventory of components/configuration/mass of the saved active model is provided, and processing continues only if the copy's geometry passes verification.
+4. Persistent component references are restored after deserializing an old configuration; a Link with empty components must not be treated as a complete model when computing mass.
+5. Fixed: the core skipping subtrees of coordinate-frame nodes, blocking error pop-ups, handling of empty property values, and the joint success check.
+6. SI mass units are enforced, the 2026 MassProperty2 is used for the overall mass check, and the relevant STL parameters are saved and restored.
+7. Persistent JSON results, logs, timeout handling, private-process identity verification and worker terminal-state checks are kept.
 
-## 使用与范围
+## Usage and scope
 
-常规使用见 [README](../README.md)。本机已注册 MCP 服务；重新加载 MCP 配置后可在 Codex 的工具目录中使用。
+For normal use see the [README](../README.md). The MCP service is registered locally; after reloading the MCP configuration it is available in Codex's tool catalog.
 
-本版本提供原项目传统 ROS URDF/STL 包。JSON 编辑覆盖 Link 树、组件归属、坐标系、固定/连续/转动/平移关节及限位、阻尼/摩擦、坐标框架。复杂 mimic、外观编辑、ROS 2 启动脚本和 MJCF/USD 尚未作为本版本的独立功能暴露。真实执行器参数与机械关节意图需要用户或经审查的设计数据。
+This version produces the original project's traditional ROS URDF/STL package. JSON editing covers the Link tree, component assignment, coordinate systems, fixed/continuous/revolute/prismatic joints and their limits, damping/friction, and coordinate frames. Complex mimic, appearance editing, ROS 2 launch scripts and MJCF/USD are not yet exposed as standalone features of this version. Real actuator parameters and mechanical joint intent must come from the user or from reviewed design data.
 
-一切正式模型应在目标 ROS/仿真环境复核。超时或中断任务明确失败，不能将其部分输出视为成功。
+Any production model should be re-checked in the target ROS/simulation environment. Timed-out or interrupted jobs fail explicitly; their partial output must not be treated as success.

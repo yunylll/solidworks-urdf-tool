@@ -18,7 +18,7 @@ The export core is built from the source of the original [ros/solidworks_urdf_ex
 - Persistent job records, asynchronous export, status queries and explicit timeout/failure results.
 - 8 tools over a local stdio MCP server; it can be registered in Codex as `solidworks_urdf_2026`.
 
-Verification records: [Tool report](validation/TOOL_REPORT.md). The earlier bridge feasibility test is kept in the [early report](validation/FEASIBILITY.md). (Both reports are in Chinese.)
+Verification records: [Tool report](validation/TOOL_REPORT.md) ([简体中文](validation/TOOL_REPORT.zh-CN.md), [日本語](validation/TOOL_REPORT.ja.md)). The earlier bridge feasibility test is kept in the [early report](validation/FEASIBILITY.md) ([简体中文](validation/FEASIBILITY.zh-CN.md), [日本語](validation/FEASIBILITY.ja.md)).
 
 ## Setup
 

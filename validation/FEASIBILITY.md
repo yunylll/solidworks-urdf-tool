@@ -1,67 +1,69 @@
-# SolidWorks 2026 与原插件代码调用：可行性验证结论
+# SolidWorks 2026 and Calling the Original Add-in Code: Feasibility Findings
 
-日期：2026-10-07（Asia/Shanghai）。结论：**可行，已完成可运行的桥接适配原型及真实 MCP 导出验证。**
+**English** | [简体中文](FEASIBILITY.zh-CN.md) | [日本語](FEASIBILITY.ja.md)
 
-本次调用的是本机已安装 SW2URDF.dll 的原始导出代码，SolidWorks 实际运行参与了模型读取、质量/惯量计算及 STL 导出。不是模拟数据，也没有使用 computer-use。
+Date: 2026-10-07 (Asia/Shanghai). Conclusion: **feasible — a working bridge-adaptation prototype and real MCP export verification have been completed.**
 
-## 环境与源码
+This run called the original export code of the SW2URDF.dll installed on the machine. SolidWorks actually ran and took part in reading the model, computing mass/inertia and exporting STL. The data are not simulated, and computer-use was not used.
 
-| 项目 | 实际值 |
+## Environment and source
+
+| Item | Actual value |
 | --- | --- |
-| SolidWorks | Design Premium 2026 SP3.2，RevisionNumber=34.3.2 |
-| 原插件 DLL | 1.6.7995.38578，产品版本 1.6.0-4-g7f85cfe |
-| 桥接程序 | C#，x64，STA，使用本机 2026 API interop DLL |
-| MCP | 本地 stdio，Python SDK 2.3.0 |
-| 原仓库源码 | ros/solidworks_urdf_exporter，882169e28952f0d17c87d7eab98826454421aabf |
-| 测试装配体 | 上游 3_DOF_ARM，4 个组件实例/Link，3 个 continuous 关节 |
+| SolidWorks | Design Premium 2026 SP3.2, RevisionNumber=34.3.2 |
+| Original add-in DLL | 1.6.7995.38578, product version 1.6.0-4-g7f85cfe |
+| Bridge program | C#, x64, STA, using the local 2026 API interop DLLs |
+| MCP | Local stdio, Python SDK 2.3.0 |
+| Original repository source | ros/solidworks_urdf_exporter, 882169e28952f0d17c87d7eab98826454421aabf |
+| Test assembly | Upstream 3_DOF_ARM, 4 component instances/Links, 3 continuous joints |
 
-## 证明了什么
+## What was proven
 
-| 要求 | 当前证据 | 结果 |
+| Requirement | Current evidence | Result |
 | --- | --- | --- |
-| 2026 底层 API 可连接 | 只读 COM 探针与 MCP 冒烟测试 | 通过 |
-| 能绕过导出向导调用原插件 | LegacyExportBridge.cs 调用 ConfigurationSerialization、LoadSWComponents、CreateRobotFromTreeView、ExportRobot；真实输出文件 | 通过 |
-| 能在 2026 完成真实 URDF/STL 导出 | MCP 集成测试的两次导出 均 passed=true | 通过 |
-| 关节与坐标正确 | 对比原仓库参考 URDF；关节位置、RPY、轴方向、视觉及碰撞原点一致 | 通过 |
-| 质量与惯量正确 | 所有 Link 的质量/质心/惯量与参考模型在容差内一致；正定性和惯量三角不等式检查 | 通过 |
-| 网格单位与位置正确 | 与参考 STL 的边界差为 0 m；四个 STL 均非空并闭合 | 通过 |
-| 重复导出一致 | 两次 MCP 导出的语义指纹一致 | 通过，允许浮点末位误差 |
-| 原 CAD 文件保护 | 每次任务原装配体及零件的 SHA-256 前后一致 | 通过 |
-| 导出设置恢复 | 同一活动模型下 preferencesBefore=preferencesAfter | 通过，测试会话使用粗糙精度模式 |
-| 原用户会话保留 | 最终仍为用户原进程及原装配体、UNSAVED_CHANGES=False、STL_QUALITY=3 | 通过 |
-| 实际 MCP 协议调用 | 初始化、tools/list、inspect_solidworks、两次 export_urdf、validate_urdf | 通过 |
-| 校验器能发现错误 | 5 项文件级测试，包括故意制造错误 | 通过 |
+| The 2026 low-level API can be connected | Read-only COM probe and MCP smoke test | Passed |
+| The original add-in can be called bypassing the export wizard | LegacyExportBridge.cs calls ConfigurationSerialization, LoadSWComponents, CreateRobotFromTreeView and ExportRobot; real output files | Passed |
+| Real URDF/STL export works on 2026 | Both exports in the MCP integration test have passed=true | Passed |
+| Joints and coordinates are correct | Compared with the original repository's reference URDF; joint positions, RPY, axis directions, visual and collision origins match | Passed |
+| Mass and inertia are correct | Mass/center of mass/inertia of all Links match the reference model within tolerance; positive-definiteness and inertia triangle-inequality checks | Passed |
+| Mesh units and positions are correct | Bounds differ from the reference STL by 0 m; all four STLs are non-empty and closed | Passed |
+| Repeated exports are consistent | The semantic fingerprints of the two MCP exports are identical | Passed, last-digit floating-point differences allowed |
+| Original CAD files are protected | The SHA-256 of the original assembly and parts is identical before and after every job | Passed |
+| Export settings are restored | preferencesBefore=preferencesAfter on the same active model | Passed; the test session used the coarse-precision mode |
+| The user's original session is preserved | At the end it is still the user's original process and assembly, UNSAVED_CHANGES=False, STL_QUALITY=3 | Passed |
+| Real MCP protocol calls | initialize, tools/list, inspect_solidworks, two export_urdf calls, validate_urdf | Passed |
+| The validator detects errors | 5 file-level tests, including deliberately introduced errors | Passed |
 
-原型总质量为 **0.3452524549775949 kg**；与 SolidWorks 原生整机质量的差为 **6.106226635438361e-16 kg**。
+The prototype's total mass is **0.3452524549775949 kg**; the difference from the native whole-assembly mass reported by SolidWorks is **6.106226635438361e-16 kg**.
 
-重复测试比较 URDF 数值到 1e-12、网格坐标到 1e-8 m。两次输出并非逐字节完全一致，存在极小浮点差异；不能把这里的“结果一致”解释为字节完全相同。
+The repeat test compared URDF values to 1e-12 and mesh coordinates to 1e-8 m. The two outputs are not byte-for-byte identical — there are tiny floating-point differences — so "consistent results" here must not be read as byte-identical.
 
-## 真实导出证据
+## Evidence of real exports
 
-原始 MCP 集成报告、任务目录和导出文件含本机路径，未纳入仓库；可按 README 在本地重新生成。
+The raw MCP integration reports, job directories and exported files contain local paths and are not included in the repository; they can be regenerated locally by following the README.
 
-## 已解决的问题
+## Problems solved
 
-1. 普通 COM 激活可能复用用户会话。桥接显式启动新进程并按 PID 查找 ROT 对象，等待 COM 初始化完成。
-2. 原插件创建导出目录会弹出提示框。通过其公开 IMessageBox 扩展点把信息写入日志。
-3. 单纯反序列化配置不会恢复运行时组件引用。补上 LoadSWComponents，并在持久引用缺失时报错。
-4. 首轮未恢复组件引用时产生了空 STL 和重复整机质量。该轮结果已判为无效，最终验证使用修正后的独立任务。
-5. STL 偏差可能由粗糙/精细模式根据活动模型尺寸自动计算。设置比较必须在同一模型上下文中进行，不能比较空会话与已打开模型的派生偏差值。
-6. MCP SDK 对结构化返回值需要明确的 dict[str, Any] 类型；已修正工具输出结构及本机中文路径编码。
+1. Ordinary COM activation may reuse the user's session. The bridge explicitly starts a new process, finds the ROT object by PID, and waits for COM initialization to finish.
+2. The original add-in shows a message box when it creates the export directory. The message is written to the log through its public IMessageBox extension point.
+3. Merely deserializing the configuration does not restore the runtime component references. LoadSWComponents was added, and an error is raised when persistent references are missing.
+4. The first round, without restored component references, produced empty STL files and a duplicated whole-assembly mass. That round was judged invalid, and the final verification uses corrected, independent jobs.
+5. The STL deviation may be computed automatically from the active model's size in coarse/fine mode. Settings must be compared in the same model context; derived deviation values of an empty session and of an opened model must not be compared.
+6. The MCP SDK needs an explicit dict[str, Any] type for structured return values; the tool output structure and the local Chinese-path encoding were fixed.
 
-## 验证边界与建议
+## Verification boundaries and recommendations
 
-**本次完成的是可行性验证和桥接适配原型。** 原插件 DLL 仍是原来的 1.6.1 系列版本；没有发布一个宣称完整支持所有 SolidWorks 2026 模型的新安装包。
+**What was completed here is a feasibility verification and a bridge-adaptation prototype.** The original add-in DLL is still the original 1.6.1-series version; no new installer claiming full support for all SolidWorks 2026 models has been released.
 
-当前导出工具接受工作区内、已保存旧插件 URDF 配置、CAD 引用集中在同一目录的装配体。以下事项尚未验证：
+The current export tool accepts assemblies in the workspace that have a saved legacy-add-in URDF configuration and whose CAD references are in a single directory. The following have not been verified:
 
-- 大型（数百组件）真实机器人的完整导出及跨目录依赖打包。
-- prismatic、revolute 限位、mimic、柔性/复杂嵌套子装配体的覆盖测试。
-- 无旧配置模型的代码建树、参数设置和自动关节推断。
-- 自定义 STL 精度模式的导出恢复全过程；当前只读确认用户原会话的自定义模式没有变化。
-- ROS 2、Gazebo、MuJoCo 等目标环境的运行验证。原插件生成的是传统 ROS 包。
-- 全部遗留错误弹窗的消除。目前已处理目录提示；其他错误弹窗由超时返回失败并清理独立进程。
+- Full export and cross-directory dependency packaging of a large real robot (hundreds of components).
+- Coverage tests for prismatic and revolute limits, mimic, and flexible/complex nested sub-assemblies.
+- Building the tree in code, setting parameters and automatic joint inference for models without a legacy configuration.
+- The full export-and-restore cycle with a custom STL precision mode; so far only a read-only check that the user's original custom mode is unchanged.
+- Runtime verification in target environments such as ROS 2, Gazebo and MuJoCo. The original add-in generates a traditional ROS package.
+- Elimination of all remaining error pop-ups. The directory prompt is handled; other error pop-ups are turned into a timeout failure and the isolated process is cleaned up.
 
-MCP 服务已经通过实际本地客户端调用，但尚未注册到当前聊天的工具列表；工作区提供了可供 stdio 客户端加载的启动参数。
+The MCP service has been called by a real local client but is not yet registered in the current chat's tool list; the workspace provides launch parameters that a stdio client can load.
 
-建议下一阶段保留这个桥接架构，为原插件增加正式的无界面导出接口、结构化配置与错误返回，再用真实机器人模型的独立 Pack and Go 副本验证。现有证据足以确认“2026 适配 + 通过底层代码/MCP 调用”这条路线成立；不能据此宣称所有装配体都已兼容。
+The recommended next phase is to keep this bridge architecture, add a proper headless export interface, structured configuration and error returns to the original add-in, and then verify with an independent Pack and Go copy of a real robot model. The current evidence is enough to confirm that the route "2026 adaptation + calling through low-level code/MCP" works; it does not allow claiming that every assembly is compatible.

@@ -18,8 +18,8 @@ validation/*.log
 
 # Machine-specific or private run data; never commit.
 validation/*
-!validation/FEASIBILITY.md
-!validation/TOOL_REPORT.md
+!validation/FEASIBILITY*.md
+!validation/TOOL_REPORT*.md
 examples/robot-configuration-template.json
 mcp-connection.json
 validation/pending-preference-restore/

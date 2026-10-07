@@ -18,7 +18,7 @@
 - 持久任务记录、异步导出、状态查询和明确的超时/失败返回。
 - 本地 stdio MCP 的 8 个工具；已注册到本机 Codex，服务名 solidworks_urdf_2026。
 
-验证记录见 [工具报告](validation/TOOL_REPORT.md)；旧桥接可行性测试保留在 [早期报告](validation/FEASIBILITY.md)。
+验证记录见 [工具报告](validation/TOOL_REPORT.zh-CN.md)；旧桥接可行性测试保留在 [早期报告](validation/FEASIBILITY.zh-CN.md)。
 
 ## 准备环境
 
