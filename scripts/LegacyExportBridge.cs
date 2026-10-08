@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
@@ -195,7 +196,7 @@ public static partial class LegacyExportBridge
         {
             var target = NormalizePreferences(new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(File.ReadAllText(Convert.ToString(request["preferences_path"]))));
             report["target"] = target;
-            Console.Error.WriteLine("Starting private SolidWorks session to restore STL preferences...");
+            SW2URDF.Headless.Progress.Stage("starting_session", "Starting private SolidWorks session to restore STL preferences...");
             app = StartPrivateSession(output, output, report, out privateProcess);
             owned = true;
             RequireSolidWorks2026(app, report);
@@ -265,6 +266,12 @@ public static partial class LegacyExportBridge
         string operation = request != null && request.ContainsKey("operation") ? Convert.ToString(request["operation"]) : "export";
         string configPath = request != null && request.ContainsKey("config_path") ? Convert.ToString(request["config_path"]) : null;
         bool pack = request != null;
+        // A model prepared by an earlier job is already self-contained: copying it is enough,
+        // without opening the original read-only and running Pack and Go again.
+        bool reusePrepared = request != null && request.ContainsKey("prepared_snapshot") && Convert.ToBoolean(request["prepared_snapshot"]);
+        SW2URDF.Headless.Progress.FilePath = Path.Combine(output, "progress.json");
+        // Every document the tool exports from is a private copy that is closed without saving.
+        SW2URDF.Headless.Options.DiscardDocumentAfterExport = true;
         report["operation"] = operation;
         try
         {
@@ -275,11 +282,11 @@ public static partial class LegacyExportBridge
             report["documentType"] = documentType;
             if (!System.Text.RegularExpressions.Regex.IsMatch(package, "^[a-z][a-z0-9_]*$"))
                 throw new ArgumentException("Package name must use lowercase letters, digits and underscores.");
-            if (operation != "export" && operation != "inspect" && operation != "prepare") throw new ArgumentException("Unsupported operation.");
-            if (Directory.Exists(Path.Combine(output, package))) throw new IOException("Output package already exists.");
+            if (operation != "export" && operation != "inspect" && operation != "prepare" && operation != "check") throw new ArgumentException("Unsupported operation: " + operation);
+            if (Directory.Exists(Path.Combine(output, package))) throw new IOException("Output package already exists: " + Path.Combine(output, package));
             ConfigureWorkspaceLog(output);
             URDFPackage.MessageBox = new HeadlessPackageMessages();
-            Console.Error.WriteLine("Starting private SolidWorks session...");
+            SW2URDF.Headless.Progress.Stage("starting_session", "Starting private SolidWorks session...");
             app = StartPrivateSession(output, Path.GetDirectoryName(modelPath), report, out privateProcess);
             owned = true;
             RequireSolidWorks2026(app, report);
@@ -290,25 +297,28 @@ public static partial class LegacyExportBridge
             {
                 currentSourceManifest = new JavaScriptSerializer().Deserialize<SourceManifest>(File.ReadAllText(Convert.ToString(request["source_manifest"])));
                 if (currentSourceManifest.unsaved_changes || !string.Equals(Path.GetFullPath(currentSourceManifest.source_path), Path.GetFullPath(modelPath), StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidOperationException("Active source manifest does not match the requested saved model.");
+                    throw new InvalidOperationException("Active source manifest does not match the requested saved model: manifest " + currentSourceManifest.source_path + " (unsaved changes: " + currentSourceManifest.unsaved_changes + "), requested " + modelPath + ".");
                 report["activeSourceManifestVerified"] = true;
             }
             if (pack)
             {
-                Console.Error.WriteLine("Creating source and dependency snapshots without opening originals...");
+                SW2URDF.Headless.Progress.Stage("snapshot", "Creating source and dependency snapshots without opening originals...");
                 modelPath = StageSourceSnapshot(app, modelPath, output, report);
             }
+            if (reusePrepared) report["reusedPreparedModel"] = Convert.ToString(request["model_path"]);
             app.SetCurrentWorkingDirectory(Path.GetDirectoryName(modelPath));
             int errors = 0, warnings = 0;
-            Console.Error.WriteLine(pack ? "Opening source snapshot read-only..." : "Opening disposable assembly...");
+            bool readOnly = pack && !reusePrepared;
+            SW2URDF.Headless.Progress.Stage("opening", readOnly ? "Opening source snapshot read-only..." : "Opening private copy of the prepared model...");
             doc = app.OpenDoc6(modelPath, documentType,
-                (int)swOpenDocOptions_e.swOpenDocOptions_Silent | (pack ? (int)swOpenDocOptions_e.swOpenDocOptions_ReadOnly : 0), currentSourceManifest == null ? "" : currentSourceManifest.configuration_name, ref errors, ref warnings);
+                (int)swOpenDocOptions_e.swOpenDocOptions_Silent | (readOnly ? (int)swOpenDocOptions_e.swOpenDocOptions_ReadOnly : 0), currentSourceManifest == null ? "" : currentSourceManifest.configuration_name, ref errors, ref warnings);
             report["openErrors"] = errors;
             report["openWarnings"] = warnings;
-            if (doc == null || errors != 0) throw new InvalidOperationException("Assembly open failed: " + errors);
+            if (doc == null || errors != 0) throw new InvalidOperationException("Opening " + modelPath + " failed: " + DescribeFlags(typeof(swFileLoadError_e), errors) + " (warnings: " + DescribeFlags(typeof(swFileLoadWarning_e), warnings) + ").");
             if (documentType == 2) ((AssemblyDoc)doc).ResolveAllLightWeightComponents(false);
             if (documentType == 2) RequireLoadedComponents(doc, report);
-            if (pack)
+            if (reusePrepared) RequireDocumentsInside(app, Convert.ToString(report["snapshotDirectory"]));
+            if (pack && !reusePrepared)
             {
                 string copiedAssembly = PrepareAssemblyCopy(doc, modelPath, output, report);
                 app.CloseDoc(doc.GetTitle());
@@ -320,10 +330,13 @@ public static partial class LegacyExportBridge
                 report["prepared_model"] = copiedAssembly;
                 app.SetCurrentWorkingDirectory(Path.GetDirectoryName(modelPath));
                 errors = 0; warnings = 0;
+                SW2URDF.Headless.Progress.Stage("reopening", "Opening the prepared copy...");
                 doc = app.OpenDoc6(modelPath, documentType, (int)swOpenDocOptions_e.swOpenDocOptions_Silent, currentSourceManifest == null ? "" : currentSourceManifest.configuration_name, ref errors, ref warnings);
-                if (doc == null || errors != 0) throw new InvalidOperationException("Prepared assembly could not be opened: " + errors);
+                if (doc == null || errors != 0) throw new InvalidOperationException("Prepared copy " + modelPath + " could not be opened: " + DescribeFlags(typeof(swFileLoadError_e), errors) + ".");
                 if (documentType == 2) ((AssemblyDoc)doc).ResolveAllLightWeightComponents(false);
             }
+            // Recorded early so that a later failure still leaves a reusable prepared copy.
+            if (documentType == 2) report["components"] = DescribeComponents(doc);
             // Coarse/fine deviation is document-size dependent: compare in the
             // same active document, rather than comparing an empty SW session.
             preferences = Snapshot(app);
@@ -339,11 +352,11 @@ public static partial class LegacyExportBridge
                 var actualComponents = ((AssemblyDoc)doc).GetComponents(false) as object[] ?? new object[0];
                 report["activeInstanceCount"] = actualComponents.Length;
                 if (actualComponents.Length != currentSourceManifest.component_count || Math.Abs(mass.Mass - currentSourceManifest.mass_kg) > Math.Max(1e-8, currentSourceManifest.mass_kg * 1e-6))
-                    throw new InvalidOperationException("Prepared geometry differs from the verified active source model.");
+                    throw new InvalidOperationException("Prepared geometry differs from the verified source model: expected " + currentSourceManifest.component_count + " component instances and " + currentSourceManifest.mass_kg.ToString("R", System.Globalization.CultureInfo.InvariantCulture) + " kg, found " + actualComponents.Length + " instances and " + mass.Mass.ToString("R", System.Globalization.CultureInfo.InvariantCulture) + " kg.");
                 foreach (object item in actualComponents)
                 {
                     var component = (Component2)item;
-                    if (!component.IsSuppressed() && component.GetModelDoc2() == null) throw new InvalidOperationException("An active component did not load: " + component.Name2);
+                    if (!component.IsSuppressed() && component.GetModelDoc2() == null) throw new InvalidOperationException("An active component did not load: " + component.Name2 + " (" + component.GetPathName() + ")");
                     Marshal.ReleaseComObject(item);
                 }
                 report["activeGeometryVerified"] = true;
@@ -352,7 +365,7 @@ public static partial class LegacyExportBridge
             Marshal.ReleaseComObject(extension);
             if (operation == "prepare")
             {
-                report["components"] = documentType == 2 ? (object)DescribeComponents(doc) : new object[0];
+                if (documentType != 2) report["components"] = new object[0];
                 report["status"] = "prepared";
                 code = 0;
                 goto OperationComplete;
@@ -367,8 +380,9 @@ public static partial class LegacyExportBridge
                 partHelper.URDFRobot.BaseLink.Name = "base_link";
                 report["configuration"] = null;
                 report["components"] = new object[0];
-                if (operation == "inspect") { report["status"] = "inspected"; code = 0; goto OperationComplete; }
+                if (operation == "inspect" || operation == "check") { report["status"] = operation == "inspect" ? "inspected" : "checked"; code = 0; goto OperationComplete; }
                 if (!string.IsNullOrEmpty(configPath)) throw new ArgumentException("JSON Link trees apply to assemblies; part export is a single rigid link.");
+                SW2URDF.Headless.Progress.Stage("export_meshes", "Exporting part URDF and STL...", 1);
                 partHelper.ExportLink(false);
                 string partUrdf = Path.Combine(output, package, "urdf", package + ".urdf");
                 if (!File.Exists(partUrdf)) throw new IOException("Part export produced no URDF.");
@@ -379,7 +393,7 @@ public static partial class LegacyExportBridge
                 goto OperationComplete;
             }
             bool configError;
-            Console.Error.WriteLine("Loading saved URDF configuration...");
+            SW2URDF.Headless.Progress.Stage("loading_configuration", string.IsNullOrEmpty(configPath) ? "Loading saved URDF configuration..." : "Resolving JSON configuration against the assembly...");
             LinkNode node;
             ConfigDocument supplied = null;
             if (!string.IsNullOrEmpty(configPath))
@@ -395,11 +409,16 @@ public static partial class LegacyExportBridge
                 {
                     var problemLinks = new List<string>();
                     CommonSwOperations.LoadSWComponents(doc, node, problemLinks);
-                    if (problemLinks.Count != 0) throw new InvalidOperationException("Unresolved component references: " + string.Join(", ", problemLinks));
+                    if (problemLinks.Count != 0 && operation == "inspect")
+                    {
+                        // Inspection still lists components and offers a configuration template.
+                        report["savedConfigurationProblems"] = problemLinks;
+                        node = null;
+                    }
+                    else if (problemLinks.Count != 0) throw new InvalidOperationException("The saved configuration names components that are not in the assembly, in Links: " + string.Join(", ", problemLinks) + ". Inspect the model and export with a JSON configuration.");
                 }
             }
             report["configuration"] = node == null ? null : DescribeConfig(node, package);
-            report["components"] = DescribeComponents(doc);
             List<string> unassigned = null, overlapping = null;
             if (node != null)
             {
@@ -417,22 +436,33 @@ public static partial class LegacyExportBridge
             ValidateResolvedTree(node);
             RequireComponentCoverage(unassigned, overlapping);
             report["componentsResolved"] = true;
+            bool check = operation == "check";
             var helper = new ExportHelper(app);
-            helper.SetComputeInertial(true);
+            // A check needs the Link frames and joints only, not inertia or meshes.
+            helper.SetComputeInertial(!check);
             helper.SetComputeJointKinematics(supplied == null || supplied.recompute_kinematics);
             helper.SetComputeJointLimits(supplied == null || supplied.recompute_kinematics);
-            helper.SetComputeVisualCollision(true);
+            helper.SetComputeVisualCollision(!check);
             helper.SavePath = output;
             helper.PackageName = package;
+            SW2URDF.Headless.Progress.Stage("link_frames", "Preparing Link coordinate systems...");
             PrepareLinkFrames(helper, node, supplied == null || supplied.recompute_kinematics, report);
-            Console.Error.WriteLine("Building links through original ExportHelper...");
-            if (!helper.CreateRobotFromTreeView(node)) throw new InvalidOperationException("Robot construction failed.");
+            SW2URDF.Headless.Progress.Stage("building_links", check ? "Building Links and joints..." : "Building Links, joints and exporter inertia...", CountLinks(node, false));
+            if (!helper.CreateRobotFromTreeView(node)) throw new InvalidOperationException("The original exporter could not build the robot; see bridge-export.log.");
             if (supplied != null && supplied.recompute_kinematics) RequireConfiguredJointTypes(node, supplied, report);
+            report["resolvedJoints"] = DescribeJoints(node);
+            if (check)
+            {
+                report["status"] = "checked";
+                code = 0;
+                goto OperationComplete;
+            }
             ApplyComponentMassProperties(helper, doc, node, report);
-            Console.Error.WriteLine("Exporting URDF and STL through original ExportHelper...");
+            SW2URDF.Headless.Progress.Stage("export_meshes", "Exporting URDF and STL through original ExportHelper...", CountLinks(node, true));
             helper.ExportRobot(true, MeshExportFormat.STL);
+            SW2URDF.Headless.Progress.Stage("closing", "Closing the private session...");
             string urdf = Path.Combine(output, package, "urdf", package + ".urdf");
-            if (!File.Exists(urdf)) throw new IOException("Exporter returned without producing a URDF.");
+            if (!File.Exists(urdf)) throw new IOException("Exporter returned without producing a URDF at " + urdf + "; see bridge-export.log.");
             report["urdf"] = urdf;
             report["jointNames"] = helper.GetJointNames();
             report["status"] = "exported";
@@ -442,6 +472,7 @@ public static partial class LegacyExportBridge
         catch (Exception e)
         {
             report["error"] = e.ToString();
+            report["errorMessage"] = e.Message;
             Console.Error.WriteLine(e.Message);
         }
         finally
@@ -453,14 +484,24 @@ public static partial class LegacyExportBridge
                     if (preferences != null)
                     {
                         Restore(app, preferences);
-                        var after = Snapshot(app);
-                        report["preferencesAfter"] = after;
-                        bool restored = true;
-                        foreach (var item in preferences) if (!SamePreference(item.Value, after[item.Key])) restored = false;
-                        report["preferencesRestored"] = restored;
-                        if (!restored) code = 1;
+                        report["preferencesAfter"] = Snapshot(app);
                     }
                     if (doc != null) { app.CloseDoc(doc.GetTitle()); Marshal.ReleaseComObject(doc); doc = null; }
+                    if (preferences != null)
+                    {
+                        // With a coarse/fine STL quality SolidWorks derives the deviation from the active
+                        // document's size, and the export adds coordinate systems to it. The startup values
+                        // of the empty session are the baseline that is saved to the user's profile.
+                        CloseAllPrivateDocuments(app);
+                        var startup = (Dictionary<string, object>)report["startupPreferences"];
+                        Func<Dictionary<string, object>, List<string>> differing = found => startup.Where(item => !SamePreference(item.Value, found[item.Key])).Select(item => item.Key + ": expected " + Convert.ToString(item.Value, System.Globalization.CultureInfo.InvariantCulture) + ", found " + Convert.ToString(found[item.Key], System.Globalization.CultureInfo.InvariantCulture)).ToList();
+                        var closed = Snapshot(app);
+                        if (differing(closed).Count != 0) { Restore(app, startup); closed = Snapshot(app); }
+                        report["preferencesAfterClosing"] = closed;
+                        var remaining = differing(closed);
+                        report["preferencesRestored"] = remaining.Count == 0;
+                        if (remaining.Count != 0) { report["preferencesNotRestored"] = remaining; code = 1; }
+                    }
                     app.ExitApp();
                     report["cleanup"] = "private_session_closed_without_saving";
                 }

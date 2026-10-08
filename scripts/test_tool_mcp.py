@@ -19,7 +19,7 @@ async def main():
     async with Client(params, read_timeout_seconds=1200) as client:
         tools = await client.list_tools()
         report["tools"] = [tool.name for tool in tools.tools]
-        assert {"inspect_solidworks", "inspect_model_configuration", "prepare_model", "export_urdf", "start_urdf_export", "get_export_job", "validate_configuration", "validate_urdf"} <= set(report["tools"])
+        assert {"inspect_solidworks", "inspect_model_configuration", "prepare_model", "export_urdf", "start_urdf_export", "get_export_job", "cancel_export_job", "validate_configuration", "validate_urdf"} <= set(report["tools"])
         call = await client.call_tool("inspect_solidworks", {})
         assert not call.is_error and call.structured_content["tool_built"]
         report["environment"] = call.structured_content
@@ -39,6 +39,11 @@ async def main():
         report["preparation"] = prepared.structured_content
         prepared_path = prepared.structured_content["bridge"]["prepared_model"]
         print("MCP prepare_model produced a verified reusable CAD snapshot.", flush=True)
+        call = await client.call_tool("export_urdf", {"model_path": prepared_path, "config_path": str(ROOT / "examples" / "arm-custom-config.json"), "check_only": True})
+        assert not call.is_error and call.structured_content["passed"], call.content
+        assert call.structured_content["reused_prepared_model"] and len(call.structured_content["resolved_joints"]) == 4
+        report["check_only"] = call.structured_content
+        print("MCP check_only run on the reused prepared model passed.", flush=True)
         call = await client.call_tool("export_urdf", {"model_path": prepared_path, "package_name": "mcp_custom_arm", "config_path": str(ROOT / "examples" / "arm-custom-config.json")})
         assert not call.is_error, call.content
         result = call.structured_content
@@ -56,22 +61,26 @@ async def main():
         identifier = call.structured_content["job_id"]
         report["async_job_id"] = identifier
         print(f"MCP asynchronous part export queued: {identifier}", flush=True)
-        deadline = time.monotonic() + 240
         observed = []
-        while time.monotonic() < deadline:
-            call = await client.call_tool("get_export_job", {"job_id": identifier})
+        for _ in range(4):
+            call = await client.call_tool("get_export_job", {"job_id": identifier, "wait_seconds": 120})
             assert not call.is_error, call.content
             state = call.structured_content
             observed.append(state["status"])
-            if state["status"] in {"succeeded", "failed", "timed_out", "interrupted"}:
+            if state["status"] in {"succeeded", "failed", "timed_out", "interrupted", "cancelled"}:
                 break
-            await asyncio.sleep(5)
         assert state["passed"] and state["status"] == "succeeded", state
         assert state["validation"]["links"] == 1 and state["validation"]["joints"] == 0
         report["asynchronous_export"] = state
         report["async_states"] = observed
         call = await client.call_tool("validate_urdf", {"urdf_path": state["bridge"]["urdf"]})
         assert not call.is_error and call.structured_content["passed"]
+        call = await client.call_tool("start_urdf_export", {"model_path": str(part), "package_name": "mcp_cancelled_part"})
+        cancelled = call.structured_content["job_id"]
+        call = await client.call_tool("cancel_export_job", {"job_id": cancelled})
+        assert not call.is_error and call.structured_content["status"] == "cancelled", call.content
+        report["cancelled_job"] = call.structured_content
+        print("MCP cancel_export_job stopped a job and cleaned up.", flush=True)
         report["passed"] = True
         REPORT.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
         print("All v2 MCP, configuration, source protection and asynchronous job tests passed.", flush=True)

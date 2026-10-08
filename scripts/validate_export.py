@@ -21,35 +21,43 @@ def _validate(urdf_path: str | Path, reference: str | Path | None = None) -> dic
     if root.tag != "robot" or not links:
         errors.append("URDF must contain a robot with at least one Link")
     if len(set(joint_names)) != len(joint_names):
-        errors.append("Duplicate joint names")
+        errors.append("Duplicate joint names: " + ", ".join(sorted({n for n in joint_names if joint_names.count(n) > 1})))
     if len(set(names)) != len(names):
-        errors.append("Duplicate link names")
+        errors.append("Duplicate link names: " + ", ".join(sorted({n for n in names if names.count(n) > 1})))
     parents, children = [], []
     for joint in joints:
         kind = joint.attrib.get("type")
         if kind not in {"fixed", "continuous", "revolute", "prismatic", "floating", "planar"}:
-            errors.append(f"Unknown joint type: {kind}")
+            errors.append(f"Unknown joint type of {joint.attrib.get('name')}: {kind}")
         parent = joint.find("parent").attrib["link"]
         child = joint.find("child").attrib["link"]
         parents.append(parent)
         children.append(child)
         if parent not in names or child not in names:
-            errors.append(f"Unknown link in {joint.attrib['name']}")
+            errors.append(f"Joint {joint.attrib['name']} connects unknown Link(s): " + ", ".join(n for n in (parent, child) if n not in names))
         if kind not in {"fixed", "floating"}:
             axis = np.fromstring(joint.find("axis").attrib["xyz"], sep=" ")
             if len(axis) != 3 or not np.all(np.isfinite(axis)) or not np.isclose(np.linalg.norm(axis), 1, atol=1e-6):
-                errors.append(f"Invalid joint axis in {joint.attrib['name']}")
+                errors.append(f"Invalid joint axis in {joint.attrib['name']}: xyz \"{joint.find('axis').attrib['xyz']}\" (expected three finite numbers of unit length)")
         if kind in {"revolute", "prismatic"}:
             limit = joint.find("limit")
             if limit is None:
-                errors.append(f"Missing limits in {joint.attrib['name']}")
+                errors.append(f"Missing limits in {kind} joint {joint.attrib['name']}")
             else:
                 numbers = [float(limit.attrib[k]) for k in ("lower", "upper", "effort", "velocity")]
                 if not all(np.isfinite(numbers)) or numbers[0] >= numbers[1] or numbers[2] <= 0 or numbers[3] <= 0:
-                    errors.append(f"Invalid joint limits in {joint.attrib['name']}")
+                    errors.append(f"Invalid joint limits in {joint.attrib['name']}: lower {numbers[0]}, upper {numbers[1]}, effort {numbers[2]}, velocity {numbers[3]} (expected lower < upper, effort > 0, velocity > 0)")
+        mimic = joint.find("mimic")
+        if mimic is not None:
+            followed = mimic.attrib.get("joint")
+            if followed not in joint_names or followed == joint.attrib["name"]:
+                errors.append(f"Joint {joint.attrib['name']} mimics {followed!r}, which is " + ("itself" if followed == joint.attrib["name"] else "not a joint of the URDF"))
+            for key in ("multiplier", "offset"):
+                if key in mimic.attrib and not np.isfinite(float(mimic.attrib[key])):
+                    errors.append(f"Non-finite mimic {key} in {joint.attrib['name']}: {mimic.attrib[key]}")
     roots = set(names) - set(children)
     if len(roots) != 1 or len(joints) != len(links) - 1 or len(set(children)) != len(children):
-        errors.append("Link graph is not a rooted tree")
+        errors.append(f"Link graph is not a rooted tree: {len(links)} Links, {len(joints)} joints, roots {sorted(roots)}" + (f", Links with several parents: {sorted({c for c in children if children.count(c) > 1})}" if len(set(children)) != len(children) else ""))
     reachable = set(roots)
     while True:
         expanded = reachable | {c for p, c in zip(parents, children) if p in reachable}
@@ -57,13 +65,14 @@ def _validate(urdf_path: str | Path, reference: str | Path | None = None) -> dic
             break
         reachable = expanded
     if reachable != set(names):
-        errors.append("Unreachable links or a cycle")
+        errors.append("Links unreachable from the root (or in a cycle): " + ", ".join(sorted(set(names) - reachable)))
     for element in root.iter():
         for attribute in ("xyz", "rpy"):
             if attribute in element.attrib:
                 values = np.fromstring(element.attrib[attribute], sep=" ")
                 if len(values) != 3 or not np.all(np.isfinite(values)):
-                    errors.append(f"Non-finite or malformed {element.tag}.{attribute}")
+                    owner = next((o.attrib.get("name") for o in links + joints if element in o.iter()), "?")
+                    errors.append(f"Non-finite or malformed {element.tag}.{attribute} in {owner}: \"{element.attrib[attribute]}\"")
     for link in links:
         name = link.attrib["name"]
         inertial = link.find("inertial")
@@ -75,15 +84,15 @@ def _validate(urdf_path: str | Path, reference: str | Path | None = None) -> dic
         mass = float(inertial.find("mass").attrib["value"])
         masses[name] = mass
         if not np.isfinite(mass) or mass <= 0:
-            errors.append(f"Invalid mass for {name}")
+            errors.append(f"Invalid mass for {name}: {mass} kg (expected a positive finite value)")
         data = {k: float(v) for k, v in inertial.find("inertia").attrib.items()}
         tensor = np.array([[data['ixx'], data['ixy'], data['ixz']], [data['ixy'], data['iyy'], data['iyz']], [data['ixz'], data['iyz'], data['izz']]])
         if not np.all(np.isfinite(tensor)):
-            errors.append(f"Non-finite inertia for {name}")
+            errors.append(f"Non-finite inertia for {name}: {data}")
         else:
             eig = np.linalg.eigvalsh(tensor)
             if eig[0] <= 0 or eig[2] > eig[0] + eig[1] + 1e-9:
-                errors.append(f"Nonphysical inertia for {name}: {eig.tolist()}")
+                errors.append(f"Nonphysical inertia for {name}: principal moments {eig.tolist()} (expected all positive, largest <= sum of the other two)")
         for role in ("visual", "collision"):
             mesh = link.find(f"{role}/geometry/mesh")
             if mesh is None:
@@ -91,17 +100,17 @@ def _validate(urdf_path: str | Path, reference: str | Path | None = None) -> dic
                 continue
             uri = mesh.attrib["filename"]
             if not uri.startswith("package://"):
-                errors.append(f"Unexpected mesh URI: {uri}")
+                errors.append(f"Unexpected {role} mesh URI of {name}: {uri} (expected package://...)")
                 continue
             relative = uri[len("package://"):].partition("/")[2]
             target = (package_dir / relative).resolve()
             if not target.is_relative_to(package_dir) or not target.is_file():
-                errors.append(f"Missing or invalid mesh path: {uri}")
+                errors.append(f"Missing or invalid {role} mesh of {name}: {uri} (looked for {target})")
                 continue
             if target.name not in meshes:
                 geometry = trimesh.load_mesh(target, process=True)
                 if len(geometry.faces) == 0 or not np.all(np.isfinite(geometry.vertices)):
-                    errors.append(f"Invalid mesh: {target.name}")
+                    errors.append(f"Invalid mesh {target.name}: {len(geometry.faces)} triangles" + ("" if np.all(np.isfinite(geometry.vertices)) else ", non-finite vertices"))
                 meshes[target.name] = {"triangles": len(geometry.faces), "bounds_m": geometry.bounds.tolist() if geometry.bounds is not None else None, "watertight": bool(geometry.is_watertight), "volume_m3": float(abs(geometry.volume)) if len(geometry.faces) else 0.0}
     comparison = {}
     if reference:
@@ -110,7 +119,7 @@ def _validate(urdf_path: str | Path, reference: str | Path | None = None) -> dic
             expected = {e.attrib["name"]: e for e in baseline.findall(tag)}
             actual = {e.attrib["name"]: e for e in root.findall(tag)}
             if expected.keys() != actual.keys():
-                errors.append(f"Reference {tag} names differ")
+                errors.append(f"Reference {tag} names differ: missing {sorted(expected.keys() - actual.keys())}, extra {sorted(actual.keys() - expected.keys())}")
                 continue
             for name, e in actual.items():
                 b = expected[name]
@@ -120,7 +129,7 @@ def _validate(urdf_path: str | Path, reference: str | Path | None = None) -> dic
                     if one is None and two is None:
                         continue
                     if one is None or two is None:
-                        errors.append(f"Reference element differs: {name}.{query}")
+                        errors.append(f"Reference element differs: {name}.{query} is " + ("missing in the export" if one is None else "not in the reference"))
                         continue
                     for key, value in one.attrib.items():
                         if key not in two.attrib:
@@ -131,9 +140,9 @@ def _validate(urdf_path: str | Path, reference: str | Path | None = None) -> dic
                         comparison[f"{name}.{query}.{key}"] = delta
                         # Historic URDF rounding uses five significant digits.
                         if not np.allclose(a, z, rtol=2e-4, atol=2e-6):
-                            errors.append(f"Reference mismatch: {name}.{query}.{key} (delta {delta})")
+                            errors.append(f"Reference mismatch: {name}.{query}.{key} is \"{value}\", reference \"{two.attrib[key]}\" (delta {delta})")
                 if tag == "joint" and e.attrib["type"] != b.attrib["type"]:
-                    errors.append(f"Reference joint type differs: {name}")
+                    errors.append(f"Reference joint type differs: {name} is {e.attrib['type']}, reference {b.attrib['type']}")
                 if tag == "link":
                     mesh = b.find("visual/geometry/mesh")
                     relative = mesh.attrib["filename"][len("package://"):].partition("/")[2]
@@ -148,9 +157,9 @@ def _validate(urdf_path: str | Path, reference: str | Path | None = None) -> dic
                         # and frame offsets (half a percent of the largest extent).
                         tolerance = max(1e-6, float(expected_mesh.extents.max()) * 0.005)
                         if bounds_delta > tolerance:
-                            errors.append(f"Reference mesh scale/frame mismatch: {name} (delta {bounds_delta} m)")
+                            errors.append(f"Reference mesh scale/frame mismatch: {name} bounds differ by {bounds_delta:.6g} m (tolerance {tolerance:.6g} m); export {np.round(meshes[current_name]['bounds_m'], 6).tolist()}, reference {np.round(expected_mesh.bounds, 6).tolist()}")
                     else:
-                        errors.append(f"Cannot compare reference mesh for {name}")
+                        errors.append(f"Cannot compare reference mesh for {name}: reference {old_path} " + ("exists" if old_path.is_file() else "is missing") + f", exported mesh {current_name} " + ("was read" if current_name in meshes else "was not read"))
     return {"passed": not errors, "errors": errors, "links": len(links), "joints": len(joints), "link_names": names, "joint_types": {j.attrib["name"]: j.attrib["type"] for j in joints}, "total_mass_kg": sum(masses.values()), "link_masses_kg": masses, "meshes": meshes, "reference_numeric_deltas": comparison}
 
 
@@ -158,7 +167,7 @@ def validate(urdf_path: str | Path, reference: str | Path | None = None) -> dict
     try:
         return _validate(urdf_path, reference)
     except (OSError, ValueError, TypeError, KeyError, AttributeError, ET.ParseError) as exc:
-        return {"passed": False, "errors": [f"Malformed or unreadable URDF/mesh: {exc}"]}
+        return {"passed": False, "errors": [f"Malformed or unreadable URDF/mesh {urdf_path}: {type(exc).__name__}: {exc}"]}
 
 
 if __name__ == "__main__":

@@ -63,6 +63,13 @@ public static partial class LegacyExportBridge
     {
         return System.Text.RegularExpressions.Regex.IsMatch(path ?? "", @"\\Temp\\swx[^\\]+\\IC~~\\", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
     }
+    // Virtual components live inside the assembly file; SolidWorks lists them at a
+    // temporary VC~~ path ("<assembly>^<part>"). They belong to the opened snapshot
+    // itself, so they are not external dependencies.
+    private static bool IsVirtualComponent(string path)
+    {
+        return (path ?? "").Contains("^") && System.Text.RegularExpressions.Regex.IsMatch(path, @"\\Temp\\swx[^\\]+\\VC~~\\", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+    }
     private static string StageSourceSnapshot(SldWorks app, string source, string output, Dictionary<string, object> report)
     {
         app.SetCurrentWorkingDirectory(Path.GetDirectoryName(source));
@@ -91,7 +98,10 @@ public static partial class LegacyExportBridge
         {
             foreach (var component in currentSourceManifest.components)
             {
-                if (!component.exists && !component.suppressed) throw new FileNotFoundException("Active model has a missing component.", component.path);
+                // Virtual components are stored inside the assembly file itself; 3D Interconnect
+                // components load from their native part, as when staging the original model.
+                if (component.is_virtual || IsVirtualComponent(component.path) || IsInterconnectCache(component.path)) continue;
+                if (!component.exists && !component.suppressed) throw new FileNotFoundException("Active component " + component.name + " has no file at " + component.path + ".", component.path);
                 if (component.exists) files.Add(Path.GetFullPath(component.path));
             }
         }
@@ -99,8 +109,10 @@ public static partial class LegacyExportBridge
         report["sourceHashesBefore"] = before;
         string snapshotRoot = Path.Combine(output, "snapshot");
         var mapping = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        SW2URDF.Headless.Progress.Stage("snapshot", "Copying " + files.Count + " source files and rewriting their references...", files.Count * 2);
         foreach (string file in files)
         {
+            SW2URDF.Headless.Progress.Step(Path.GetFileName(file));
             // Preserve each source directory separately, including basename collisions.
             string directoryKey;
             using (var sha = SHA256.Create()) directoryKey = BitConverter.ToString(sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(Path.GetDirectoryName(file).ToLowerInvariant()))).Replace("-", "").Substring(0, 16);
@@ -114,6 +126,7 @@ public static partial class LegacyExportBridge
         // Only copies are passed as the document to modify. Originals are never opened.
         foreach (var entry in mapping)
         {
+            SW2URDF.Headless.Progress.Step(Path.GetFileName(entry.Key));
             app.SetCurrentWorkingDirectory(Path.GetDirectoryName(entry.Key));
             object storedRaw = app.GetDocumentDependencies2(entry.Key, false, false, false);
             object resolvedRaw = app.GetDocumentDependencies2(entry.Key, false, true, false);
@@ -128,10 +141,10 @@ public static partial class LegacyExportBridge
                     // Absent saved paths (old locations, importer sources) are not snapshot
                     // files; Pack and Go below still rejects any real external dependency.
                     if (!File.Exists(originalReference)) continue;
-                    throw new IOException("Cannot map snapshot reference: " + originalReference);
+                    throw new IOException("Cannot map snapshot reference: " + entry.Key + " refers to " + originalReference + (i < resolved.Length ? " (resolved as " + resolved[i] + ")" : "") + ", which is not among the " + mapping.Count + " snapshot files.");
                 }
                 if (!app.ReplaceReferencedDocument(entry.Value, originalReference, copiedReference))
-                    throw new IOException("Cannot rewrite snapshot reference: " + originalReference);
+                    throw new IOException("Cannot rewrite snapshot reference in " + entry.Value + ": " + originalReference + " -> " + copiedReference);
             }
         }
         report["sourceSnapshotMapping"] = mapping;
@@ -163,15 +176,16 @@ public static partial class LegacyExportBridge
             object originalsRaw;
             if (!pack.GetDocumentNames(out originalsRaw)) throw new IOException("Pack and Go did not enumerate dependencies.");
             string[] originals = ((IEnumerable)originalsRaw).Cast<object>().Select(Convert.ToString).ToArray();
-            if (originals.Length == 0) throw new IOException("No files were found for Pack and Go.");
+            if (originals.Length == 0) throw new IOException("Pack and Go found no documents for " + source + ".");
             var before = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (string file in originals)
             {
+                if (IsVirtualComponent(file)) continue;
                 if (File.Exists(file)) before[file] = HashFile(file);
-                else if (!file.Contains("^"))
+                else
                 {
                     if (IsInterconnectCache(file) || ignoredSavedReferences.Contains(file)) continue;
-                    throw new FileNotFoundException("An assembly dependency is missing.", file);
+                    throw new FileNotFoundException("An assembly dependency is missing: " + file, file);
                 }
             }
             // A caller may already have audited original files before staging.
@@ -181,55 +195,96 @@ public static partial class LegacyExportBridge
             {
                 string snapshotRoot = Path.GetFullPath(Convert.ToString(report["snapshotDirectory"])) + Path.DirectorySeparatorChar;
                 foreach (string file in originals)
-                    if (!IsInterconnectCache(file) && !ignoredSavedReferences.Contains(file) && !Path.GetFullPath(file).StartsWith(snapshotRoot, StringComparison.OrdinalIgnoreCase))
+                    if (!IsInterconnectCache(file) && !IsVirtualComponent(file) && !ignoredSavedReferences.Contains(file) && !Path.GetFullPath(file).StartsWith(snapshotRoot, StringComparison.OrdinalIgnoreCase))
                         throw new IOException("Snapshot has an external dependency; refusing to run Pack and Go: " + file);
             }
-            var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var targets = new string[originals.Length];
-            for (int i = 0; i < originals.Length; i++)
+            // Virtual components are stored inside their assembly. SolidWorks accepts only its own default
+            // destination for them (an empty or renamed destination rejects the whole list, verified on a
+            // model with 12 of them), so they keep it and travel inside the copied assembly.
+            object defaultsRaw, defaultsStatus;
+            if (!pack.GetDocumentSaveToNames(out defaultsRaw, out defaultsStatus)) throw new IOException("Cannot read Pack and Go default destinations for " + originals.Length + " documents.");
+            string[] defaults = ((IEnumerable)defaultsRaw).Cast<object>().Select(Convert.ToString).ToArray();
+            if (defaults.Length != originals.Length) throw new IOException("Pack and Go lists " + originals.Length + " documents but " + defaults.Length + " default destinations.");
+            // Cached importer files and saved-but-absent references have nothing to copy: try an empty
+            // destination first and the default one if SolidWorks refuses.
+            string[] PlanTargets(bool missingEmpty)
             {
-                if (!File.Exists(originals[i]) && (IsInterconnectCache(originals[i]) || ignoredSavedReferences.Contains(originals[i]))) { targets[i] = ""; continue; }
-                string name = Path.GetFileName(originals[i]);
-                // Distinct directories may contain identically named vendor parts.
-                if (!used.Add(name))
+                var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var plan = new string[originals.Length];
+                for (int i = 0; i < originals.Length; i++)
                 {
-                    name = Path.GetFileNameWithoutExtension(name) + "_dep_" + i + Path.GetExtension(name);
-                    if (!used.Add(name)) throw new IOException("Cannot assign unique dependency filenames.");
+                    if (IsVirtualComponent(originals[i])) { plan[i] = defaults[i]; continue; }
+                    if (!File.Exists(originals[i]) && (IsInterconnectCache(originals[i]) || ignoredSavedReferences.Contains(originals[i]))) { plan[i] = missingEmpty ? "" : defaults[i]; continue; }
+                    string name = Path.GetFileName(originals[i]);
+                    // Distinct directories may contain identically named vendor parts.
+                    if (!used.Add(name))
+                    {
+                        name = Path.GetFileNameWithoutExtension(name) + "_dep_" + i + Path.GetExtension(name);
+                        if (!used.Add(name)) throw new IOException("Cannot assign unique dependency filenames.");
+                    }
+                    plan[i] = Path.Combine(destination, name);
                 }
-                targets[i] = Path.Combine(destination, name);
+                return plan;
             }
-            if (!pack.SetDocumentSaveToNames(targets)) throw new IOException("Pack and Go rejected destination filenames.");
+            report["packOriginals"] = originals;
+            var attempts = new Dictionary<string, bool>();
+            report["packSetAttempts"] = attempts;
+            string[] targets = null;
+            foreach (bool missingEmpty in new[] { true, false })
+            {
+                string[] plan = PlanTargets(missingEmpty);
+                bool accepted = pack.SetDocumentSaveToNames(plan);
+                attempts[missingEmpty ? "missing-empty" : "missing-default"] = accepted;
+                if (accepted) { targets = plan; break; }
+            }
+            if (targets == null)
+            {
+                Func<int, string> kind = i => IsVirtualComponent(originals[i]) ? "virtual" : !File.Exists(originals[i]) ? "absent" : "file";
+                var counts = Enumerable.Range(0, originals.Length).GroupBy(kind).Select(g => g.Count() + " " + g.Key);
+                var plan = PlanTargets(true);
+                var sample = Enumerable.Range(0, originals.Length).Where(i => kind(i) != "file").Concat(Enumerable.Range(0, originals.Length).Where(i => kind(i) == "file")).Take(8)
+                    .Select(i => "[" + kind(i) + "] " + originals[i] + " -> '" + plan[i] + "' (default '" + defaults[i] + "')");
+                throw new IOException("Pack and Go rejected both destination plans (" + string.Join(", ", attempts.Keys) + ") for " + originals.Length + " documents (" + string.Join(", ", counts) + "). First entries: " + string.Join("; ", sample) + ". Full lists: bridge.packOriginals and the job's bridge-result.json.");
+            }
             object effectiveRaw, effectiveStatus;
             if (!pack.GetDocumentSaveToNames(out effectiveRaw, out effectiveStatus)) throw new IOException("Cannot verify Pack and Go destinations.");
             var effective = ((IEnumerable)effectiveRaw).Cast<object>().Select(Convert.ToString).ToArray();
             report["packDestinations"] = effective;
             if (effective.Length != targets.Length || effective.Where((value, index) => !string.Equals(value, targets[index], StringComparison.OrdinalIgnoreCase)).Any())
-                throw new IOException("Pack and Go destination verification failed.");
-            Console.Error.WriteLine("Copying " + originals.Length + " CAD dependencies through Pack and Go...");
+            {
+                var differences = Enumerable.Range(0, Math.Min(effective.Length, targets.Length)).Where(i => !string.Equals(effective[i], targets[i], StringComparison.OrdinalIgnoreCase)).Take(8)
+                    .Select(i => originals[i] + ": expected '" + targets[i] + "', SolidWorks kept '" + effective[i] + "'");
+                throw new IOException("Pack and Go destination verification failed (" + targets.Length + " planned, " + effective.Length + " reported): " + string.Join("; ", differences));
+            }
+            SW2URDF.Headless.Progress.Stage("pack_and_go", "Copying " + originals.Length + " CAD dependencies through Pack and Go...");
             object results = extension.SavePackAndGo(pack);
             if (results == null) throw new IOException("Pack and Go returned no save status.");
             var statuses = ((IEnumerable)results).Cast<object>().Select(Convert.ToInt32).ToArray();
             report["packSaveStatuses"] = statuses;
-            if (statuses.Where((s, i) => s != 0 && !(s == 3 && statuses.Length == targets.Length && targets[i] == "")).Any()) throw new IOException("Pack and Go save failed: " + string.Join(",", statuses));
+            var failedSaves = Enumerable.Range(0, statuses.Length).Where(i => statuses[i] != 0 && !(statuses[i] == 3 && statuses.Length == targets.Length && targets[i] == "")).ToList();
+            if (failedSaves.Count != 0)
+                throw new IOException("Pack and Go could not save " + failedSaves.Count + " of " + statuses.Length + " documents: " + string.Join("; ", failedSaves.Take(8).Select(i => (i < originals.Length ? originals[i] + " -> '" + targets[i] + "'" : "#" + i) + ": " + (Enum.GetName(typeof(swPackAndGoSaveStatus_e), statuses[i]) ?? "status") + " (" + statuses[i] + ")")));
             var after = before.Keys.ToDictionary(p => p, HashFile, StringComparer.OrdinalIgnoreCase);
             if (!staged)
             {
                 report["sourceHashesAfter"] = after;
                 bool unchanged = before.All(p => after[p.Key] == p.Value);
                 report["sourceUnchanged"] = unchanged;
-                if (!unchanged) throw new IOException("Source CAD changed during preparation; refusing export.");
+                if (!unchanged) throw new IOException("Source CAD changed during preparation; refusing export. Changed files: " + string.Join(", ", before.Where(p => after[p.Key] != p.Value).Select(p => p.Key)));
             }
             var mapping = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < originals.Length; i++)
             {
                 mapping[originals[i]] = targets[i];
-                if (targets[i] != "" && !File.Exists(targets[i]) && !originals[i].Contains("^")) throw new IOException("Pack and Go omitted " + originals[i]);
+                if (targets[i] != "" && File.Exists(originals[i]) && !IsVirtualComponent(originals[i]) && !File.Exists(targets[i])) throw new IOException("Pack and Go omitted " + originals[i]);
             }
             report["dependencyMapping"] = mapping;
             report["dependencyCount"] = originals.Length;
             string originalModel = Path.GetFullPath(source);
             string packed = mapping.FirstOrDefault(p => string.Equals(Path.GetFullPath(p.Key), originalModel, StringComparison.OrdinalIgnoreCase)).Value;
-            if (string.IsNullOrEmpty(packed) || !File.Exists(packed)) throw new IOException("Packed top-level assembly was not found.");
+            if (string.IsNullOrEmpty(packed) || !File.Exists(packed)) throw new IOException("Packed top-level assembly was not found: expected the copy of " + originalModel + " at '" + packed + "'.");
+            // Fingerprint of the copy as written, so a later job can reuse it after checking nothing changed.
+            report["preparedHashes"] = Directory.GetFiles(destination).Where(f => f.EndsWith(".sldprt", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".sldasm", StringComparison.OrdinalIgnoreCase)).ToDictionary(f => f, HashFile, StringComparer.OrdinalIgnoreCase);
             return packed;
         }
         finally
@@ -299,13 +354,13 @@ public static partial class LegacyExportBridge
         var nodes = new Dictionary<string, LinkNode>();
         foreach (var settings in config.links)
         {
-            if (string.IsNullOrWhiteSpace(settings.name) || nodes.ContainsKey(settings.name)) throw new ArgumentException("Duplicate or empty link name.");
+            if (string.IsNullOrWhiteSpace(settings.name) || nodes.ContainsKey(settings.name)) throw new ArgumentException(string.IsNullOrWhiteSpace(settings.name) ? "A Link has an empty name." : "Duplicate Link name: " + settings.name);
             var link = new Link { Name = settings.name, isFixedFrame = settings.frame_only, STLQualityFine = settings.mesh_quality == "fine" };
             link.Joint.CoordinateSystemName = settings.coordinate_system;
             foreach (string name in settings.components ?? new string[0])
             {
                 Component2 component;
-                if (!components.TryGetValue(name, out component)) throw new ArgumentException("Component not found: " + name);
+                if (!components.TryGetValue(name, out component)) throw new ArgumentException("Link " + settings.name + " names component '" + name + "', which is not in the assembly. " + SimilarNames(name, components.Keys));
                 link.SWComponents.Add(component);
             }
             if (settings.joint != null)
@@ -333,13 +388,13 @@ public static partial class LegacyExportBridge
             node.IsBaseNode = settings.parent == null;
             if (settings.parent == null)
             {
-                if (root != null) throw new ArgumentException("Multiple root links.");
+                if (root != null) throw new ArgumentException("Multiple root Links: " + root.Link.Name + " and " + settings.name + " both have parent null.");
                 root = node;
             }
             else
             {
                 LinkNode parent;
-                if (!nodes.TryGetValue(settings.parent, out parent) || parent == node) throw new ArgumentException("Invalid parent link.");
+                if (!nodes.TryGetValue(settings.parent, out parent) || parent == node) throw new ArgumentException("Link " + settings.name + " has parent '" + settings.parent + "', " + (parent == node ? "which is itself." : "which is not a Link of the configuration."));
                 parent.Nodes.Add(node);
                 node.Link.Parent = parent.Link;
                 node.Link.Joint.Parent.Name = parent.Link.Name;
@@ -349,9 +404,9 @@ public static partial class LegacyExportBridge
         if (root == null) throw new ArgumentException("No root link.");
         var visited = new HashSet<string>();
         Action<LinkNode> visit = null;
-        visit = node => { if (!visited.Add(node.Link.Name)) throw new ArgumentException("Cycle in Link tree."); foreach (LinkNode child in node.Nodes) visit(child); };
+        visit = node => { if (!visited.Add(node.Link.Name)) throw new ArgumentException("Cycle in Link tree at " + node.Link.Name + "."); foreach (LinkNode child in node.Nodes) visit(child); };
         visit(root);
-        if (visited.Count != nodes.Count) throw new ArgumentException("Disconnected Link tree.");
+        if (visited.Count != nodes.Count) throw new ArgumentException("Links not reachable from root " + root.Link.Name + ": " + string.Join(", ", nodes.Keys.Where(k => !visited.Contains(k))));
         return root;
     }
 
@@ -417,6 +472,80 @@ public static partial class LegacyExportBridge
             throw new FileNotFoundException(missing.Count + " active component(s) reference files that are not on this computer: " + string.Join("; ", missing.Take(20)) + ". Restore the files, or suppress the components in the active configuration and save.");
     }
 
+    // Names the set bits of a SolidWorks status code, e.g. "swFileNotFoundError (2)".
+    private static string DescribeFlags(Type flags, int value)
+    {
+        if (value == 0) return "none (0)";
+        var names = Enum.GetValues(flags).Cast<object>().Select(Convert.ToInt32).Distinct()
+            .Where(bit => bit != 0 && (bit & (bit - 1)) == 0 && (value & bit) == bit).Select(bit => Enum.GetName(flags, bit)).ToList();
+        if (names.Count == 0 && Enum.IsDefined(flags, value)) names.Add(Enum.GetName(flags, value));
+        return (names.Count == 0 ? "unknown" : string.Join(" | ", names)) + " (" + value + ")";
+    }
+
+    private static string SimilarNames(string wanted, IEnumerable<string> available)
+    {
+        Func<string, string, int> distance = (a, b) =>
+        {
+            var row = Enumerable.Range(0, b.Length + 1).ToArray();
+            for (int i = 1; i <= a.Length; i++)
+            {
+                int previous = row[0];
+                row[0] = i;
+                for (int j = 1; j <= b.Length; j++)
+                {
+                    int current = row[j];
+                    row[j] = Math.Min(Math.Min(row[j] + 1, row[j - 1] + 1), previous + (char.ToLowerInvariant(a[i - 1]) == char.ToLowerInvariant(b[j - 1]) ? 0 : 1));
+                    previous = current;
+                }
+            }
+            return row[b.Length];
+        };
+        var similar = available.Select(n => new { name = n, cost = distance(wanted, n) }).Where(n => n.cost <= Math.Max(3, wanted.Length / 3)).OrderBy(n => n.cost).ThenBy(n => n.name).Take(5).Select(n => n.name).ToList();
+        return similar.Count != 0 ? "Similar names: " + string.Join(", ", similar) + "." : "Run inspect to list component names (inspection result: components).";
+    }
+
+    // A reused prepared model must load nothing from outside its private copy.
+    private static void RequireDocumentsInside(SldWorks app, string directory)
+    {
+        string root = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var outside = new List<string>();
+        foreach (object item in app.GetDocuments() as object[] ?? new object[0])
+        {
+            string path = ((ModelDoc2)item).GetPathName() ?? "";
+            if (path.Length != 0 && !IsVirtualComponent(path) && !IsInterconnectCache(path) && !Path.GetFullPath(path).StartsWith(root, StringComparison.OrdinalIgnoreCase)) outside.Add(path);
+            Marshal.ReleaseComObject(item);
+        }
+        if (outside.Count != 0)
+            throw new IOException(outside.Count + " document(s) of the reused prepared model loaded from outside its private copy " + root + ": " + string.Join(", ", outside.Take(10)) + ". Prepare the model again.");
+    }
+
+    private static int CountLinks(LinkNode node, bool withGeometry)
+    {
+        int own = withGeometry && node.Link.isFixedFrame ? 0 : 1;
+        foreach (LinkNode child in node.Nodes) own += CountLinks(child, withGeometry);
+        return own;
+    }
+
+    // The joints as the exporter resolved them, for a check run to report.
+    private static List<Dictionary<string, object>> DescribeJoints(LinkNode root)
+    {
+        var joints = new List<Dictionary<string, object>>();
+        Action<LinkNode> visit = null;
+        visit = node => {
+            foreach (LinkNode child in node.Nodes)
+            {
+                var joint = child.Link.Joint;
+                joints.Add(new Dictionary<string, object> {
+                    { "name", joint.Name }, { "type", joint.Type }, { "parent", node.Link.Name }, { "child", child.Link.Name },
+                    { "coordinate_system", joint.CoordinateSystemName }, { "xyz", joint.Origin.GetXYZ() }, { "rpy", joint.Origin.GetRPY() },
+                    { "axis", joint.Type == "fixed" ? null : joint.Axis.GetXYZ() } });
+                visit(child);
+            }
+        };
+        visit(root);
+        return joints;
+    }
+
     public const string AssemblyOriginFrame = "Assembly Origin";
     private const string AutomaticFrame = "Automatically Generate";
 
@@ -425,7 +554,7 @@ public static partial class LegacyExportBridge
         MathTransform transform = null;
         try { transform = helper.GetToolFrameTransform(name); }
         catch (NullReferenceException) { }
-        if (transform == null) throw new InvalidOperationException("Coordinate system not found in the assembly: " + name);
+        if (transform == null) throw new InvalidOperationException("Coordinate system '" + name + "' was not found in the top-level assembly. Use a coordinate system of the assembly itself (not of a part or sub-assembly), \"Assembly Origin\" for the root Link, or \"Automatically Generate\".");
         return MathOps.GetTransformation(transform);
     }
 
@@ -458,6 +587,7 @@ public static partial class LegacyExportBridge
         if (recompute) return;
         var frames = new Dictionary<string, object>();
         var mismatches = new List<string>();
+        var createdMismatches = new List<string>();
         Action<LinkNode, Matrix<double>> visit = null;
         visit = (node, pose) => {
             frames[node.Link.Name] = new Dictionary<string, object> { { "coordinate_system", node.Link.Joint.CoordinateSystemName }, { "assembly_xyz", MathOps.GetXYZ(pose) }, { "assembly_rpy", MathOps.GetRPY(pose) } };
@@ -469,8 +599,10 @@ public static partial class LegacyExportBridge
                 if (joint.CoordinateSystemName == AutomaticFrame)
                 {
                     joint.CoordinateSystemName = helper.CreateToolFrame(configured, "Origin_" + joint.Name);
-                    if (PoseDifference(FramePose(helper, joint.CoordinateSystemName), configured) > 1e-6)
-                        throw new InvalidOperationException("The coordinate system created for " + joint.Name + " does not match its configured origin.");
+                    var created = FramePose(helper, joint.CoordinateSystemName);
+                    double difference = PoseDifference(created, configured);
+                    if (difference > 1e-6)
+                        createdMismatches.Add(joint.Name + ": the created coordinate system '" + joint.CoordinateSystemName + "' differs from its configured origin by " + difference.ToString("0.#########", System.Globalization.CultureInfo.InvariantCulture) + " (assembly frame: configured xyz " + FormatVector(MathOps.GetXYZ(configured)) + " rpy " + FormatVector(MathOps.GetRPY(configured)) + ", created xyz " + FormatVector(MathOps.GetXYZ(created)) + " rpy " + FormatVector(MathOps.GetRPY(created)) + ")");
                 }
                 else
                 {
@@ -486,6 +618,8 @@ public static partial class LegacyExportBridge
         };
         visit(root, FramePose(helper, rootJoint.CoordinateSystemName));
         report["linkFrames"] = frames;
+        if (createdMismatches.Count != 0)
+            throw new InvalidOperationException("Generated coordinate systems do not reproduce the configured joint origins: " + string.Join("; ", createdMismatches));
         if (mismatches.Count != 0)
             throw new InvalidOperationException("Configured joint origins disagree with named coordinate systems. Use the coordinate system values, or set coordinate_system to \"Automatically Generate\": " + string.Join("; ", mismatches));
     }
@@ -596,9 +730,21 @@ public static partial class LegacyExportBridge
         Action<LinkNode> collect = null;
         collect = node => { if (!node.Link.isFixedFrame && node.Link.SWComponents.Count != 0) links.Add(node.Link); foreach (LinkNode child in node.Nodes) collect(child); };
         collect(root);
-        var cad = links.ToDictionary(l => l, l => ComponentMassProperties(model, l.SWComponents, helper.GetToolFrameTransform(l.Joint.CoordinateSystemName)));
+        SW2URDF.Headless.Progress.Stage("mass_properties", "Reading component mass properties of each Link...", links.Count);
+        var cad = links.ToDictionary(l => l, l => { SW2URDF.Headless.Progress.Step(l.Name); return ComponentMassProperties(model, l.SWComponents, helper.GetToolFrameTransform(l.Joint.CoordinateSystemName)); });
         var disagreeing = new List<string>();
         var overrides = new List<object>();
+        // Instances of one part file and configuration share their masses; large links repeat the
+        // same fasteners and profiles hundreds of times (e.g. 610 instances of 124 files in a large assembly).
+        var componentMasses = new Dictionary<string, double[]>(StringComparer.OrdinalIgnoreCase);
+        Func<Component2, double[]> massesOf = c =>
+        {
+            string key = c.GetPathName() + "|" + c.ReferencedConfiguration;
+            double[] known;
+            if (!componentMasses.TryGetValue(key, out known))
+                componentMasses[key] = known = new[] { ComponentMassProperties(model, new[] { c }, null)[0], GeometricMass(model, new[] { c }) };
+            return known;
+        };
         foreach (var link in links)
         {
             var values = cad[link];
@@ -608,8 +754,9 @@ public static partial class LegacyExportBridge
                 if (!Enumerable.Range(0, 3).All(i => Close(values[1 + i], center[i], 0, 1e-6))) disagreeing.Add(link.Name + " center of mass");
                 continue;
             }
+            SW2URDF.Headless.Progress.Stage("mass_overrides", "Mass of " + link.Name + " differs from its geometry; checking its components for overrides...", link.SWComponents.Count);
             var components = link.SWComponents
-                .Select(c => new { name = c.Name2, cad = ComponentMassProperties(model, new[] { c }, null)[0], geometric = GeometricMass(model, new[] { c }) })
+                .Select(c => { SW2URDF.Headless.Progress.Step(c.Name2); var known = massesOf(c); return new { name = c.Name2, cad = known[0], geometric = known[1] }; })
                 .Where(c => !Close(c.cad, c.geometric, 1e-5, 1e-12))
                 .Select(c => new Dictionary<string, object> { { "component", c.name }, { "cad_mass_kg", c.cad }, { "geometric_mass_kg", c.geometric } }).ToList();
             overrides.Add(new Dictionary<string, object> { { "link", link.Name }, { "cad_mass_kg", values[0] }, { "geometric_mass_kg", link.Inertial.Mass.Value }, { "components", components } });

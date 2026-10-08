@@ -34,6 +34,15 @@ TOOL_HOOKS = '''        internal string CreateToolBaseFrame(bool zIsUp)
                 unique = name + i.ToString();
             }
             ActiveSWModel.ClearSelection2(true);
+            // Every frame gets its own 3D sketch. In the shared sketch SolidWorks merges new geometry
+            // that coincides with an earlier frame's, and the new frame then lands 1 cm along its Y
+            // axis from the requested origin (every joint sharing a position with an earlier one).
+            if (ActiveSWModel.SketchManager.ActiveSketch != null)
+            {
+                ActiveSWModel.SketchManager.Insert3DSketch(true);
+                ActiveSWModel.ClearSelection2(true);
+            }
+            ActiveSWModel.SketchManager.Insert3DSketch(true);
             Origin origin = new Origin(true);
             origin.SetXYZ(MathOps.GetXYZ(pose));
             origin.SetRPY(MathOps.GetRPY(pose));
@@ -80,12 +89,19 @@ for source in files:
         text = patch(text, key, "IMassProperty swMass = swModel.Extension.CreateMassProperty();", "IMassProperty swMass = swModel.Extension.CreateMassProperty();\n            swMass.UseSystemUnits = true;", 1)
         # Hooks for the tool: build link frames from configured joints and read them back.
         text = patch(text, key, "        //Creates the Origin_global coordinate system\n", TOOL_HOOKS + "\n        //Creates the Origin_global coordinate system\n", 1)
+        # Progress for job queries: one step per Link built.
+        text = patch(text, key, 'progressBar.UpdateTitle("Building link: " + node.Name);', 'progressBar.UpdateTitle("Building link: " + node.Name);\n            SW2URDF.Headless.Progress.Step(node.Name);', 1)
     if key == "URDF/Link.cs":
         for name in ("Inertial", "Visual", "Collision"):
             text = patch(text, key, f"if ({name} != null)", f"if ({name} != null && !isFixedFrame)", 1)
     if key == "URDFExport/ExportHelper.cs":
         text = patch(text, key, "if (!child.isFixedFrame)\n                {\n                    ExportFiles(child, package, count, exportSTL, meshFormat);\n                }", "ExportFiles(child, package, count, exportSTL, meshFormat);", 1)
         text = patch(text, key, "// Copy the texture file (if it was specified) to the textures directory", "if (link.isFixedFrame) return;\n\n            // Copy the texture file (if it was specified) to the textures directory", 1)
+        # Progress for job queries: one step per mesh.
+        text = patch(text, key, 'logger.Info(link.Name + ": Exporting STL with coordinate frame " + coordsysName);', 'logger.Info(link.Name + ": Exporting STL with coordinate frame " + coordsysName);\n            SW2URDF.Headless.Progress.Step(link.Name);', 1)
+        # Restoring visibility component by component took 10 of 38 minutes on a 700-part model.
+        # The tool exports from a private copy that is closed without saving, so it skips it.
+        text = patch(text, key, "CommonSwOperations.ShowAllComponents(ActiveSWModel, hiddenComponents);", "if (!SW2URDF.Headless.Options.DiscardDocumentAfterExport) CommonSwOperations.ShowAllComponents(ActiveSWModel, hiddenComponents);", 1)
     if key == "URDF/URDFAttribute.cs":
         text = patch(text, key, "Value.GetType()", "Value?.GetType()", 5)
     target.write_text(text, encoding="utf-8")
@@ -101,6 +117,46 @@ namespace SW2URDF.Headless {
     public static class Errors {
         public static void Show(string message) { throw new InvalidOperationException(message); }
         public static DialogResult Show(string message, string caption, MessageBoxButtons buttons) { throw new InvalidOperationException(caption + ": " + message); }
+    }
+    public static class Options {
+        // Set when the document is a private copy closed without saving after the export.
+        public static bool DiscardDocumentAfterExport;
+    }
+    // Stage and step counters for job queries, written to a JSON file the tool reads.
+    public static class Progress {
+        public static string FilePath;
+        private static readonly object Gate = new object();
+        private static string stage = "", detail = "";
+        private static int current, total;
+        private static DateTime stageStarted = DateTime.UtcNow, lastWrite = DateTime.MinValue;
+        public static void Stage(string name, string message, int steps = 0) {
+            lock (Gate) {
+                stage = name; detail = ""; current = 0; total = steps; stageStarted = DateTime.UtcNow;
+                Console.Error.WriteLine("[" + DateTime.Now.ToString("HH:mm:ss") + "] " + message + (steps > 0 ? " (" + steps + ")" : ""));
+                Write();
+            }
+        }
+        public static void Step(string item) {
+            lock (Gate) {
+                current++; detail = item ?? "";
+                // Steps of large models come in hundreds; the file need not follow each one.
+                if (current == total || (DateTime.UtcNow - lastWrite).TotalSeconds >= 1) {
+                    Console.Error.WriteLine("[" + DateTime.Now.ToString("HH:mm:ss") + "]   " + current + (total > 0 ? "/" + total : "") + " " + detail);
+                    Write();
+                }
+            }
+        }
+        private static void Write() {
+            lastWrite = DateTime.UtcNow;
+            if (string.IsNullOrEmpty(FilePath)) return;
+            try {
+                string json = new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(new { stage = stage, detail = detail, current = current, total = total, stage_started_at = stageStarted.ToString("o"), updated_at = lastWrite.ToString("o") });
+                string temporary = FilePath + ".tmp";
+                System.IO.File.WriteAllText(temporary, json);
+                if (System.IO.File.Exists(FilePath)) System.IO.File.Replace(temporary, FilePath, null);
+                else System.IO.File.Move(temporary, FilePath);
+            } catch (System.IO.IOException) { } catch (UnauthorizedAccessException) { } // A reader may hold the file briefly.
+        }
     }
 }
 namespace SW2URDF.UI {

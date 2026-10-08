@@ -15,8 +15,10 @@
 - fixed、continuous、revolute、prismatic のジョイントと、ジオメトリを持たない固定座標フレームに対応します。
 - ディレクトリをまたぐ CAD 依存関係のスナップショット、参照の書き換え、Pack and Go。同名の依存ファイルには別のファイル名を割り当てます。
 - 実ファイルのハッシュ監査、質量・慣性・メッシュの検証、STL 設定の復元、独立プロセスのクリーンアップ。
-- 永続的なジョブ記録、非同期エクスポート、状態の問い合わせ、明確なタイムアウト/失敗の返却。
-- ローカル stdio MCP の 8 ツール。Codex に `solidworks_urdf_2026` として登録できます。
+- 永続的なジョブ記録、非同期エクスポート、段階とステップ数付きの進捗問い合わせ、待機、キャンセル、停滞検出、明確な失敗の返却。
+- 関節と Link 座標系まで実行して止まるチェック専用モードと、準備済み CAD コピーの再利用による、設定の素早い試行錯誤。
+- JSON 設定からの mimic 関節と world ルートフレーム（Z 軸上向き・接地・中心合わせ）。1 回のエクスポートでそのまま使える URDF が得られます。
+- ローカル stdio MCP の 9 ツール。Codex に `solidworks_urdf_2026` として登録できます。
 
 検証記録は [ツールレポート](validation/TOOL_REPORT.ja.md) を参照してください。以前のブリッジ実現性テストは [初期レポート](validation/FEASIBILITY.ja.md) に残してあります。
 
@@ -55,20 +57,36 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-tool.ps1
 # 単一パーツ
 .\.venv\Scripts\python.exe scripts\tool_cli.py export "C:\path\part.SLDPRT" --package part_description
 
-# 大きなモデルはバックグラウンドでジョブを開始し、あとで問い合わせる
-.\.venv\Scripts\python.exe scripts\tool_cli.py start-export "C:\path\robot.SLDASM" --package robot_description --timeout 1200
-.\.venv\Scripts\python.exe scripts\tool_cli.py job "<返された job_id>"
+# JSON 設定を関節と Link 座標系までだけ検証する（慣性もメッシュも計算しない）
+.\.venv\Scripts\python.exe scripts\tool_cli.py check "C:\path\robot.SLDASM" --config "C:\path\robot-config.json"
+
+# 大きなモデルはバックグラウンドでジョブを開始し、完了を待つ（終わり次第戻る）かキャンセルする
+.\.venv\Scripts\python.exe scripts\tool_cli.py start-export "C:\path\robot.SLDASM" --package robot_description --config "C:\path\robot-config.json"
+.\.venv\Scripts\python.exe scripts\tool_cli.py job "<返された job_id>" --wait 300
+.\.venv\Scripts\python.exe scripts\tool_cli.py cancel "<返された job_id>"
 
 # 自己完結した CAD コピーだけを作成する
 .\.venv\Scripts\python.exe scripts\tool_cli.py prepare "C:\path\robot.SLDASM"
 
 # SolidWorks を起動せずに設定を検証する
 .\.venv\Scripts\python.exe scripts\tool_cli.py validate-config examples\arm-custom-config.json
+
+# このコンピューター上の任意の URDF パッケージを検証する（プロジェクトにコピーしたものなど）
+.\.venv\Scripts\python.exe scripts\tool_cli.py validate-urdf "C:\project\robot_description\urdf\robot_description.urdf"
 ```
+
+CAD コマンドはいずれも `--timeout`（総時間の上限、既定 14400 秒）、`--stall-timeout`（既定 900 秒、後述）、`--use-saved-files` を受け付けます。
 
 操作のたびに `validation/jobs/<job_id>/` が作られます。`result.json` には、ステータス、元ファイルの SHA-256、設定の復元、物理検証、エラーが記録され、`stdout.log`/`stderr.log` にはネイティブのログが残ります。操作のすべてのチェックに合格したことを示すのは、`status=succeeded` かつ `passed=true` の場合だけです。`queued`/`running` や「一部のファイルが生成された」状態を成功とみなしてはいけません。
 
 ディレクトリには、元のスナップショット、準備済みの CAD、エクスポートパッケージが同居することがあります。最終的な URDF の絶対パスは `bridge.urdf` にあります。既定では過去のジョブや出力を上書きしません。
+
+### 試行錯誤を速くする
+
+- **チェック専用。** `check`（MCP：`check_only=true`）はエクスポートを Link 座標系と関節まで進めて止まり、慣性・質量特性・STL は扱いません。結果には `resolved_joints`（各関節の種類・原点・軸）、`link_frames`、`recompute_kinematics=true` なら `detected_joint_types` が入ります。コンポーネント名の誤り、関節原点と合わない座標系、関節種類の誤検出などの設定ミスが、完全なエクスポートを待たずに数分で分かります。
+- **準備済みコピーの再利用。** Pack and Go を実行した inspect・prepare・check・export はすべて `reusable_model` を返します。ファイルのハッシュ一覧付きの自己完結した CAD コピーで、コピーが変更されていなければエクスポート失敗後も使えます。次回のモデルパスに渡すと、ハッシュを照合してフォルダーを複製し直接開くため、元モデルの読み取り専用オープンと Pack and Go を省略できます。
+- **進捗。** `job` / `get_export_job` は `progress` を返します：段階（例 `export_meshes`）、`Exporting STL meshes: 7/18 (gripper_z)` のような要約、ステップ数、経過秒数、現段階の秒数、SolidWorks の CPU 秒数、最後に作業の兆候があってからの `idle_seconds`、ログの末尾数行。`stderr.log` にはタイムスタンプが付きます。
+- 失敗時は `error.stage` が発生した段階を示します。
 
 ## JSON 設定
 
@@ -84,18 +102,26 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-tool.ps1
 - `frame_only=true` の Link は質量・ビジュアル・コリジョンのジオメトリを出力しませんが、その子孫は通常どおり処理されます。
 - 座標系と基準軸は、モデルにすでにある基準ジオメトリに基づくべきです。ツールが実際のジョイントの意図やアクチュエータのパラメータを推測することはありません。
 
-チェッカーは、循環または切断された Link ツリー、コンポーネントの二重割り当て、軸の長さの誤り、無効なリミット、有限でない数値を拒否します。inspect の結果では、`unassigned_components` がどの Link にも割り当てられていない実体パーツを、`overlapping_components` が直接割り当てと親子アセンブリ経由の割り当ての両方に該当するコンポーネントを列挙します。どちらかが空でないと `configuration_ready=false` となり、エクスポートはメッシュ生成前にコンポーネント名を示して失敗します。JSON モードが扱うのは上記の Link/Joint フィールドで、mimic や外観といった旧設定の複雑なフィールドは、まだすべては JSON 編集インターフェースに公開されていません。
+次の 2 つは、CAD エクスポーターが URDF を書き出した後にツールが加えます。エクスポーター自身のファイルはジョブディレクトリの `native.urdf` として残り、変更内容は `postprocess` に記録されます。
+
+- `joint.mimic`：`{"joint": "<追従する関節>", "multiplier": 1, "offset": 0}` で URDF の `<mimic>` 要素を追加します（対称グリッパーのもう一方の指など）。両方とも可動関節である必要があり、mimic 関節が別の mimic 関節に追従することはできません。
+- `world`（トップレベル）：ルート Link の上にルート Link（既定 `world`）と固定関節（既定 `world_to_base`）を追加します。`up_axis`（`+z`、`-z`、`+y`、`-y`、`+x`、`-x`）は URDF の +Z になるモデルの軸（Y 軸上向きのモデルなら `+y`）、または `rpy` で回転を直接指定します。`ground: true` はメッシュの最下点を z=0 に、`center_xy: true` はメッシュの外接箱を x=y=0 の中心に合わせます。どちらもエクスポートしたメッシュから全関節ゼロの姿勢で計算し、`xyz` はさらにオフセットを加えます。例：`"world": {"up_axis": "+y", "ground": true, "center_xy": true}`。
+
+モデルに保存済みの設定がない（または存在しないコンポーネントを参照する古い設定しかない）場合、inspect は `configuration_path` にテンプレート（`configuration_source=template`）を返します。最上位のコンポーネントをすべて 1 つの `base_link` に入れたもので、チェックを通り単一の剛体としてエクスポートでき、可動 Link を切り出す出発点になります。
+
+チェッカーは、循環または切断された Link ツリー、コンポーネントの二重割り当て、軸の長さの誤り、無効なリミット、有限でない数値を拒否し、各メッセージは対象の Link または関節と、期待値・実際の値を示します。inspect の結果では、`unassigned_components` がどの Link にも割り当てられていない実体パーツを、`overlapping_components` が直接割り当てと親子アセンブリ経由の割り当ての両方に該当するコンポーネントを列挙します。どちらかが空でないと `configuration_ready=false` となり、エクスポートはメッシュ生成前にコンポーネント名を示して失敗します。JSON モードが扱うのは上記の Link/Joint フィールドで、旧設定の外観設定は JSON 編集インターフェースに公開されていません。
 
 ## Python
 
 ```python
 import sys
 sys.path.insert(0, r"C:\path\to\solidworks-urdf-tool\scripts")
-from tool_service import inspect_model, export_urdf, start_export, get_job
+from tool_service import inspect_model, check_configuration, export_urdf, start_export, wait_job, cancel_job
 
 result = export_urdf(r"C:\path\robot.SLDASM", "robot_description")
-# config_path / reference_urdf / timeout_seconds はキーワード引数のみ
-result = export_urdf(r"C:\path\robot.SLDASM", "robot_description", config_path=r"C:\path\robot-config.json")
+# config_path / reference_urdf / timeout_seconds / stall_timeout_seconds / use_saved_files はキーワード引数のみ
+check = check_configuration(r"C:\path\robot.SLDASM", r"C:\path\robot-config.json")
+result = export_urdf(check.get("reusable_model") or r"C:\path\robot.SLDASM", "robot_description", config_path=r"C:\path\robot-config.json")
 assert result["passed"], result.get("error")
 print(result["bridge"]["urdf"])
 ```
@@ -104,7 +130,7 @@ print(result["bridge"]["urdf"])
 
 サーバーは `scripts/mcp_server.py` で、ワークスペースの Python で起動します。ほかの stdio クライアントは [mcp-connection.example.json](mcp-connection.example.json) をテンプレートとして使い、`<REPO_ROOT>` をこのリポジトリのパスに置き換えてください。開発時の Codex 設定では、起動タイムアウトは 60 秒、ツールのタイムアウトは 1200 秒で、登録で追加されるのはこのサーバーだけです（ほかのサーバーやセキュリティ設定は変更しません）。
 
-8 つのツール：`inspect_solidworks`、`inspect_model_configuration`、`prepare_model`、`validate_configuration`、`export_urdf`、`start_urdf_export`、`get_export_job`、`validate_urdf`。大きなモデルでは `start_urdf_export` を使い、`get_export_job` で最終状態を確認してください。
+9 つのツール：`inspect_solidworks`、`inspect_model_configuration`、`prepare_model`、`validate_configuration`、`export_urdf`、`start_urdf_export`、`get_export_job`、`cancel_export_job`、`validate_urdf`。`export_urdf` と `start_urdf_export` は `check_only`、`use_saved_files`、`timeout_seconds`、`stall_timeout_seconds` を受け付けます。大きなモデルでは `start_urdf_export` を使い、`wait_seconds`（例 300）付きで `get_export_job` を呼んでください。呼び出しはジョブの完了を待ち、終了状態になった時点ですぐ戻るので、クライアントはシェルの `sleep` も頻繁なポーリングも不要です。`validate_urdf` はこのコンピューター上の任意の URDF と、任意の `reference_urdf` を受け付けます。
 
 ブロッキング型のツール（`export_urdf`、`inspect_model_configuration`、`prepare_model`）もバックグラウンドジョブとして実行され、最大 1000 秒待機します（環境変数 `SW_URDF_SYNC_WAIT_SECONDS` で調整できます。クライアントのツールタイムアウトより小さくしてください）。その時点で完了していなければ `still_running=true` と `job_id` が返り、ジョブは実行を続けるので、`get_export_job` で問い合わせます。
 
@@ -116,9 +142,9 @@ print(result["bridge"]["urdf"])
 
 保存された参照がこのコンピューターにないファイル（旧構成、インポート元ファイル、ライブラリ部品など）を指していても、先に SolidWorks でモデルを開く必要はありません。ツールはスナップショット作成時にそのパスをスキップし、開いたスナップショットで抑制されていないすべてのコンポーネントが読み込まれたことを確認します。アクティブなコンポーネントのファイルが欠けている場合だけ、コンポーネント名とパスを示して失敗します。スキップした参照とファイルのない抑制コンポーネントは result.json の `warnings` に記録されます。
 
-保存済みのアセンブリが SolidWorks で開かれている場合は、さらに読み取り専用のアクティブモデル一覧を読み、スナップショットの構成名、コンポーネント数、ネイティブの質量が一致することを求めます。未保存の変更があるアクティブモデルは拒否されるため、ユーザーが明示的に保存してからエクスポートしてください。
+保存済みのアセンブリが SolidWorks で開かれている場合は、さらに読み取り専用のアクティブモデル一覧を読み、スナップショットの構成名、コンポーネント数、ネイティブの質量が一致することを求めます。開いているモデルに未保存の変更があると、ジョブは `UNSAVED_CHANGES` で失敗します。SolidWorks で保存するか、保存せずに閉じてから再実行してください。または `use_saved_files=true`（CLI：`--use-saved-files`）で、ディスクに保存済みの版をエクスポートし未保存の変更を無視できます。その旨は結果の `warnings` に記録されます。
 
-操作は直列に実行され、複数のエクスポートがグローバルな STL 設定を上書きし合うのを防ぎます。後から来たジョブは最大 3600 秒 `queued`（`result.json` の `queue=waiting_for_cad_lock`）のまま待ち、超過すると `CAD_BUSY` を返します。先着順は保証されません。実行プロセスは PID と開始時刻を登録し、プロセスが消えた、または 120 秒以内に登録されなかったジョブは `get_export_job` が `interrupted` とマークします。タイムアウト時はジョブが失敗を返し、PID と開始時刻を照合したうえで独立セッションをクリーンアップします。`timed_out`/`interrupted` ジョブの出力を正式なモデルに使ってはいけません。
+操作は直列に実行され、複数のエクスポートがグローバルな STL 設定を上書きし合うのを防ぎます。後から来たジョブは最大 3600 秒 `queued`（`result.json` の `queue=waiting_for_cad_lock`）のまま待ち、超過すると `CAD_BUSY` を返します。先着順は保証されません。実行プロセスは PID と開始時刻を登録し、プロセスが消えた、または 120 秒以内に登録されなかったジョブは `get_export_job` が `interrupted` とマークします。実行中のジョブが止められるのは停滞したときです：`stall_timeout_seconds`（既定 900 秒）の間、進捗も、ツールとその SolidWorks プロセスの CPU 時間も増えなかった場合です（大きな STL 1 つのような長いステップの間は SolidWorks が計算し続けるため停滞とはみなしません）。`timeout_seconds`（既定 14400 秒）は総時間の上限にすぎません。停滞は `error.code=CAD_STALLED`、上限超過は `CAD_TIMEOUT` で終わり、いずれも `status=timed_out` で、メッセージに段階が示されます。`cancel` / `cancel_export_job` は待機中または実行中のジョブを止めます（`status=cancelled`）。どの場合も PID と開始時刻を照合して独立セッションをクリーンアップし、後述のとおり STL 設定を復元します。`timed_out`/`interrupted`/`cancelled` ジョブの出力を正式なモデルに使ってはいけません。
 
 プライベートセッションは、ローカルの SolidWorks とユーザー設定を共有します。ネイティブコアは起動直後に STL 関連の設定を `output/preferences-snapshot.json` に保存します。ジョブがタイムアウトまたは失敗して復元が確認できなかった場合、ツールは別のプライベートセッションを起動して設定をそのスナップショットの状態に戻し、結果を `result.json` の `preference_restore` に記録します（`changed_keys` は実際に元へ戻した項目です）。ワーカーが予期せず終了したジョブは、`get_export_job` により復元待ちとマークされ、次の CAD ジョブの開始前に復元が実行されます。
 
@@ -130,9 +156,13 @@ print(result["bridge"]["urdf"])
 .\.venv\Scripts\python.exe scripts\test_configuration.py
 .\.venv\Scripts\python.exe scripts\test_validation.py
 .\.venv\Scripts\python.exe scripts\test_jobs.py
+.\.venv\Scripts\python.exe scripts\test_postprocess.py
+.\.venv\Scripts\python.exe scripts\test_cad_regressions.py
 .\.venv\Scripts\python.exe scripts\test_tool_mcp.py
 .\.venv\Scripts\python.exe scripts\test_registered_mcp.py
 ```
+
+`test_cad_regressions.py` には SolidWorks が必要です。仮想部品を含むサンプルアームのコピーを作成し、仮想部品を含む Pack and Go、同じ原点を共有する関節、チェック専用モード、準備済みコピーの再利用、進捗記録、mimic/world 設定、誤ったコンポーネント名を示すエラーメッセージを検証します。
 
 元のエクスポートソースのスナップショット：882169e28952f0d17c87d7eab98826454421aabf（MIT）。`build/core-source-manifest.json` に上流の各ファイルのハッシュと改造マーカーが記録され、`build/core-source` で生成後のソースを確認できます。ソース準備のルールは `scripts/prepare-core.py` にあります。
 

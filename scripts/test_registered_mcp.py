@@ -19,14 +19,14 @@ async def main():
     async with Client(params, read_timeout_seconds=60) as client:
         result = await client.list_tools()
         names = [tool.name for tool in result.tools]
-        assert len(names) == 8
+        assert len(names) == 9 and "cancel_export_job" in names
         call = await client.call_tool("inspect_solidworks", {})
         assert not call.is_error and call.structured_content["exit_code"] == 0
         checks = await client.call_tool("validate_configuration", {"config_path": str(ROOT / "examples" / "arm-custom-config.json")})
         assert not checks.is_error and checks.structured_content["passed"]
         report = {"passed": True, "server": "solidworks_urdf_2026", "tools": names, "environment_probe": call.structured_content, "configuration_validation": checks.structured_content, "startup_timeout_sec": config["startup_timeout_sec"], "tool_timeout_sec": config["tool_timeout_sec"]}
         (ROOT / "validation" / "registered-mcp-test.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-        print("Registered Codex MCP configuration starts successfully and exposes all 8 tools.")
+        print("Registered Codex MCP configuration starts successfully and exposes all 9 tools.")
 
 
 if __name__ == "__main__":
