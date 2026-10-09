@@ -164,7 +164,7 @@ The output is the original project's traditional ROS URDF package. ROS 2 launch 
 
 `test_cad_regressions.py` needs SolidWorks: it authors a copy of the sample arm with a virtual component, then covers Pack and Go with virtual components, joints that share one origin, check-only runs, reuse of a prepared copy, progress records, mimic/world settings and error messages that name the wrong component.
 
-Original export source snapshot: 882169e28952f0d17c87d7eab98826454421aabf, MIT. `build/core-source-manifest.json` records the hash and adaptation marker of every upstream file, and `build/core-source` holds the generated source for review. The source preparation rules are in `scripts/prepare-core.py`.
+Original export source snapshot: 882169e28952f0d17c87d7eab98826454421aabf, MIT. `build/core-source-manifest.json` records the hash and adaptation marker of every upstream file, and `build/core-source` holds the generated source for review. The source preparation rules are in `scripts/prepare-core.py`. The comment at the top of each exported URDF credits this tool and the upstream author; upstream's own header is replaced by a patch in the same script.
 
 A previously downloaded `solidworks_urdf_exporter2` is kept in `vendor` for reference; this version does not use it for exports. The upstream license is kept in `vendor`, and `SW2URDF-LICENSE.txt` ships with the local native build.
 
