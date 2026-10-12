@@ -79,6 +79,8 @@ The CAD commands accept `--timeout` (hard limit, default 14400 s), `--stall-time
 
 Every operation creates `validation/jobs/<job_id>/`. `result.json` records the status, the SHA-256 of the original files, settings restoration, physical validation and errors; `stdout.log`/`stderr.log` keep the native logs. Only `status=succeeded` with `passed=true` means every check of the operation passed. `queued`/`running`, or "some files were produced", must never be treated as success.
 
+Export validation also places every Link at zero pose and fails when the mesh box of a child Link is more than 0.5 % of the robot's size (at least 2 mm) away from its parent's, which catches a root frame rotated by "Automatically Generate" and other frame offsets; `validation.link_world_bounds_m` lists each Link's world box. Every export also writes `front.png`, `side.png` and `top.png` (from +X, -Y and +Z, one color per Link) to `previews/` in the package, listed in `previews.images` of result.json; look at them before using the export, because a rotation about a point inside the parent can keep the boxes touching. `validate-urdf --previews` and `validate_urdf(render_previews=true)` render the same images for any URDF.
+
 The directory may contain the source snapshot, the prepared CAD and the export package side by side; the absolute path of the final URDF is in `bridge.urdf`. Old jobs and outputs are not overwritten by default.
 
 ### Faster iteration

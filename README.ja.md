@@ -79,6 +79,8 @@ CAD コマンドはいずれも `--timeout`（総時間の上限、既定 14400 
 
 操作のたびに `validation/jobs/<job_id>/` が作られます。`result.json` には、ステータス、元ファイルの SHA-256、設定の復元、物理検証、エラーが記録され、`stdout.log`/`stderr.log` にはネイティブのログが残ります。操作のすべてのチェックに合格したことを示すのは、`status=succeeded` かつ `passed=true` の場合だけです。`queued`/`running` や「一部のファイルが生成された」状態を成功とみなしてはいけません。
 
+エクスポートの検証では各 Link をゼロ姿勢に配置し、子 Link のメッシュの境界ボックスが親からロボット寸法の 0.5 %（最小 2 mm）より離れていると失敗にします。"Automatically Generate" で回転したルート座標系などの座標系のずれを検出できます。各 Link のワールド境界ボックスは `validation.link_world_bounds_m` にあります。また、エクスポートごとにパッケージの `previews/` に `front.png`、`side.png`、`top.png`（+X、-Y、+Z から見た図、Link ごとに色分け）を書き出し、パスは result.json の `previews.images` に記録されます。親の内部の点まわりの回転では境界ボックスが接したままのことがあるため、使う前に必ず画像を確認してください。`validate-urdf --previews` と `validate_urdf(render_previews=true)` で任意の URDF の画像も作れます。
+
 ディレクトリには、元のスナップショット、準備済みの CAD、エクスポートパッケージが同居することがあります。最終的な URDF の絶対パスは `bridge.urdf` にあります。既定では過去のジョブや出力を上書きしません。
 
 ### 試行錯誤を速くする

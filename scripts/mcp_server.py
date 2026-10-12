@@ -9,6 +9,7 @@ from export_service import inspect_environment as inspect_sw
 from tool_service import start_job, get_job, cancel_job, TERMINAL, DEFAULT_TIMEOUT_SECONDS, DEFAULT_STALL_SECONDS
 from configuration import validate_config
 from validate_export import validate
+import render_preview
 from pathlib import Path
 from typing import Any
 
@@ -101,12 +102,18 @@ def validate_configuration(config_path: str) -> dict[str, Any]:
 
 
 @server.tool(structured_output=True)
-def validate_urdf(urdf_path: str, reference_urdf: str | None = None) -> dict[str, Any]:
-    """Check link graph, joint axes, mimic joints, masses, inertia tensors and referenced meshes of any URDF package on this computer."""
+def validate_urdf(urdf_path: str, reference_urdf: str | None = None, render_previews: bool = False) -> dict[str, Any]:
+    """Check link graph, joint axes, mimic joints, masses, inertia tensors, referenced meshes and zero-pose Link placement of any URDF package on this computer.
+
+    render_previews=true also writes front/side/top PNG renders to previews/ in the package (paths in previews.images).
+    """
     path = Path(urdf_path).resolve()
     if path.suffix.lower() != ".urdf" or not path.is_file():
         raise ValueError(f"urdf_path must be an existing .urdf file, got {str(path)!r}.")
-    return validate(path, reference_urdf)
+    result = validate(path, reference_urdf)
+    if render_previews:
+        result["previews"] = render_preview.render(path, path.parent.parent / "previews")
+    return result
 
 
 if __name__ == "__main__":

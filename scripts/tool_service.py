@@ -18,6 +18,7 @@ import uuid
 
 from configuration import load_config, native_config, needs_postprocess, skeleton_config, validate_config
 from validate_export import validate
+import render_preview
 import urdf_postprocess
 
 WORKSPACE = Path(__file__).resolve().parent.parent
@@ -471,6 +472,11 @@ def _validate_export(directory, record, bridge, config):
             checks["errors"].append(message)
     checks["passed"] = not checks["errors"]
     record["validation"] = checks
+    # Renders are for the user to look at; failing to draw them does not fail the export.
+    try:
+        record["previews"] = render_preview.render(bridge["urdf"], Path(bridge["urdf"]).parent.parent / "previews")
+    except Exception as exc:
+        record["previews"] = {"error": f"{type(exc).__name__}: {exc}"}
 
 
 def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):

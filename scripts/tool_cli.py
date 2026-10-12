@@ -6,6 +6,7 @@ from pathlib import Path
 from tool_service import DEFAULT_STALL_SECONDS, DEFAULT_TIMEOUT_SECONDS, TERMINAL, cancel_job, operation, run_job, start_job, wait_job
 from configuration import validate_config
 from validate_export import validate
+import render_preview
 
 
 def main():
@@ -35,6 +36,7 @@ def main():
     urdf = commands.add_parser("validate-urdf")
     urdf.add_argument("urdf")
     urdf.add_argument("--reference")
+    urdf.add_argument("--previews", action="store_true", help="also write front/side/top renders to previews/ in the package")
     arguments = parser.parse_args()
     try:
         if arguments.command in {"inspect", "prepare", "check", "export", "start-export"}:
@@ -54,6 +56,9 @@ def main():
             result = run_job(arguments.job_id)
         elif arguments.command == "validate-urdf":
             result = validate(arguments.urdf, arguments.reference)
+            if arguments.previews:
+                target = Path(arguments.urdf).resolve()
+                result["previews"] = render_preview.render(target, target.parent.parent / "previews")
         else:
             result = validate_config(json.loads(Path(arguments.config).read_text(encoding="utf-8-sig")))
     except Exception as exc:

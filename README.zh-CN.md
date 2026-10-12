@@ -79,6 +79,8 @@ CAD 命令都接受 --timeout（总时长上限，默认 14400 秒）、--stall-
 
 每次操作生成 validation/jobs/<job_id>/。result.json 记录状态、原文件 SHA-256、设置恢复、物理校验和错误；stdout.log/stderr.log 保留原生日志。status=succeeded 且 passed=true 才表示该操作所有检查通过。queued/running 和“已生成部分文件”均不能视为成功。
 
+导出校验还会把每个 Link 放到零位，若子 Link 的网格包围盒与父 Link 的相距超过机器人尺寸的 0.5%（至少 2 mm）即判为失败，可拦住被 "Automatically Generate" 旋转的根坐标系等坐标系偏移；`validation.link_world_bounds_m` 列出各 Link 的世界包围盒。每次导出还会在包内 `previews/` 生成 `front.png`、`side.png`、`top.png`（分别从 +X、-Y、+Z 看，每个 Link 一种颜色），路径见 result.json 的 `previews.images`；使用导出前请先看一眼，因为绕父 Link 内部某点的旋转仍可能让包围盒相接。`validate-urdf --previews` 和 `validate_urdf(render_previews=true)` 可为任意 URDF 生成同样的图。
+
 目录中可能同时存在源快照、准备后的 CAD 和导出包；最终 URDF 的绝对路径在 bridge.urdf 中。默认不覆盖旧任务或旧输出。
 
 ### 加快排查

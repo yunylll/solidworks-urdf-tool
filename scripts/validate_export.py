@@ -7,6 +7,84 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 import trimesh
+from trimesh.transformations import euler_matrix
+
+# Mated parts touch, so the zero-pose boxes of a child Link and its parent may
+# only be apart by tessellation noise: this share of the robot's largest extent.
+PLACEMENT_TOLERANCE_SHARE = 0.005
+PLACEMENT_TOLERANCE_MIN_M = 0.002
+
+
+def origin_matrix(origin) -> np.ndarray:
+    """Homogeneous transform of a URDF <origin> (fixed-axis roll, pitch, yaw)."""
+    matrix = np.eye(4)
+    if origin is not None:
+        matrix = euler_matrix(*np.fromstring(origin.attrib.get("rpy", "0 0 0"), sep=" "), axes="sxyz")
+        matrix[:3, 3] = np.fromstring(origin.attrib.get("xyz", "0 0 0"), sep=" ")
+    return matrix
+
+
+def link_world_transforms(root) -> dict[str, np.ndarray]:
+    """Zero-pose frame of every Link reachable from a root of the joint tree."""
+    joints = {j.find("child").attrib["link"]: (j.find("parent").attrib["link"], origin_matrix(j.find("origin"))) for j in root.findall("joint")}
+    frames = {}
+    for link in root.findall("link"):
+        chain, name = [], link.attrib["name"]
+        while name in joints and name not in frames and name not in chain:
+            chain.append(name)
+            name = joints[name][0]
+        if name in chain:
+            continue  # Cycle; reported by the tree check.
+        frames.setdefault(name, np.eye(4))
+        for child in reversed(chain):
+            frames[child] = frames[joints[child][0]] @ joints[child][1]
+    return frames
+
+
+def visual_mesh_path(link, package_dir: Path) -> Path | None:
+    mesh = link.find("visual/geometry/mesh")
+    if mesh is None or not mesh.attrib.get("filename", "").startswith("package://"):
+        return None
+    target = (package_dir / mesh.attrib["filename"][len("package://"):].partition("/")[2]).resolve()
+    return target if target.is_relative_to(package_dir) and target.is_file() else None
+
+
+def world_box(local_bounds, transform: np.ndarray) -> np.ndarray:
+    """Axis-aligned box in the world of a local box moved by transform."""
+    corners = trimesh.bounds.corners(np.asarray(local_bounds)) @ transform[:3, :3].T + transform[:3, 3]
+    return np.array([corners.min(axis=0), corners.max(axis=0)])
+
+
+def _placement(root, links, package_dir, meshes, errors):
+    """Zero-pose world box of every Link mesh, and an error for each child Link that does not touch its parent."""
+    frames = link_world_transforms(root)
+    boxes = {}
+    for link in links:
+        name, target = link.attrib["name"], visual_mesh_path(link, package_dir)
+        if name in frames and target is not None and meshes.get(target.name, {}).get("bounds_m") is not None:
+            boxes[name] = world_box(meshes[target.name]["bounds_m"], frames[name] @ origin_matrix(link.find("visual/origin")))
+    if not boxes:
+        return {}
+    union = np.array([np.min([b[0] for b in boxes.values()], axis=0), np.max([b[1] for b in boxes.values()], axis=0)])
+    tolerance = max(PLACEMENT_TOLERANCE_MIN_M, float((union[1] - union[0]).max()) * PLACEMENT_TOLERANCE_SHARE)
+    parent_of = {j.find("child").attrib["link"]: j.find("parent").attrib["link"] for j in root.findall("joint")}
+    for name, box in boxes.items():
+        # Compare with the nearest ancestor that has a mesh (coordinate-only Links have none).
+        parent, seen = parent_of.get(name), {name}
+        while parent is not None and parent not in boxes and parent not in seen:
+            seen.add(parent)
+            parent = parent_of.get(parent)
+        if parent is None or parent not in boxes:
+            continue
+        other = boxes[parent]
+        separation = np.maximum(0, np.maximum(box[0] - other[1], other[0] - box[1]))
+        gap = float(np.linalg.norm(separation))
+        if gap > tolerance:
+            axes = ", ".join(f"{axis} {value:.4g} m" for axis, value in zip("xyz", separation) if value > 0)
+            errors.append(f"Link placement: at zero pose the mesh of {name} is {gap:.4g} m away from the mesh of its parent {parent} ({axes}; tolerance {tolerance:.3g} m). "
+                          f"{name} spans {np.round(box, 4).tolist()}, {parent} {np.round(other, 4).tolist()}. A mesh or Link frame is probably rotated or offset, "
+                          "for example by an \"Automatically Generate\" root coordinate system; check the previews.")
+    return {name: np.round(box, 6).tolist() for name, box in boxes.items()}
 
 
 def _validate(urdf_path: str | Path, reference: str | Path | None = None) -> dict:
@@ -112,6 +190,7 @@ def _validate(urdf_path: str | Path, reference: str | Path | None = None) -> dic
                 if len(geometry.faces) == 0 or not np.all(np.isfinite(geometry.vertices)):
                     errors.append(f"Invalid mesh {target.name}: {len(geometry.faces)} triangles" + ("" if np.all(np.isfinite(geometry.vertices)) else ", non-finite vertices"))
                 meshes[target.name] = {"triangles": len(geometry.faces), "bounds_m": geometry.bounds.tolist() if geometry.bounds is not None else None, "watertight": bool(geometry.is_watertight), "volume_m3": float(abs(geometry.volume)) if len(geometry.faces) else 0.0}
+    world_bounds = _placement(root, links, package_dir, meshes, errors) if reachable == set(names) else {}
     comparison = {}
     if reference:
         baseline = ET.parse(reference).getroot()
@@ -160,7 +239,7 @@ def _validate(urdf_path: str | Path, reference: str | Path | None = None) -> dic
                             errors.append(f"Reference mesh scale/frame mismatch: {name} bounds differ by {bounds_delta:.6g} m (tolerance {tolerance:.6g} m); export {np.round(meshes[current_name]['bounds_m'], 6).tolist()}, reference {np.round(expected_mesh.bounds, 6).tolist()}")
                     else:
                         errors.append(f"Cannot compare reference mesh for {name}: reference {old_path} " + ("exists" if old_path.is_file() else "is missing") + f", exported mesh {current_name} " + ("was read" if current_name in meshes else "was not read"))
-    return {"passed": not errors, "errors": errors, "links": len(links), "joints": len(joints), "link_names": names, "joint_types": {j.attrib["name"]: j.attrib["type"] for j in joints}, "total_mass_kg": sum(masses.values()), "link_masses_kg": masses, "meshes": meshes, "reference_numeric_deltas": comparison}
+    return {"passed": not errors, "errors": errors, "links": len(links), "joints": len(joints), "link_names": names, "joint_types": {j.attrib["name"]: j.attrib["type"] for j in joints}, "total_mass_kg": sum(masses.values()), "link_masses_kg": masses, "meshes": meshes, "link_world_bounds_m": world_bounds, "reference_numeric_deltas": comparison}
 
 
 def validate(urdf_path: str | Path, reference: str | Path | None = None) -> dict:
