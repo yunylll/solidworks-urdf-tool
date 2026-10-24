@@ -71,11 +71,17 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-tool.ps1
 # SolidWorks を起動せずに設定を検証する
 .\.venv\Scripts\python.exe scripts\tool_cli.py validate-config examples\arm-custom-config.json
 
+# 設定がモデルの現在の CAD バージョン用かどうかも報告（ファイルを読むだけ）
+.\.venv\Scripts\python.exe scripts\tool_cli.py validate-config "C:\path\robot-config.json" --model "C:\path\robot.SLDASM"
+
 # このコンピューター上の任意の URDF パッケージを検証する（プロジェクトにコピーしたものなど）
 .\.venv\Scripts\python.exe scripts\tool_cli.py validate-urdf "C:\project\robot_description\urdf\robot_description.urdf"
+
+# 2 つのエクスポートを比較：数値の差は失敗、reference_motion に各メッシュと関節原点の移動量
+.\.venv\Scripts\python.exe scripts\tool_cli.py validate-urdf "C:\new\urdf\robot.urdf" --reference "C:\old\urdf\robot.urdf"
 ```
 
-CAD コマンドはいずれも `--timeout`（総時間の上限、既定 14400 秒）、`--stall-timeout`（既定 900 秒、後述）、`--use-saved-files` を受け付けます。
+CAD コマンドはいずれも `--timeout`（総時間の上限、既定 14400 秒）、`--stall-timeout`（既定 900 秒、後述）、`--use-saved-files` を受け付けます。`check`、`export`、`start-export` はさらに `--accept-source-change`、`--kinematics-tolerance-mm`、`--kinematics-tolerance-deg`、`--write-config-source`、`--recompute-preflight` を、`export`/`start-export` は `--no-compare-previous` を受け付けます（後述の「CAD バージョンと前回のエクスポート」を参照）。
 
 操作のたびに `validation/jobs/<job_id>/` が作られます。`result.json` には、ステータス、元ファイルの SHA-256、設定の復元、物理検証、エラーが記録され、`stdout.log`/`stderr.log` にはネイティブのログが残ります。操作のすべてのチェックに合格したことを示すのは、`status=succeeded` かつ `passed=true` の場合だけです。`queued`/`running` や「一部のファイルが生成された」状態を成功とみなしてはいけません。
 
@@ -90,11 +96,20 @@ CAD コマンドはいずれも `--timeout`（総時間の上限、既定 14400 
 - **進捗。** `job` / `get_export_job` は `progress` を返します：段階（例 `export_meshes`）、`Exporting STL meshes: 7/18 (gripper_z)` のような要約、ステップ数、経過秒数、現段階の秒数、SolidWorks の CPU 秒数、最後に作業の兆候があってからの `idle_seconds`、ログの末尾数行。`stderr.log` にはタイムスタンプが付きます。
 - 失敗時は `error.stage` が発生した段階を示します。
 
+### CAD バージョンと前回のエクスポート
+
+`recompute_kinematics=false` の設定は、ある版の CAD から写した絶対的な関節原点を持っています。その後アセンブリが原点に対してモデルを動かした状態で保存されると、メッシュは CAD に追従しますが関節原点は追従せず、新しい URDF は単体ではすべての検査に合格してしまいます。これを次の 2 つの検査で検出します。
+
+- **設定の CAD バージョン。** JSON 設定を使った `check` または `export` が合格すると、検証した CAD バージョンを記録します。ジョブの `config_with_source_path` は `source` ブロック（`model_sha256`、`model_path`、`exported_at`、`job_id`、`operation`、ルート Link 座標系での各 Link 座標系の姿勢 `link_frames`、各 Link の最初のコンポーネントのアセンブリ内の姿勢 `component_poses`）付きの設定で、`--write-config-source`（MCP/Python：`write_config_source=true`）を指定すると、このブロックを `--config` のファイル自体に書き込みます（ジョブ中にファイルが変更された場合は書き込みません）。`source` ブロックのない設定は、同じモデルで同じ関節原点を使った過去のジョブから出所を推定します（`config_source.origin=inferred_from_job`。そのジョブがコンポーネントの姿勢を記録していればそれも使います）。そのバージョンがモデルの SHA-256（再利用コピーでは元のモデル）と異なると、結果の `warnings` に警告が出て `config_stale=true` になります。`validate-config --model` は SolidWorks を起動せずに同じ判定を返します。続いてエクスポートは同じ SolidWorks セッション内で、設定の解決直後、Link 座標系やメッシュを作る前に、各 Link の最初のコンポーネントの姿勢を記録値と比較します（数秒）。いずれかのコンポーネントが `--kinematics-tolerance-mm` / `--kinematics-tolerance-deg`（既定 0.1 mm / 0.1°）を超えて移動・回転していると `CONFIG_OUTDATED` で失敗し、Link ごとに新旧の位置を示し、すべてが同じ剛体並進ならそのベクトルを示します（明細は `component_pose_check`）。姿勢が記録されていない設定（この検査より前の設定）は警告のみで、下の前回のエクスポートとの比較に頼ります。`--recompute-preflight`（`recompute_preflight=true`）は代わりに別のチェック専用セッション（`preflight/`）で現在の CAD から "Automatically Generate" の関節を再計算して原点と軸を比較し、`CONFIG_OUTDATED` または `KINEMATICS_PREFLIGHT_FAILED` で失敗します。数百部品のアセンブリでは必要な拘束解析に数時間かかるため、既定ではオフです。`--accept-source-change`（`accept_source_change=true`）はこれらの検査を省き、設定どおりの関節でエクスポートします。
+- **前回のエクスポート。** `--reference` を指定せず `--no-compare-previous`（`compare_previous=false`）も指定しない限り、エクスポートは同じモデル（なければ同じパッケージ名）の最新の成功したエクスポートと比較されます（result.json の `previous_export`）。差は `validation.reference_changes` に列挙され `warnings` に要約されますが、失敗にはなりません。`validation.reference_motion` には各メッシュ（バウンディングボックス中心と重心）と各関節原点の移動量が、メッシュを持つ最上位 Link の座標系で入ります。すべてのメッシュが同じベクトルだけ動いた場合、revolute と continuous の各関節原点も一緒に動いている必要があります。自分の軸方向へのずれは運動を変えないので数えません（`reference_motion.rotation_axis_offset_mm` に関節ごとの軸に垂直な残差が入ります）。0.5 mm を超えて取り残された軸があると、エクスポートは「Mesh/joint-origin mismatch」エラーで失敗し、そのベクトル、取り残された各軸と部品からのずれ、追従した軸を示します。一部の軸だけ修正した設定も失敗します。動いていない prismatic と fixed の関節原点は Link 座標系の位置を変えるだけなので、変更として列挙します。`--accept-source-change` では警告になります。明示的な `--reference` は従来どおり厳密で、差があれば失敗します。
+
+待機中のジョブはスリープやスタンバイで誤って停止されません。2 回のポーリングの間隔が 60 秒を超えた分は中断時間とみなし、`--stall-timeout` のアイドル時間にも `--timeout` にも数えません。任意の再計算事前チェックは 2 つ目の SolidWorks セッションで、`--timeout` は別に適用されます。
+
 ## JSON 設定
 
 まず `inspect` を実行し、返された `configuration_path` のファイルを編集します。実行できるサンプルは [arm-config.json](examples/arm-config.json) と [リミットと固定フレームを含む設定](examples/arm-custom-config.json) です。
 
-形式は `schema_version=1`、`robot_name`、`recompute_kinematics`、`links` です。各 Link には `name`、`parent`、`components`、`coordinate_system`、`mesh_quality`、`frame_only`、`joint` を指定します。コンポーネント名は inspect が返す完全なインスタンス名を使います。
+形式は `schema_version=1`、`robot_name`、`recompute_kinematics`、`links` と、任意の `world` および `source`（設定を検証した CAD バージョン。ツールが書き込みます。「CAD バージョンと前回のエクスポート」を参照）です。各 Link には `name`、`parent`、`components`、`coordinate_system`、`mesh_quality`、`frame_only`、`joint` を指定します。コンポーネント名は inspect が返す完全なインスタンス名を使います。
 
 - `recompute_kinematics=true`：設定で指定した CAD の座標系/軸からジョイントの変換を再計算します。座標系または軸が "Automatically Generate" の場合は、元のエクスポーターが合致から推定します。推定は、親 Link のコンポーネントを固定したときの各子 Link の**先頭コンポーネント**の残り自由度だけを見るため、フレキシブルなサブアセンブリ内部や他の Link を経由する合致は認識されません。推定したジョイント種別が JSON の `type` と異なる場合は、`fixed` を黙って出力せず、各ジョイントを列挙して失敗します。
 - `recompute_kinematics=false`：JSON のローカル xyz、rpy、axis（axis は子 Link 座標系）を使います。`coordinate_system` が "Automatically Generate" の Link には、ジョイントの連鎖から CAD コピー内に座標系 `Origin_<ジョイント名>` を作成し、メッシュと慣性をその Link 自身の座標系で出力します。既存の座標系を指定した Link は JSON の原点と一致している必要があり、一致しない場合はその座標系の xyz/rpy を示して失敗します。continuous/revolute ジョイントの xyz は回転軸上に置いてください。
@@ -121,7 +136,8 @@ sys.path.insert(0, r"C:\path\to\solidworks-urdf-tool\scripts")
 from tool_service import inspect_model, check_configuration, export_urdf, start_export, wait_job, cancel_job
 
 result = export_urdf(r"C:\path\robot.SLDASM", "robot_description")
-# config_path / reference_urdf / timeout_seconds / stall_timeout_seconds / use_saved_files はキーワード引数のみ
+# config_path / reference_urdf / timeout_seconds / stall_timeout_seconds / use_saved_files と
+# accept_source_change / kinematics_tolerance_mm / kinematics_tolerance_deg / compare_previous / write_config_source / recompute_preflight はキーワード引数のみ
 check = check_configuration(r"C:\path\robot.SLDASM", r"C:\path\robot-config.json")
 result = export_urdf(check.get("reusable_model") or r"C:\path\robot.SLDASM", "robot_description", config_path=r"C:\path\robot-config.json")
 assert result["passed"], result.get("error")
@@ -132,7 +148,7 @@ print(result["bridge"]["urdf"])
 
 サーバーは `scripts/mcp_server.py` で、ワークスペースの Python で起動します。ほかの stdio クライアントは [mcp-connection.example.json](mcp-connection.example.json) をテンプレートとして使い、`<REPO_ROOT>` をこのリポジトリのパスに置き換えてください。開発時の Codex 設定では、起動タイムアウトは 60 秒、ツールのタイムアウトは 1200 秒で、登録で追加されるのはこのサーバーだけです（ほかのサーバーやセキュリティ設定は変更しません）。
 
-9 つのツール：`inspect_solidworks`、`inspect_model_configuration`、`prepare_model`、`validate_configuration`、`export_urdf`、`start_urdf_export`、`get_export_job`、`cancel_export_job`、`validate_urdf`。`export_urdf` と `start_urdf_export` は `check_only`、`use_saved_files`、`timeout_seconds`、`stall_timeout_seconds` を受け付けます。大きなモデルでは `start_urdf_export` を使い、`wait_seconds`（例 300）付きで `get_export_job` を呼んでください。呼び出しはジョブの完了を待ち、終了状態になった時点ですぐ戻るので、クライアントはシェルの `sleep` も頻繁なポーリングも不要です。`validate_urdf` はこのコンピューター上の任意の URDF と、任意の `reference_urdf` を受け付けます。
+9 つのツール：`inspect_solidworks`、`inspect_model_configuration`、`prepare_model`、`validate_configuration`、`export_urdf`、`start_urdf_export`、`get_export_job`、`cancel_export_job`、`validate_urdf`。`export_urdf` と `start_urdf_export` は `check_only`、`use_saved_files`、`timeout_seconds`、`stall_timeout_seconds`、`compare_previous`（既定 true）、`accept_source_change`、`kinematics_tolerance_mm`、`kinematics_tolerance_deg`（既定はいずれも 0.1）、`write_config_source`、`recompute_preflight` を受け付けます。`validate_configuration` は CAD バージョンの確認用に任意の `model_path` を受け付けます。大きなモデルでは `start_urdf_export` を使い、`wait_seconds`（例 300）付きで `get_export_job` を呼んでください。呼び出しはジョブの完了を待ち、終了状態になった時点ですぐ戻るので、クライアントはシェルの `sleep` も頻繁なポーリングも不要です。`validate_urdf` はこのコンピューター上の任意の URDF と、任意の `reference_urdf` を受け付けます。
 
 ブロッキング型のツール（`export_urdf`、`inspect_model_configuration`、`prepare_model`）もバックグラウンドジョブとして実行され、最大 1000 秒待機します（環境変数 `SW_URDF_SYNC_WAIT_SECONDS` で調整できます。クライアントのツールタイムアウトより小さくしてください）。その時点で完了していなければ `still_running=true` と `job_id` が返り、ジョブは実行を続けるので、`get_export_job` で問い合わせます。
 
@@ -159,6 +175,7 @@ print(result["bridge"]["urdf"])
 .\.venv\Scripts\python.exe scripts\test_validation.py
 .\.venv\Scripts\python.exe scripts\test_jobs.py
 .\.venv\Scripts\python.exe scripts\test_postprocess.py
+.\.venv\Scripts\python.exe scripts\test_provenance.py
 .\.venv\Scripts\python.exe scripts\test_cad_regressions.py
 .\.venv\Scripts\python.exe scripts\test_tool_mcp.py
 .\.venv\Scripts\python.exe scripts\test_registered_mcp.py

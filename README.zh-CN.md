@@ -71,11 +71,17 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-tool.ps1
 # 不启动 SolidWorks 的配置检查
 .\.venv\Scripts\python.exe scripts\tool_cli.py validate-config examples\arm-custom-config.json
 
+# 同时报告该配置是否对应模型当前的 CAD 版本（只读文件）
+.\.venv\Scripts\python.exe scripts\tool_cli.py validate-config "C:\path\robot-config.json" --model "C:\path\robot.SLDASM"
+
 # 校验本机任意位置的 URDF 包，例如拷到项目里的
 .\.venv\Scripts\python.exe scripts\tool_cli.py validate-urdf "C:\project\robot_description\urdf\robot_description.urdf"
+
+# 比较两次导出：数值差异判为失败，reference_motion 给出每个网格和关节原点的位移
+.\.venv\Scripts\python.exe scripts\tool_cli.py validate-urdf "C:\new\urdf\robot.urdf" --reference "C:\old\urdf\robot.urdf"
 ```
 
-CAD 命令都接受 --timeout（总时长上限，默认 14400 秒）、--stall-timeout（默认 900 秒，见下文）和 --use-saved-files。
+CAD 命令都接受 --timeout（总时长上限，默认 14400 秒）、--stall-timeout（默认 900 秒，见下文）和 --use-saved-files。check、export 和 start-export 还接受 --accept-source-change、--kinematics-tolerance-mm、--kinematics-tolerance-deg、--write-config-source 和 --recompute-preflight，export/start-export 另接受 --no-compare-previous（见下文“CAD 版本与上一次导出”）。
 
 每次操作生成 validation/jobs/<job_id>/。result.json 记录状态、原文件 SHA-256、设置恢复、物理校验和错误；stdout.log/stderr.log 保留原生日志。status=succeeded 且 passed=true 才表示该操作所有检查通过。queued/running 和“已生成部分文件”均不能视为成功。
 
@@ -90,11 +96,20 @@ CAD 命令都接受 --timeout（总时长上限，默认 14400 秒）、--stall-
 - **进度。** job / get_export_job 返回 progress：当前阶段（如 export_meshes）、摘要（如 “Exporting STL meshes: 7/18 (gripper_z)”）、步数、已用时间、本阶段用时、SolidWorks CPU 时间、距上次有活动的 idle_seconds，以及最后几行日志。stderr.log 带时间戳。
 - 失败时 error.stage 写明出错的阶段。
 
+### CAD 版本与上一次导出
+
+recompute_kinematics=false 的配置保存的是从某一版 CAD 抄来的绝对关节原点。如果之后装配体被重新保存、模型相对装配体原点发生了移动，网格会跟着 CAD 走，关节原点却不会，而新 URDF 单独看仍能通过所有检查。下面两项检查用来发现这种情况：
+
+- **配置对应的 CAD 版本。** 带 JSON 配置的 check 或 export 通过后，会记录它验证过的 CAD 版本：任务里的 config_with_source_path 是附带 source 块的配置（model_sha256、model_path、exported_at、job_id、operation、link_frames：各 Link 坐标系在根 Link 坐标系中的位姿，以及 component_poses：每个 Link 第一个组件在装配体中的位姿）；--write-config-source（MCP/Python：write_config_source=true）会把该块写回 --config 文件本身，若文件在任务期间被改动则不写。没有 source 块的配置，会按同一模型、使用相同关节原点的历史任务推断其来源（config_source.origin=inferred_from_job；若那次任务记录了组件位姿，也一并使用）。当该版本与模型当前的 SHA-256 不同（可复用副本则比较其原始模型）时，结果的 warnings 中会给出警告并置 config_stale=true；validate-config --model 不启动 SolidWorks 也能给出同样的判断。随后导出会在同一个 SolidWorks 会话里、解析完配置之后、建立任何 Link 坐标系和网格之前，把每个 Link 第一个组件的位姿与记录值比较，只需几秒。任一组件的平移或转动超过 --kinematics-tolerance-mm / --kinematics-tolerance-deg（默认 0.1 mm / 0.1°），任务以 CONFIG_OUTDATED 失败；消息逐个列出 Link 的旧位置和新位置，若全部是同一个刚体平移，还会给出这个向量（明细在 component_pose_check）。没有记录位姿的配置（此检查之前的配置）只给出警告，依靠下面的“与上一次导出比较”兜底。--recompute-preflight（recompute_preflight=true）则改为先在单独的仅检查会话（preflight/）里用当前 CAD 重算 "Automatically Generate" 关节，比较原点和轴，以 CONFIG_OUTDATED 或 KINEMATICS_PREFLIGHT_FAILED 失败；对几百个零件的装配体，所需的约束分析要几个小时，因此默认关闭。--accept-source-change（accept_source_change=true）跳过这些检查，按配置中的关节导出。
+- **上一次导出。** 除非给了 --reference 或指定 --no-compare-previous（compare_previous=false），导出都会与同一模型（否则同一包名）最近一次成功的导出比较（result.json 中的 previous_export）。与它的差异列在 validation.reference_changes 并汇总到 warnings，不判为失败。validation.reference_motion 给出每个网格（包围盒中心和质心）以及每个关节原点的位移，均在最上层带网格的 Link 坐标系中计算。如果所有网格都平移了同一个向量，每个 revolute 或 continuous 关节的原点都必须跟着移动；沿自身转轴方向的滑移不影响运动，不计入（reference_motion.rotation_axis_offset_mm 给出每个关节在垂直于轴方向上的残差）。任一转轴落后超过 0.5 mm，导出就以“Mesh/joint-origin mismatch”错误失败，错误中给出该向量、每个没跟上的转轴及其偏离零件的距离，以及已跟上的转轴；因此只修正了部分转轴的配置仍会失败。没动的 prismatic 和 fixed 关节原点只改变 Link 坐标系的位置，列为变化；加 --accept-source-change 时降为警告。显式的 --reference 仍是严格比较：任何差异都判为失败。
+
+等待中的任务不会因睡眠或待机被误停：两次轮询间隔超过 60 秒视为挂起时间，既不计入 --stall-timeout 的空闲时间，也不计入 --timeout。可选的重算预检是第二个 SolidWorks 会话，单独按 --timeout 计时。
+
 ## JSON 配置
 
 先 inspect，再编辑它返回的 configuration_path。可运行样例见 [arm-config.json](examples/arm-config.json) 和 [带限位及固定框架的配置](examples/arm-custom-config.json)。
 
-配置格式为 schema_version=1、robot_name、recompute_kinematics 和 links。每个 Link 指定 name、parent、components、coordinate_system、mesh_quality、frame_only 和 joint；组件名采用检查返回的完整实例名。
+配置格式为 schema_version=1、robot_name、recompute_kinematics 和 links，以及可选的 world 和 source（配置验证过的 CAD 版本，由工具写入，见“CAD 版本与上一次导出”）。每个 Link 指定 name、parent、components、coordinate_system、mesh_quality、frame_only 和 joint；组件名采用检查返回的完整实例名。
 
 - recompute_kinematics=true：从配置中指定的 CAD 坐标系/轴重算关节变换；坐标系或轴为 "Automatically Generate" 时由原导出器根据配合推断。推断只看每个子 Link 的**第一个组件**在父 Link 固定时剩余的自由度，柔性子装配内部或经过其他 Link 的配合看不到。推断出的关节类型与 JSON 的 type 不一致时，导出直接失败并列出每个关节，不会静默生成 fixed。
 - recompute_kinematics=false：采用 JSON 中的局部 xyz、rpy 和 axis（axis 在子 Link 坐标系中）。coordinate_system 为 "Automatically Generate" 的 Link，工具按关节链在 CAD 副本中创建坐标系 Origin_<关节名>，网格和惯量都按该 Link 自己的坐标系导出；指定了已有坐标系的 Link 必须与 JSON 原点一致，否则报错并给出该坐标系对应的 xyz/rpy。continuous/revolute 关节的 xyz 应位于转轴上。
@@ -121,7 +136,8 @@ sys.path.insert(0, r"C:\path\to\solidworks-urdf-tool\scripts")
 from tool_service import inspect_model, check_configuration, export_urdf, start_export, wait_job, cancel_job
 
 result = export_urdf(r"C:\path\robot.SLDASM", "robot_description")
-# config_path / reference_urdf / timeout_seconds / stall_timeout_seconds / use_saved_files 只能按关键字传入
+# config_path / reference_urdf / timeout_seconds / stall_timeout_seconds / use_saved_files 以及
+# accept_source_change / kinematics_tolerance_mm / kinematics_tolerance_deg / compare_previous / write_config_source / recompute_preflight 只能按关键字传入
 check = check_configuration(r"C:\path\robot.SLDASM", r"C:\path\robot-config.json")
 result = export_urdf(check.get("reusable_model") or r"C:\path\robot.SLDASM", "robot_description", config_path=r"C:\path\robot-config.json")
 assert result["passed"], result.get("error")
@@ -132,7 +148,7 @@ print(result["bridge"]["urdf"])
 
 本机已注册 solidworks_urdf_2026，启动程序为工作区 Python，服务脚本为 scripts/mcp_server.py；其他 stdio 客户端可参考 mcp-connection.example.json，把 <REPO_ROOT> 换成本仓库路径。启动超时 60 秒，工具超时 1200 秒。Codex 配置仅新增此服务；其他服务器和安全设置保留。
 
-9 个工具：inspect_solidworks、inspect_model_configuration、prepare_model、validate_configuration、export_urdf、start_urdf_export、get_export_job、cancel_export_job、validate_urdf。export_urdf 和 start_urdf_export 接受 check_only、use_saved_files、timeout_seconds 和 stall_timeout_seconds。大型模型优先使用 start_urdf_export，再带 wait_seconds（例如 300）调用 get_export_job：调用会等任务结束，一到终态立即返回，客户端既不需要 shell sleep，也不用频繁轮询。validate_urdf 可校验本机任意位置的 URDF，并可选 reference_urdf。
+9 个工具：inspect_solidworks、inspect_model_configuration、prepare_model、validate_configuration、export_urdf、start_urdf_export、get_export_job、cancel_export_job、validate_urdf。export_urdf 和 start_urdf_export 接受 check_only、use_saved_files、timeout_seconds、stall_timeout_seconds、compare_previous（默认 true）、accept_source_change、kinematics_tolerance_mm、kinematics_tolerance_deg（默认均为 0.1）、write_config_source 和 recompute_preflight；validate_configuration 可选 model_path，用于检查 CAD 版本。大型模型优先使用 start_urdf_export，再带 wait_seconds（例如 300）调用 get_export_job：调用会等任务结束，一到终态立即返回，客户端既不需要 shell sleep，也不用频繁轮询。validate_urdf 可校验本机任意位置的 URDF，并可选 reference_urdf。
 
 阻塞式工具（export_urdf、inspect_model_configuration、prepare_model）同样在后台任务中运行，最多等待 1000 秒（环境变量 SW_URDF_SYNC_WAIT_SECONDS 可调，应小于客户端工具超时）。届时未完成会返回 still_running=true 和 job_id，任务继续执行，用 get_export_job 查询即可。
 
@@ -159,6 +175,7 @@ Codex 客户端需要重新加载 MCP 配置后才会把新服务加入当前工
 .\.venv\Scripts\python.exe scripts\test_validation.py
 .\.venv\Scripts\python.exe scripts\test_jobs.py
 .\.venv\Scripts\python.exe scripts\test_postprocess.py
+.\.venv\Scripts\python.exe scripts\test_provenance.py
 .\.venv\Scripts\python.exe scripts\test_cad_regressions.py
 .\.venv\Scripts\python.exe scripts\test_tool_mcp.py
 .\.venv\Scripts\python.exe scripts\test_registered_mcp.py

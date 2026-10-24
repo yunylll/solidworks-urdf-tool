@@ -13,6 +13,12 @@ from trimesh.transformations import euler_matrix
 # only be apart by tessellation noise: this share of the robot's largest extent.
 PLACEMENT_TOLERANCE_SHARE = 0.005
 PLACEMENT_TOLERANCE_MIN_M = 0.002
+# Against a reference export: a mesh moved less than this is tessellation noise, and a common
+# move of all meshes allows this share of its length (or the minimum) per mesh.
+MESH_SHIFT_MIN_M = 0.0005
+MESH_SHIFT_COMMON_SHARE = 0.02
+# Joint origins that moved less than this count as unchanged.
+JOINT_SHIFT_MAX_M = 0.0001
 
 
 def origin_matrix(origin) -> np.ndarray:
@@ -87,13 +93,125 @@ def _placement(root, links, package_dir, meshes, errors):
     return {name: np.round(box, 6).tolist() for name, box in boxes.items()}
 
 
-def _validate(urdf_path: str | Path, reference: str | Path | None = None) -> dict:
+def _depths(root) -> dict[str, int]:
+    parent_of = {j.find("child").attrib["link"]: j.find("parent").attrib["link"] for j in root.findall("joint")}
+    depths = {}
+    for link in root.findall("link"):
+        name, depth, seen = link.attrib["name"], 0, set()
+        while name in parent_of and name not in seen:
+            seen.add(name)
+            name, depth = parent_of[name], depth + 1
+        depths[link.attrib["name"]] = depth
+    return depths
+
+
+def _mm(vector) -> str:
+    return "(" + ", ".join(f"{v * 1000:.3f}" for v in vector) + ")"
+
+
+def _reference_motion(root, baseline, reference_path: Path, package_dir: Path, meshes, reference_meshes, errors, changes, allow_mesh_shift):
+    """How each Link mesh and joint origin moved against a reference export, both in the frame of a Link they share.
+
+    All meshes moving together while the joint origins stay put is the signature of a CAD model that
+    moved relative to the assembly origin under a configuration with absolute joint origins: rotation
+    axes then miss their parts although every check of the URDF on its own passes. Each revolute or
+    continuous joint is checked on its own, so a configuration fixed for some axes but not others
+    still fails; only the sideways part counts, as sliding an origin along its axis changes nothing.
+    """
+    current, previous = link_world_transforms(root), link_world_transforms(baseline)
+    old_links = {l.attrib["name"]: l for l in baseline.findall("link")}
+    reference_dir = reference_path.parent.parent
+    placed = {}
+    for link in root.findall("link"):
+        name = link.attrib["name"]
+        old = old_links.get(name)
+        target = visual_mesh_path(link, package_dir)
+        old_target = visual_mesh_path(old, reference_dir) if old is not None else None
+        if name not in current or name not in previous or target is None or old_target is None or meshes.get(target.name, {}).get("bounds_m") is None:
+            continue
+        if old_target not in reference_meshes:
+            reference_meshes[old_target] = trimesh.load_mesh(old_target, process=True)
+        old_mesh, info = reference_meshes[old_target], meshes[target.name]
+        placed[name] = (current[name] @ origin_matrix(link.find("visual/origin")), np.mean(info["bounds_m"], axis=0), np.array(info["centroid_m"]),
+                        previous[name] @ origin_matrix(old.find("visual/origin")), old_mesh.bounds.mean(axis=0), old_mesh.centroid)
+    if len(placed) < 2:
+        return {"compared_meshes": len(placed)}
+    depths = _depths(root)
+    anchor = min(placed, key=lambda n: (depths.get(n, 0), n))
+    to_current, to_previous = np.linalg.inv(current[anchor]), np.linalg.inv(previous[anchor])
+
+    def point(frame, pose, p):
+        return (frame @ pose @ np.append(p, 1))[:3]
+
+    shifts, centroid_shifts = {}, {}
+    for name, (new_pose, new_center, new_centroid, old_pose, old_center, old_centroid) in placed.items():
+        shifts[name] = point(to_current, new_pose, new_center) - point(to_previous, old_pose, old_center)
+        centroid_shifts[name] = point(to_current, new_pose, new_centroid) - point(to_previous, old_pose, old_centroid)
+    old_joints = {j.attrib["name"] for j in baseline.findall("joint")}
+    joint_shifts, rotational = {}, {}
+    for joint in root.findall("joint"):
+        name, child = joint.attrib["name"], joint.find("child").attrib["link"]
+        if name not in old_joints or child not in current or child not in previous:
+            continue
+        new_frame, old_frame = to_current @ current[child], to_previous @ previous[child]
+        joint_shifts[name] = new_frame[:3, 3] - old_frame[:3, 3]
+        if joint.attrib.get("type") in {"revolute", "continuous"} and joint.find("axis") is not None:
+            axis = new_frame[:3, :3] @ np.fromstring(joint.find("axis").attrib["xyz"], sep=" ")
+            rotational[name] = axis / np.linalg.norm(axis)
+    vectors = np.array(list(shifts.values()))
+    common = np.median(vectors, axis=0)
+    length = float(np.linalg.norm(common))
+    allowance = max(MESH_SHIFT_MIN_M, MESH_SHIFT_COMMON_SHARE * length)
+    common_moved = length > MESH_SHIFT_MIN_M and float(np.max(np.linalg.norm(vectors - common, axis=1))) <= allowance
+    largest_joint = max((float(np.linalg.norm(v)) for v in joint_shifts.values()), default=0.0)
+    motion = {"anchor_link": anchor, "compared_meshes": len(placed),
+              "mesh_shift_mm": {n: {"bounds_center": (v * 1000).round(4).tolist(), "centroid": (centroid_shifts[n] * 1000).round(4).tolist()} for n, v in shifts.items()},
+              "joint_origin_shift_mm": {n: (v * 1000).round(4).tolist() for n, v in joint_shifts.items()},
+              "common_mesh_shift_mm": (common * 1000).round(4).tolist() if common_moved else None,
+              "largest_joint_origin_shift_mm": round(largest_joint * 1000, 4), "mesh_joint_mismatch": False}
+    # How far each rotation axis now misses the parts that moved: the sideways part of (mesh move - origin move).
+    lagging = {}
+    if common_moved:
+        offsets = {}
+        for name, axis in rotational.items():
+            residual = common - joint_shifts[name]
+            offsets[name] = float(np.linalg.norm(residual - (residual @ axis) * axis))
+        motion["rotation_axis_offset_mm"] = {n: round(v * 1000, 4) for n, v in offsets.items()}
+        lagging = {n: v for n, v in offsets.items() if v > MESH_SHIFT_MIN_M}
+    if lagging:
+        motion["mesh_joint_mismatch"] = True
+        followed = sorted(set(rotational) - set(lagging))
+        message = (f"Mesh/joint-origin mismatch against reference {reference_path}: every Link mesh ({len(placed)}) moved by the same {_mm(common)} mm ({length * 1000:.3f} mm) "
+                   f"in the frame of {anchor}, but these rotation axes did not move with them and now miss their parts: "
+                   + ", ".join(f"{n} by {v * 1000:.3f} mm (origin moved {_mm(joint_shifts[n])} mm)" for n, v in sorted(lagging.items(), key=lambda item: -item[1])) + ".")
+        if largest_joint <= JOINT_SHIFT_MAX_M:
+            message += " No joint origin moved at all: the CAD model was probably moved relative to the assembly origin while the configuration kept absolute joint origins (recompute_kinematics=false)."
+        elif followed:
+            message += " Rotation axes that did follow: " + ", ".join(followed) + "."
+        message += " Shift these joint origins by the vector above or recompute them; the tool's accept_source_change=true keeps such an export only if the move is intended."
+        (changes if allow_mesh_shift else errors).append(message)
+    elif common_moved and all(np.linalg.norm(v - common) <= allowance for v in joint_shifts.values()):
+        changes.append(f"The whole robot moved by {_mm(common)} mm against reference {reference_path}, meshes and joint origins alike (consistent; for example a new base frame).")
+    elif common_moved:
+        changes.append(f"Every Link mesh ({len(placed)}) moved by the same {_mm(common)} mm ({length * 1000:.3f} mm) in the frame of {anchor} against reference {reference_path}; "
+                       + (f"the rotation axes moved with them ({', '.join(sorted(rotational))}), " if rotational else "the robot has no rotation axes, ")
+                       + f"other joint origins that stayed put only change where Link frames sit (largest joint origin change {largest_joint * 1000:.3f} mm).")
+    else:
+        for name, vector in shifts.items():
+            if float(np.linalg.norm(vector)) > MESH_SHIFT_MIN_M:
+                changes.append(f"Mesh of {name} moved by {_mm(vector)} mm ({float(np.linalg.norm(vector)) * 1000:.3f} mm) in the frame of {anchor} against reference {reference_path}.")
+    return motion
+
+
+def _validate(urdf_path: str | Path, reference: str | Path | None = None, reference_mode: str = "strict", allow_mesh_shift: bool = False) -> dict:
     path = Path(urdf_path).resolve()
     root = ET.parse(path).getroot()
     package_dir = path.parent.parent
     links = root.findall("link")
     joints = root.findall("joint")
-    errors, meshes, masses = [], {}, {}
+    if reference_mode not in {"strict", "changes"}:
+        raise ValueError(f"reference_mode must be strict or changes, got {reference_mode!r}")
+    errors, meshes, masses, changes = [], {}, {}, []
     names = [link.attrib["name"] for link in links]
     joint_names = [joint.attrib["name"] for joint in joints]
     if root.tag != "robot" or not links:
@@ -189,16 +307,20 @@ def _validate(urdf_path: str | Path, reference: str | Path | None = None) -> dic
                 geometry = trimesh.load_mesh(target, process=True)
                 if len(geometry.faces) == 0 or not np.all(np.isfinite(geometry.vertices)):
                     errors.append(f"Invalid mesh {target.name}: {len(geometry.faces)} triangles" + ("" if np.all(np.isfinite(geometry.vertices)) else ", non-finite vertices"))
-                meshes[target.name] = {"triangles": len(geometry.faces), "bounds_m": geometry.bounds.tolist() if geometry.bounds is not None else None, "watertight": bool(geometry.is_watertight), "volume_m3": float(abs(geometry.volume)) if len(geometry.faces) else 0.0}
+                meshes[target.name] = {"triangles": len(geometry.faces), "bounds_m": geometry.bounds.tolist() if geometry.bounds is not None else None, "watertight": bool(geometry.is_watertight), "volume_m3": float(abs(geometry.volume)) if len(geometry.faces) else 0.0, "centroid_m": geometry.centroid.tolist() if len(geometry.faces) else None}
     world_bounds = _placement(root, links, package_dir, meshes, errors) if reachable == set(names) else {}
-    comparison = {}
+    comparison, motion = {}, {}
     if reference:
         baseline = ET.parse(reference).getroot()
+        # A reference is either a fixed expectation (strict: differences fail) or the previous
+        # export of the same robot (changes: differences are reported for review).
+        differ = errors.append if reference_mode == "strict" else changes.append
+        reference_meshes = {}
         for tag in ("link", "joint"):
             expected = {e.attrib["name"]: e for e in baseline.findall(tag)}
             actual = {e.attrib["name"]: e for e in root.findall(tag)}
             if expected.keys() != actual.keys():
-                errors.append(f"Reference {tag} names differ: missing {sorted(expected.keys() - actual.keys())}, extra {sorted(actual.keys() - expected.keys())}")
+                differ(f"Reference {tag} names differ: missing {sorted(expected.keys() - actual.keys())}, extra {sorted(actual.keys() - expected.keys())}")
                 continue
             for name, e in actual.items():
                 b = expected[name]
@@ -208,43 +330,51 @@ def _validate(urdf_path: str | Path, reference: str | Path | None = None) -> dic
                     if one is None and two is None:
                         continue
                     if one is None or two is None:
-                        errors.append(f"Reference element differs: {name}.{query} is " + ("missing in the export" if one is None else "not in the reference"))
+                        differ(f"Reference element differs: {name}.{query} is " + ("missing in the export" if one is None else "not in the reference"))
                         continue
                     for key, value in one.attrib.items():
                         if key not in two.attrib:
-                            errors.append(f"Reference attribute missing: {name}.{query}.{key}")
+                            differ(f"Reference attribute missing: {name}.{query}.{key}")
                             continue
                         a, z = np.fromstring(value, sep=" "), np.fromstring(two.attrib[key], sep=" ")
                         delta = float(np.max(np.abs(a - z))) if len(a) == len(z) and len(a) else float("inf")
                         comparison[f"{name}.{query}.{key}"] = delta
                         # Historic URDF rounding uses five significant digits.
                         if not np.allclose(a, z, rtol=2e-4, atol=2e-6):
-                            errors.append(f"Reference mismatch: {name}.{query}.{key} is \"{value}\", reference \"{two.attrib[key]}\" (delta {delta})")
+                            differ(f"Reference mismatch: {name}.{query}.{key} is \"{value}\", reference \"{two.attrib[key]}\" (delta {delta})")
                 if tag == "joint" and e.attrib["type"] != b.attrib["type"]:
-                    errors.append(f"Reference joint type differs: {name} is {e.attrib['type']}, reference {b.attrib['type']}")
+                    differ(f"Reference joint type differs: {name} is {e.attrib['type']}, reference {b.attrib['type']}")
                 if tag == "link":
-                    mesh = b.find("visual/geometry/mesh")
+                    mesh, current = b.find("visual/geometry/mesh"), e.find("visual/geometry/mesh")
+                    if mesh is None or current is None:
+                        # A coordinate-only Link has no mesh; only a Link that gained or lost one differs.
+                        if (mesh is None) != (current is None):
+                            differ(f"Reference mesh differs: {name} has " + ("no mesh in the export" if current is None else "no mesh in the reference"))
+                        continue
                     relative = mesh.attrib["filename"][len("package://"):].partition("/")[2]
                     old_path = Path(reference).resolve().parent.parent / relative
-                    current = e.find("visual/geometry/mesh")
                     current_name = Path(current.attrib["filename"]).name
                     if old_path.is_file() and current_name in meshes and meshes[current_name]["bounds_m"] is not None:
-                        expected_mesh = trimesh.load_mesh(old_path, process=True)
+                        if old_path.resolve() not in reference_meshes:
+                            reference_meshes[old_path.resolve()] = trimesh.load_mesh(old_path, process=True)
+                        expected_mesh = reference_meshes[old_path.resolve()]
                         bounds_delta = float(np.max(np.abs(np.array(meshes[current_name]["bounds_m"]) - expected_mesh.bounds)))
                         comparison[f"{name}.mesh.bounds_max_delta_m"] = bounds_delta
                         # Allow tessellation differences while catching mm/m errors
                         # and frame offsets (half a percent of the largest extent).
                         tolerance = max(1e-6, float(expected_mesh.extents.max()) * 0.005)
                         if bounds_delta > tolerance:
-                            errors.append(f"Reference mesh scale/frame mismatch: {name} bounds differ by {bounds_delta:.6g} m (tolerance {tolerance:.6g} m); export {np.round(meshes[current_name]['bounds_m'], 6).tolist()}, reference {np.round(expected_mesh.bounds, 6).tolist()}")
+                            differ(f"Reference mesh scale/frame mismatch: {name} bounds differ by {bounds_delta:.6g} m (tolerance {tolerance:.6g} m); export {np.round(meshes[current_name]['bounds_m'], 6).tolist()}, reference {np.round(expected_mesh.bounds, 6).tolist()}")
                     else:
-                        errors.append(f"Cannot compare reference mesh for {name}: reference {old_path} " + ("exists" if old_path.is_file() else "is missing") + f", exported mesh {current_name} " + ("was read" if current_name in meshes else "was not read"))
-    return {"passed": not errors, "errors": errors, "links": len(links), "joints": len(joints), "link_names": names, "joint_types": {j.attrib["name"]: j.attrib["type"] for j in joints}, "total_mass_kg": sum(masses.values()), "link_masses_kg": masses, "meshes": meshes, "link_world_bounds_m": world_bounds, "reference_numeric_deltas": comparison}
+                        differ(f"Cannot compare reference mesh for {name}: reference {old_path} " + ("exists" if old_path.is_file() else "is missing") + f", exported mesh {current_name} " + ("was read" if current_name in meshes else "was not read"))
+        if reachable == set(names):
+            motion = _reference_motion(root, baseline, Path(reference).resolve(), package_dir, meshes, reference_meshes, errors, changes, allow_mesh_shift)
+    return {"passed": not errors, "errors": errors, "links": len(links), "joints": len(joints), "link_names": names, "joint_types": {j.attrib["name"]: j.attrib["type"] for j in joints}, "total_mass_kg": sum(masses.values()), "link_masses_kg": masses, "meshes": meshes, "link_world_bounds_m": world_bounds, "reference_numeric_deltas": comparison, "reference_mode": reference_mode if reference else None, "reference_changes": changes, "reference_motion": motion}
 
 
-def validate(urdf_path: str | Path, reference: str | Path | None = None) -> dict:
+def validate(urdf_path: str | Path, reference: str | Path | None = None, reference_mode: str = "strict", allow_mesh_shift: bool = False) -> dict:
     try:
-        return _validate(urdf_path, reference)
+        return _validate(urdf_path, reference, reference_mode, allow_mesh_shift)
     except (OSError, ValueError, TypeError, KeyError, AttributeError, ET.ParseError) as exc:
         return {"passed": False, "errors": [f"Malformed or unreadable URDF/mesh {urdf_path}: {type(exc).__name__}: {exc}"]}
 

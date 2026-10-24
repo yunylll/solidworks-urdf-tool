@@ -5,11 +5,14 @@ import math
 from pathlib import Path
 import re
 
-CONFIG_KEYS = {"schema_version", "robot_name", "recompute_kinematics", "links", "world"}
+CONFIG_KEYS = {"schema_version", "robot_name", "recompute_kinematics", "links", "world", "source"}
 LINK_KEYS = {"name", "parent", "components", "coordinate_system", "mesh_quality", "frame_only", "joint"}
 JOINT_KEYS = {"name", "type", "axis_name", "axis", "xyz", "rpy", "lower", "upper", "effort", "velocity", "damping", "friction", "mimic"}
 MIMIC_KEYS = {"joint", "multiplier", "offset"}
 WORLD_KEYS = {"link", "joint", "up_axis", "xyz", "rpy", "center_xy", "ground"}
+# The CAD version a configuration was made from or last verified against; written by the tool.
+SOURCE_KEYS = {"model_sha256", "model_path", "exported_at", "job_id", "operation", "link_frames", "component_poses"}
+SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 # Model axis that becomes URDF +Z, and the matching world-to-root rotation (URDF rpy).
 UP_AXES = {"+z": (0.0, 0.0, 0.0), "-z": (math.pi, 0.0, 0.0), "+y": (math.pi / 2, 0.0, 0.0), "-y": (-math.pi / 2, 0.0, 0.0), "+x": (0.0, -math.pi / 2, 0.0), "-x": (0.0, math.pi / 2, 0.0)}
 # Fields applied to the exported URDF by the tool, not by the CAD exporter.
@@ -18,6 +21,7 @@ NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 # Base-link coordinate system that keeps the assembly's own axes (the exporter's
 # automatic base frame assumes a Y-up model and turns it Z-up).
 ASSEMBLY_ORIGIN = "Assembly Origin"
+AUTOMATIC = "Automatically Generate"
 RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
 JOINT_TYPES = ("fixed", "continuous", "revolute", "prismatic")
 
@@ -26,8 +30,12 @@ def _number(value):
     return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
 
 
+def _numbers(value, count):
+    return isinstance(value, list) and len(value) == count and all(_number(x) for x in value)
+
+
 def _vector(value):
-    return isinstance(value, list) and len(value) == 3 and all(_number(x) for x in value)
+    return _numbers(value, 3)
 
 
 def _show(value):
@@ -60,6 +68,26 @@ def validate_world(world, link_names=()) -> list[str]:
     for field in ("center_xy", "ground"):
         if not isinstance(world.get(field, False), bool):
             errors.append(f"world.{field} must be true or false, got {_show(world[field])}")
+    return errors
+
+
+def validate_source(source) -> list[str]:
+    if not isinstance(source, dict):
+        return [f"source must be an object, got {_show(source)}"]
+    errors = []
+    if set(source) - SOURCE_KEYS:
+        errors.append(f"source has unknown fields: {_unknown(source, SOURCE_KEYS)} (allowed: {', '.join(sorted(SOURCE_KEYS))})")
+    if not isinstance(source.get("model_sha256"), str) or not SHA256.fullmatch(source["model_sha256"]):
+        errors.append(f"source.model_sha256 must be 64 lowercase hexadecimal characters, got {_show(source.get('model_sha256'))}")
+    for field in ("model_path", "exported_at", "job_id", "operation"):
+        if field in source and not isinstance(source[field], str):
+            errors.append(f"source.{field} must be a string, got {_show(source[field])}")
+    frames = source.get("link_frames", {})
+    if not isinstance(frames, dict) or any(not isinstance(f, dict) or not _vector(f.get("xyz")) or not _vector(f.get("rpy")) for f in frames.values()):
+        errors.append(f"source.link_frames must map Link names to {{\"xyz\": [3 numbers], \"rpy\": [3 numbers]}}, got {_show(frames)}")
+    poses = source.get("component_poses", {})
+    if not isinstance(poses, dict) or any(not isinstance(p, dict) or not isinstance(p.get("component"), str) or not _numbers(p.get("rotation"), 9) or not _numbers(p.get("translation"), 3) for p in poses.values()):
+        errors.append(f"source.component_poses must map Link names to {{\"component\": name, \"rotation\": [9 numbers], \"translation\": [3 numbers]}}, got {_show(poses)}")
     return errors
 
 
@@ -195,6 +223,8 @@ def validate_config(config: dict) -> dict:
                 errors.append(f"{name}.joint.mimic.joint {target} is itself a mimic joint; follow the joint it mimics instead")
     if "world" in config:
         errors.extend(validate_world(config["world"], names))
+    if "source" in config:
+        errors.extend(validate_source(config["source"]))
     if len(roots) != 1:
         errors.append(f"Exactly one root Link (parent null) is required, found {len(roots)}" + (f": {', '.join(roots)}" if roots else ""))
     for name in names:
@@ -212,8 +242,8 @@ def validate_config(config: dict) -> dict:
 
 
 def native_config(config: dict) -> dict:
-    """The configuration without the fields the tool applies to the URDF after export."""
-    native = {k: v for k, v in config.items() if k != "world"}
+    """The configuration without the fields the tool applies to the URDF after export, or only records."""
+    native = {k: v for k, v in config.items() if k not in {"world", "source"}}
     native["links"] = [dict(link, joint={k: v for k, v in link["joint"].items() if k not in POSTPROCESS_JOINT_KEYS}) if isinstance(link.get("joint"), dict) else link for link in config["links"]]
     return native
 

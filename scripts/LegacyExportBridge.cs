@@ -436,6 +436,11 @@ public static partial class LegacyExportBridge
             ValidateResolvedTree(node);
             RequireComponentCoverage(unassigned, overlapping);
             report["componentsResolved"] = true;
+            // Where each Link's first component sits in the assembly: reading it costs nothing, and against
+            // the placements recorded with the configuration it shows a moved CAD model before any mesh is written.
+            report["linkComponentPoses"] = DescribeComponentPoses(node);
+            if (request != null && request.ContainsKey("expected_component_poses"))
+                CheckComponentPoses(report, Convert.ToString(request["expected_component_poses"]), Convert.ToDouble(request["pose_tolerance_m"], System.Globalization.CultureInfo.InvariantCulture), Convert.ToDouble(request["pose_tolerance_deg"], System.Globalization.CultureInfo.InvariantCulture));
             bool check = operation == "check";
             var helper = new ExportHelper(app);
             // A check needs the Link frames and joints only, not inertia or meshes.
@@ -449,8 +454,9 @@ public static partial class LegacyExportBridge
             PrepareLinkFrames(helper, node, supplied == null || supplied.recompute_kinematics, report);
             SW2URDF.Headless.Progress.Stage("building_links", check ? "Building Links and joints..." : "Building Links, joints and exporter inertia...", CountLinks(node, false));
             if (!helper.CreateRobotFromTreeView(node)) throw new InvalidOperationException("The original exporter could not build the robot; see bridge-export.log.");
-            if (supplied != null && supplied.recompute_kinematics) RequireConfiguredJointTypes(node, supplied, report);
+            // Recorded before the joint type check, so a failed check still shows the recomputed joints.
             report["resolvedJoints"] = DescribeJoints(node);
+            if (supplied != null && supplied.recompute_kinematics) RequireConfiguredJointTypes(node, supplied, report);
             if (check)
             {
                 report["status"] = "checked";

@@ -320,6 +320,60 @@ public static partial class LegacyExportBridge
         return list;
     }
 
+    // Rotation (9 values) and translation in meters of each Link's first component, in the assembly frame.
+    private static Dictionary<string, object> DescribeComponentPoses(LinkNode root)
+    {
+        var poses = new Dictionary<string, object>();
+        Action<LinkNode> visit = null;
+        visit = node => {
+            var link = node.Link;
+            if (link.SWComponents.Count != 0)
+            {
+                var component = link.SWComponents[0];
+                var transform = component.Transform2;
+                var data = transform == null ? null : transform.ArrayData as double[];
+                if (data != null && data.Length >= 12)
+                    poses[link.Name] = new Dictionary<string, object> { { "component", component.Name2 }, { "rotation", data.Take(9).ToArray() }, { "translation", data.Skip(9).Take(3).ToArray() } };
+                if (transform != null) Marshal.ReleaseComObject(transform);
+            }
+            foreach (LinkNode child in node.Nodes) visit(child);
+        };
+        visit(root);
+        return poses;
+    }
+
+    private static double[] Numbers(object value)
+    {
+        return ((IEnumerable)value).Cast<object>().Select(v => Convert.ToDouble(v, System.Globalization.CultureInfo.InvariantCulture)).ToArray();
+    }
+
+    // Compares the placements with those recorded for the CAD version the configuration was made for;
+    // the rows go to the report for the caller to explain, and any row over a tolerance stops the run.
+    private static void CheckComponentPoses(Dictionary<string, object> report, string expectedPath, double toleranceM, double toleranceDeg)
+    {
+        var expected = new System.Web.Script.Serialization.JavaScriptSerializer().Deserialize<Dictionary<string, Dictionary<string, object>>>(File.ReadAllText(expectedPath));
+        var current = (Dictionary<string, object>)report["linkComponentPoses"];
+        var rows = new List<Dictionary<string, object>>();
+        var missing = new List<string>();
+        bool exceeded = false;
+        foreach (var item in expected)
+        {
+            object found;
+            var now = current.TryGetValue(item.Key, out found) ? (Dictionary<string, object>)found : null;
+            if (now == null || !string.Equals(Convert.ToString(now["component"]), Convert.ToString(item.Value["component"]), StringComparison.OrdinalIgnoreCase)) { missing.Add(item.Key); continue; }
+            double[] oldT = Numbers(item.Value["translation"]), newT = (double[])now["translation"], oldR = Numbers(item.Value["rotation"]), newR = (double[])now["rotation"];
+            double distance = Math.Sqrt(Enumerable.Range(0, 3).Sum(i => (newT[i] - oldT[i]) * (newT[i] - oldT[i])));
+            // trace(A^T B) is the sum of the element-wise products of two rotation matrices.
+            double trace = Enumerable.Range(0, 9).Sum(i => oldR[i] * newR[i]);
+            double angle = Math.Acos(Math.Max(-1, Math.Min(1, (trace - 1) / 2))) * 180 / Math.PI;
+            bool over = distance > toleranceM || angle > toleranceDeg;
+            exceeded |= over;
+            rows.Add(new Dictionary<string, object> { { "link", item.Key }, { "component", item.Value["component"] }, { "old_translation", oldT }, { "new_translation", newT }, { "distance_m", distance }, { "angle_deg", angle }, { "exceeds_tolerance", over } });
+        }
+        report["componentPoseCheck"] = new Dictionary<string, object> { { "rows", rows }, { "not_compared", missing }, { "exceeded", exceeded }, { "tolerance_m", toleranceM }, { "tolerance_deg", toleranceDeg } };
+        if (exceeded) throw new InvalidOperationException("Link components moved since the CAD version the configuration was made for (see componentPoseCheck).");
+    }
+
     private static double? OptionalValue(Func<double> value)
     {
         try { return value(); } catch (NullReferenceException) { return null; }

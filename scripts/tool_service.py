@@ -16,8 +16,9 @@ import sys
 import time
 import uuid
 
-from configuration import load_config, native_config, needs_postprocess, skeleton_config, validate_config
+from configuration import AUTOMATIC, load_config, native_config, needs_postprocess, skeleton_config, validate_config
 from validate_export import validate
+import provenance
 import render_preview
 import urdf_postprocess
 
@@ -39,6 +40,8 @@ DEFAULT_STALL_SECONDS = 900
 ACTIVITY_CPU_SHARE = 0.05
 ACTIVITY_SAMPLE_SECONDS = 30
 POLL_SECONDS = 2
+# A gap this long between two polls means the computer slept; that time counts neither as idle nor towards the limit.
+SUSPEND_GAP_SECONDS = 60
 # A job whose worker never recorded itself within this time is interrupted.
 WORKER_START_GRACE_SECONDS = 120
 STAGES = {
@@ -50,6 +53,7 @@ STAGES = {
     "opening": "Opening the model",
     "pack_and_go": "Copying the model through Pack and Go",
     "reopening": "Opening the prepared copy",
+    "kinematics_preflight": "Recomputing the joints from the current CAD to compare them with the configuration",
     "loading_configuration": "Loading the Link configuration",
     "link_frames": "Creating Link coordinate systems",
     "building_links": "Building Links and joints",
@@ -73,6 +77,18 @@ class JobCancelled(RuntimeError):
 
 class UnsavedChangesError(ValueError):
     pass
+
+
+class ConfigOutdatedError(RuntimeError):
+    """The configuration's joints no longer match the CAD it is exported from."""
+
+    def __init__(self, message, code="CONFIG_OUTDATED"):
+        super().__init__(message)
+        self.code = code
+
+
+class PreflightStopped(RuntimeError):
+    """The kinematics preflight was cancelled or timed out; the record already says which."""
 
 
 def _process_handle(pid):
@@ -174,7 +190,38 @@ def _check_int(name, value, low, high):
         raise ValueError(f"{name} must be an integer between {low} and {high}, got {value!r}.")
 
 
-def create_job(operation, model_path, package_name="robot_description", *, config_path=None, reference_urdf=None, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds=DEFAULT_STALL_SECONDS, use_saved_files=False):
+def _check_tolerance(name, value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 1000:
+        raise ValueError(f"{name} must be a positive number up to 1000, got {value!r}.")
+
+
+def original_model(model_path, digest=None):
+    """The model a prepared copy was made from, and its hash; any other model is its own original."""
+    model = Path(model_path)
+    saved = read_json(model.parent / "solidworks-urdf-snapshot.json") or {}
+    if saved.get("original_model_sha256") and provenance.same_path(saved.get("source_path"), model):
+        return saved.get("original_model_path") or str(model), saved["original_model_sha256"]
+    return str(model), digest or sha256(model)
+
+
+def source_status(config, model_path, before=None, original=None):
+    """Whether a configuration was made for the CAD version of model_path. Reads files only."""
+    original_path, digest = original or original_model(model_path)
+    known = provenance.config_source(config, original_path, JOBS, before)
+    status = {"current_model_sha256": digest, "config_source": known, "stale": bool(known and known["model_sha256"] != digest)}
+    if status["stale"]:
+        status["message"] = provenance.describe_staleness(known, digest)
+    elif known is None:
+        status["message"] = "The configuration does not record the CAD version it was made from, and no earlier job of this model used the same joint origins."
+    return status
+
+
+def _needs_preflight(config):
+    return config.get("recompute_kinematics") is False and any(l.get("parent") is not None and l.get("coordinate_system") == AUTOMATIC for l in config["links"])
+
+
+def create_job(operation, model_path, package_name="robot_description", *, config_path=None, reference_urdf=None, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds=DEFAULT_STALL_SECONDS, use_saved_files=False,
+               accept_source_change=False, kinematics_tolerance_mm=provenance.DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg=provenance.DEFAULT_TOLERANCE_DEG, compare_previous=True, write_config_source=False, recompute_preflight=False):
     source = Path(model_path).expanduser().resolve()
     if not source.is_file() or source.suffix.lower() not in {".sldasm", ".sldprt"}:
         raise ValueError(f"model_path must be an existing .SLDASM or .SLDPRT, got {str(source)!r}" + (" (file not found)." if not source.is_file() else "."))
@@ -184,6 +231,10 @@ def create_job(operation, model_path, package_name="robot_description", *, confi
         raise ValueError(f"Unknown CAD operation {operation!r}; use one of {', '.join(sorted(OPERATIONS))}.")
     _check_int("timeout_seconds", timeout_seconds, 30, MAX_TIMEOUT_SECONDS)
     _check_int("stall_timeout_seconds", stall_timeout_seconds, 60, MAX_TIMEOUT_SECONDS)
+    _check_tolerance("kinematics_tolerance_mm", kinematics_tolerance_mm)
+    _check_tolerance("kinematics_tolerance_deg", kinematics_tolerance_deg)
+    if write_config_source and not config_path:
+        raise ValueError("write_config_source needs config_path: it records the CAD version in that configuration file.")
     if operation == "check" and not config_path:
         raise ValueError("A check needs config_path: it verifies a JSON configuration's Link frames and joints.")
     if not NATIVE.is_file():
@@ -203,7 +254,39 @@ def create_job(operation, model_path, package_name="robot_description", *, confi
         write_json(directory / "native-config.json", native_config(config))
         request["config_path"] = str(directory / "native-config.json")
     write_json(directory / "request.json", request)
-    record = {"job_id": identifier, "job": str(directory), "status": "queued", "passed": False, "operation": operation, "model_path": str(source), "created_at": stamp(), "timeout_seconds": timeout_seconds, "stall_timeout_seconds": stall_timeout_seconds, "reference_urdf": str(reference) if reference else None, "source_model_sha256": sha256(source)}
+    created = stamp()
+    source_sha256 = sha256(source)
+    original_path, cad_version = original_model(source, source_sha256)
+    record = {"job_id": identifier, "job": str(directory), "status": "queued", "passed": False, "operation": operation, "model_path": str(source), "created_at": created, "timeout_seconds": timeout_seconds, "stall_timeout_seconds": stall_timeout_seconds, "reference_urdf": str(reference) if reference else None, "source_model_sha256": source_sha256,
+              # A prepared copy differs byte-wise from its original; configurations belong to the original's version.
+              "cad_version_sha256": cad_version, "accept_source_change": bool(accept_source_change), "kinematics_tolerance": {"mm": kinematics_tolerance_mm, "deg": kinematics_tolerance_deg}, "recompute_preflight": bool(recompute_preflight), "warnings": []}
+    if original_path != str(source):
+        record["original_model_path"] = original_path
+    if config:
+        record["config_input_path"] = str(Path(config_path).resolve())
+        record["write_config_source"] = bool(write_config_source)
+        status = source_status(config, source, created, (original_path, cad_version))
+        record["config_source"], record["config_stale"] = status["config_source"], status["stale"]
+        record["config_source_message"] = status.get("message")
+        if status["stale"]:
+            if config.get("recompute_kinematics", True):
+                action = "The joints are recomputed from the CAD (recompute_kinematics=true); review the limits and joint types."
+            elif accept_source_change:
+                action = "Accepted with accept_source_change=true: the configured joints are exported without comparing them with the current CAD."
+            elif recompute_preflight and _needs_preflight(config):
+                action = "The \"Automatically Generate\" joints are recomputed from the current CAD in a separate session (recompute_preflight) and compared with the configuration before any mesh is exported."
+            elif (status["config_source"] or {}).get("component_poses"):
+                # Same session, before the Link frames are built: costs seconds, not a second run.
+                write_json(directory / "expected-component-poses.json", status["config_source"]["component_poses"])
+                request.update(expected_component_poses=str(directory / "expected-component-poses.json"), pose_tolerance_m=kinematics_tolerance_mm / 1000, pose_tolerance_deg=kinematics_tolerance_deg)
+                write_json(directory / "request.json", request)
+                action = "The placement of each Link's first component is compared with that CAD version before any Link frame or mesh is made."
+            else:
+                action = ("No component placements were recorded for that CAD version, so they cannot be compared; the export is checked against the previous export instead "
+                          "(all meshes moving while a rotation axis stays behind fails). recompute_preflight=true recomputes the joints first, which takes long on large assemblies.")
+            record["warnings"].append(status["message"] + " " + action)
+    if operation == "export" and compare_previous and not reference:
+        record["previous_export"] = provenance.previous_export(original_path, package_name, JOBS, before=created, exclude=identifier)
     write_json(directory / "result.json", record)
     return identifier
 
@@ -268,18 +351,21 @@ def cancel_requested(directory):
 class ActivityMonitor:
     """Tracks whether a CAD job still makes progress: progress steps, log output or CPU work."""
 
-    def __init__(self, directory, native_pid):
+    def __init__(self, directory, native_pid, output_name="output"):
         self.directory = directory
+        self.output = directory / output_name
         self.native_pid = native_pid
         self.last_activity = time.monotonic()
         self.last_signature = None
         self.sample_started = time.monotonic()
         self.sample_cpu = self.cpu_seconds()
         self.cpu_total = self.sample_cpu
+        self.last_poll = time.monotonic()
+        self.suspended_seconds = 0.0
 
     def pids(self):
         pids = [self.native_pid]
-        session = read_json(self.directory / "output" / "session.json") or {}
+        session = read_json(self.output / "session.json") or {}
         if session.get("pid"):
             pids.append(session["pid"])
         return pids
@@ -294,8 +380,15 @@ class ActivityMonitor:
 
     def poll(self):
         now = time.monotonic()
-        output = self.directory / "output"
-        signature = tuple((p.stat().st_mtime_ns, p.stat().st_size) if p.is_file() else None for p in (output / "progress.json", self.directory / "stderr.log"))
+        gap = now - self.last_poll
+        self.last_poll = now
+        if gap > SUSPEND_GAP_SECONDS:
+            # Sleep or standby froze SolidWorks and this worker alike: move the clocks past it.
+            self.suspended_seconds += gap
+            self.last_activity += gap
+            self.sample_started = now
+            self.sample_cpu = self.cpu_seconds()
+        signature = tuple((p.stat().st_mtime_ns, p.stat().st_size) if p.is_file() else None for p in (self.output / "progress.json", self.output.parent / "stderr.log"))
         if signature != self.last_signature:
             self.last_signature = signature
             self.last_activity = now
@@ -311,7 +404,8 @@ class ActivityMonitor:
 
 def describe_progress(directory, record):
     """Current stage, step counters, elapsed time and last activity of a job."""
-    native = read_json(directory / "output" / "progress.json") or {}
+    output_name = record.get("native_output", "output")
+    native = read_json(directory / output_name / "progress.json") or {}
     if record["status"] in TERMINAL:
         progress = {"stage": record["status"], "description": f"Finished: {record['status']}", "last_native_stage": native.get("stage")}
     else:
@@ -321,6 +415,9 @@ def describe_progress(directory, record):
         if phase == "native" and native:
             progress.update(detail=native.get("detail") or None, current=native.get("current"), total=native.get("total") or None, stage_elapsed_seconds=seconds_since(native["stage_started_at"]) if native.get("stage_started_at") else None)
         progress["summary"] = progress["description"] + (f": {progress['current']}/{progress['total']}" if progress.get("total") else "") + (f" ({progress['detail']})" if progress.get("detail") else "")
+        if output_name != "output":
+            progress["preflight"] = True
+            progress["summary"] = STAGES["kinematics_preflight"] + ": " + progress["summary"]
     begin = record.get("started_at") or record["created_at"]
     end = datetime.fromisoformat(record["finished_at"]) if record.get("finished_at") else datetime.now(timezone.utc)
     progress["elapsed_seconds"] = round((end - datetime.fromisoformat(begin)).total_seconds(), 1)
@@ -328,7 +425,7 @@ def describe_progress(directory, record):
     if activity and record["status"] == "running":
         progress["cad_cpu_seconds"] = activity["cpu_seconds"]
         progress["idle_seconds"] = round(activity["idle_seconds"] + seconds_since(activity["sampled_at"]), 1)
-    log = directory / "stderr.log"
+    log = (directory / output_name).parent / "stderr.log"
     if log.is_file():
         progress["log_tail"] = log.read_text(encoding="utf-8", errors="replace").splitlines()[-5:]
     return progress
@@ -362,7 +459,8 @@ def _record_reusable_copy(bridge, record):
         return
     # Virtual components live inside the assembly at a temporary "...\VC~~\<assembly>^<part>" path.
     items = [{"name": c["name"], "path": c["path"], "is_virtual": "^" in Path(c["path"]).name, "suppressed": c["suppressed"], "exists": Path(c["path"]).is_file()} for c in bridge["components"]]
-    snapshot = {"source_path": str(prepared), "unsaved_changes": False, "configuration_name": bridge.get("configurationName", ""), "component_count": len(items), "mass_kg": bridge["cadAssemblyMassKg"], "components": items, "source_hashes": files}
+    snapshot = {"source_path": str(prepared), "unsaved_changes": False, "configuration_name": bridge.get("configurationName", ""), "component_count": len(items), "mass_kg": bridge["cadAssemblyMassKg"], "components": items, "source_hashes": files,
+                "original_model_path": record.get("original_model_path", record["model_path"]), "original_model_sha256": record.get("cad_version_sha256") or record["source_model_sha256"]}
     write_json(prepared.parent / "solidworks-urdf-snapshot.json", snapshot)
     record["reusable_model"] = str(prepared)
     record["reusable_model_hint"] = "Pass reusable_model as model_path to inspect, check or export again without the snapshot and Pack and Go steps."
@@ -401,7 +499,7 @@ def _probe_active_document(directory, request_path, request_data, record):
 
 def _wait_native(directory, record, process):
     """Wait for the native tool; stop it on cancel, stall or the hard time limit."""
-    monitor = ActivityMonitor(directory, process.pid)
+    monitor = ActivityMonitor(directory, process.pid, record.get("native_output", "output"))
     started = time.monotonic()
     while True:
         try:
@@ -415,7 +513,7 @@ def _wait_native(directory, record, process):
         if cancel_requested(directory):
             record.update(status="cancelled", error={"code": "CANCELLED", "message": f"Cancelled on request during: {where}.", "stage": progress.get("stage")})
             problem = True
-        elif time.monotonic() - started > record["timeout_seconds"]:
+        elif time.monotonic() - started - monitor.suspended_seconds > record["timeout_seconds"]:
             record.update(status="timed_out", error={"code": "CAD_TIMEOUT", "message": f"The CAD operation exceeded its {record['timeout_seconds']} s limit during: {where}. Source files were only snapshotted.", "stage": progress.get("stage")})
             problem = True
         elif idle > record["stall_timeout_seconds"]:
@@ -455,7 +553,10 @@ def _finish_configuration(directory, record, bridge, package_name):
 def _validate_export(directory, record, bridge, config):
     if config and needs_postprocess(config):
         record["postprocess"] = urdf_postprocess.apply(bridge["urdf"], config, directory / "native.urdf")
-    checks = validate(bridge["urdf"], record.get("reference_urdf"))
+    reference, mode = record.get("reference_urdf"), "strict"
+    if not reference and record.get("previous_export"):
+        reference, mode = record["previous_export"]["urdf"], "changes"
+    checks = validate(bridge["urdf"], reference, mode, allow_mesh_shift=record.get("accept_source_change", False))
     cad_mass = bridge["cadAssemblyMassKg"]
     if "total_mass_kg" in checks:
         delta = abs(checks["total_mass_kg"] - cad_mass)
@@ -472,11 +573,82 @@ def _validate_export(directory, record, bridge, config):
             checks["errors"].append(message)
     checks["passed"] = not checks["errors"]
     record["validation"] = checks
+    changes = checks.get("reference_changes") or []
+    if changes:
+        against = f"the previous export (job {record['previous_export']['job_id']})" if mode == "changes" else f"reference {reference}"
+        record.setdefault("notes", []).extend(c for c in changes if c.startswith("Mesh/joint-origin mismatch"))
+        others = [c for c in changes if not c.startswith("Mesh/joint-origin mismatch")]
+        if others:
+            record.setdefault("notes", []).append(f"{len(others)} difference(s) from {against}; review validation.reference_changes: " + " | ".join(others[:5]) + (" | ..." if len(others) > 5 else ""))
     # Renders are for the user to look at; failing to draw them does not fail the export.
     try:
         record["previews"] = render_preview.render(bridge["urdf"], Path(bridge["urdf"]).parent.parent / "previews")
     except Exception as exc:
         record["previews"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _preflight_kinematics(directory, record, request_data, config):
+    """Recompute the joints from the current CAD in a separate check run and compare them with the configuration.
+
+    Runs before the export itself, so a configuration made for another CAD version fails before any mesh is written.
+    """
+    folder = directory / "preflight"
+    (folder / "output").mkdir(parents=True, exist_ok=True)
+    write_json(folder / "native-config.json", dict(native_config(config), recompute_kinematics=True))
+    request_path = folder / "request.json"
+    write_json(request_path, dict(request_data, operation="check", output_dir=str(folder / "output"), config_path=str(folder / "native-config.json")))
+    record["native_output"] = "preflight/output"
+    try:
+        with (folder / "stdout.log").open("w", encoding="utf-8") as stdout, (folder / "stderr.log").open("w", encoding="utf-8") as stderr:
+            process = subprocess.Popen([str(NATIVE), str(request_path)], cwd=WORKSPACE, stdout=stdout, stderr=stderr, creationflags=subprocess.CREATE_NO_WINDOW)
+            record["preflight_native_pid"] = process.pid
+            _set_phase(directory, record, "native")
+            return_code = _wait_native(directory, record, process)
+    finally:
+        record.pop("native_output", None)
+    cleanup = cleanup_private_session(directory, "preflight/output")
+    bridge = read_json(folder / "output" / "bridge-result.json") or {}
+    preflight = {"native_exit_code": return_code, "status": bridge.get("status"), "error": bridge.get("errorMessage"), "session_cleanup": cleanup, "source_unchanged": bridge.get("sourceUnchanged"), "detected_joint_types": bridge.get("detectedJointTypes"), "folder": str(folder)}
+    record["kinematics_preflight"] = preflight
+    if record["status"] in {"timed_out", "cancelled"}:
+        raise PreflightStopped(record["error"]["message"])
+    if bridge.get("sourceUnchanged") is False or not cleanup["passed"]:
+        raise RuntimeError("The kinematics preflight " + ("changed source files" if bridge.get("sourceUnchanged") is False else "could not close its private session: " + str(cleanup.get("error"))) + "; see preflight/.")
+    staleness = record.get("config_source_message") or "The configuration was made for another CAD version."
+    resolved = bridge.get("resolvedJoints")
+    if not resolved:
+        raise ConfigOutdatedError(f"{staleness}\nRecomputing the joints from the current CAD failed ({bridge.get('errorMessage') or 'see preflight/stderr.log'}), so the configuration could not be compared. "
+                                  "No mesh was exported. Check the configuration with check_only, or rerun with accept_source_change=true to export the configured joints unchanged.", "KINEMATICS_PREFLIGHT_FAILED")
+    comparison = provenance.compare_kinematics(config, resolved, record["kinematics_tolerance"]["mm"], record["kinematics_tolerance"]["deg"], bridge.get("detectedJointTypes"))
+    preflight["comparison"] = comparison
+    if not comparison["passed"]:
+        raise ConfigOutdatedError(f"{staleness}\n{provenance.describe_differences(comparison)}\nNo mesh was exported. Correct the joints in the configuration (the recomputed values are in kinematics_preflight.comparison), "
+                                  "or rerun with accept_source_change=true to export the configured joints unchanged.")
+    record.setdefault("notes", []).append(f"Kinematics preflight: all {comparison['compared']} compared \"Automatically Generate\" joints match the current CAD within {comparison['tolerance_mm']} mm / {comparison['tolerance_deg']}°"
+                                          + (f"; not compared: {', '.join(n['joint'] for n in comparison['not_compared'])}" if comparison["not_compared"] else "") + ".")
+
+
+def _record_config_source(directory, record, bridge, config):
+    """Attach the CAD version a passed run verified to the configuration: in the job, and on request in the user's file."""
+    frames = {name: {"xyz": f["assembly_xyz"], "rpy": f["assembly_rpy"]} for name, f in (bridge.get("linkFrames") or {}).items()}
+    if not frames and bridge.get("resolvedJoints"):
+        frames = provenance.link_frames(bridge["resolvedJoints"])
+    source = {"model_sha256": record["cad_version_sha256"], "model_path": record.get("original_model_path", record["model_path"]), "exported_at": stamp(), "job_id": record["job_id"], "operation": record["operation"], "link_frames": frames}
+    if bridge.get("linkComponentPoses"):
+        source["component_poses"] = bridge["linkComponentPoses"]
+    record["config_verified_for_sha256"] = record["cad_version_sha256"]
+    sourced = dict(config, source=source)
+    write_json(directory / "robot-config.with-source.json", sourced)
+    record["config_with_source_path"] = str(directory / "robot-config.with-source.json")
+    if record.get("write_config_source"):
+        target = Path(record["config_input_path"])
+        current = read_json(target)
+        # Never overwrite edits made while the job ran.
+        if isinstance(current, dict) and {k: v for k, v in current.items() if k != "source"} == {k: v for k, v in config.items() if k != "source"}:
+            write_json(target, dict(current, source=source))
+            record["config_source_written"] = str(target)
+        else:
+            record.setdefault("notes", []).append(f"{target} changed while the job ran; its source block was not updated (see config_with_source_path).")
 
 
 def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
@@ -517,6 +689,9 @@ def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
             _probe_active_document(directory, request_path, request_data, record)
             if cancel_requested(directory):
                 raise JobCancelled("Cancelled before SolidWorks started.")
+            job_config = read_json(directory / "robot-config.json")
+            if job_config and record.get("config_stale") and record.get("recompute_preflight") and not record.get("accept_source_change") and _needs_preflight(job_config):
+                _preflight_kinematics(directory, record, request_data, job_config)
             with (directory / "stdout.log").open("w", encoding="utf-8") as stdout, (directory / "stderr.log").open("w", encoding="utf-8") as stderr:
                 process = subprocess.Popen([str(NATIVE), str(request_path)], cwd=WORKSPACE, stdout=stdout, stderr=stderr, creationflags=subprocess.CREATE_NO_WINDOW)
                 record["native_pid"] = process.pid
@@ -551,9 +726,14 @@ def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
                     record["resolved_joints"] = bridge.get("resolvedJoints")
                     record["link_frames"] = bridge.get("linkFrames")
                     record["detected_joint_types"] = bridge.get("detectedJointTypes")
-                record["warnings"] = bridge_warnings(bridge) + record.pop("notes", [])
+                record["warnings"] = record.get("warnings", []) + bridge_warnings(bridge) + record.pop("notes", [])
                 validation_ok = record.get("validation", {"passed": True})["passed"]
                 record["passed"] = bool(native_ok and preferences_ok and cleanup["passed"] and record["source_unchanged"] and bool(before) and validation_ok)
+                if config:
+                    record["config_verified_for_sha256"] = None
+                    if record["passed"] and record["operation"] in {"export", "check"}:
+                        _record_config_source(directory, record, bridge, config)
+                        record["warnings"] += record.pop("notes", [])
                 if not stopped:
                     record["status"] = "succeeded" if record["passed"] else "failed"
                 if not native_ok and not stopped:
@@ -570,6 +750,10 @@ def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
                             reasons.append("source file audit failed: " + str(bridge.get("sourceAuditError") or "files changed"))
                         message = f"The native operation ended with status {bridge.get('status')!r} and exit code {return_code}: " + ("; ".join(reasons) or "see stderr.log")
                     record["error"] = {"code": "CAD_OPERATION_FAILED", "message": message, "stage": stage, "native_exit_code": return_code}
+                    if (bridge.get("componentPoseCheck") or {}).get("exceeded"):
+                        record["component_pose_check"] = bridge["componentPoseCheck"]
+                        record["error"].update(code="CONFIG_OUTDATED", message=f"{record.get('config_source_message') or 'The configuration was made for another CAD version.'}\n{provenance.describe_pose_changes(bridge['componentPoseCheck'])}\n"
+                                               "No Link frame or mesh was made. Correct the joint origins, or rerun with accept_source_change=true to export the configured joints unchanged.")
                 elif native_ok and not record["passed"] and not record.get("error"):
                     reasons = []
                     if not validation_ok:
@@ -600,9 +784,18 @@ def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
         if record.get("preference_restore", {}).get("passed") is not True and preference_restore_needed(directory, record):
             mark_preference_restore(identifier)
             record["preference_restore"] = {"passed": False, "pending": True, "message": "Will be restored before the next CAD job starts."}
+        if (directory / "preflight" / "output" / "session.json").is_file():
+            record["preflight_session_cleanup"] = cleanup_private_session(directory, "preflight/output")
         record.pop("queue", None)
-        code = "CAD_BUSY" if isinstance(exc, CadBusyError) else "CANCELLED" if isinstance(exc, JobCancelled) else "UNSAVED_CHANGES" if isinstance(exc, UnsavedChangesError) else "TOOL_ERROR"
-        record.update(status="cancelled" if isinstance(exc, JobCancelled) else "failed", passed=False, error={"code": code, "message": str(exc)})
+        record.pop("native_output", None)
+        record["warnings"] = record.get("warnings", []) + record.pop("notes", [])
+        if record.get("config_input_path"):
+            record["config_verified_for_sha256"] = None
+        if isinstance(exc, PreflightStopped):
+            record["passed"] = False  # status and error were set where the preflight stopped
+        else:
+            code = "CAD_BUSY" if isinstance(exc, CadBusyError) else "CANCELLED" if isinstance(exc, JobCancelled) else "UNSAVED_CHANGES" if isinstance(exc, UnsavedChangesError) else exc.code if isinstance(exc, ConfigOutdatedError) else "TOOL_ERROR"
+            record.update(status="cancelled" if isinstance(exc, JobCancelled) else "failed", passed=False, error={"code": code, "message": str(exc)})
     finally:
         record.pop("phase", None)
         record["finished_at"] = stamp()
@@ -657,6 +850,8 @@ def get_job(identifier):
                 result.pop("phase", None)
                 result.update(status="interrupted", passed=False, finished_at=stamp(), error={"code": "WORKER_INTERRUPTED", "message": "The worker exited (or never started) before producing a terminal result. Create a new job to retry."})
                 result["session_cleanup"] = cleanup_private_session(directory)
+                if (directory / "preflight" / "output" / "session.json").is_file():
+                    result["preflight_session_cleanup"] = cleanup_private_session(directory, "preflight/output")
                 if preference_restore_needed(directory, result):
                     mark_preference_restore(identifier)
                     result["preference_restore"] = {"passed": False, "pending": True, "message": "Will be restored before the next CAD job starts."}
@@ -697,13 +892,17 @@ def operation(operation_name, model_path, package_name="robot_description", **op
     return run_job(create_job(operation_name, model_path, package_name, **options))
 
 
-def export_urdf(model_path, package_name="robot_description", *, config_path=None, reference_urdf=None, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds=DEFAULT_STALL_SECONDS, use_saved_files=False):
-    return operation("export", model_path, package_name, config_path=config_path, reference_urdf=reference_urdf, timeout_seconds=timeout_seconds, stall_timeout_seconds=stall_timeout_seconds, use_saved_files=use_saved_files)
+def export_urdf(model_path, package_name="robot_description", *, config_path=None, reference_urdf=None, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds=DEFAULT_STALL_SECONDS, use_saved_files=False,
+                accept_source_change=False, kinematics_tolerance_mm=provenance.DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg=provenance.DEFAULT_TOLERANCE_DEG, compare_previous=True, write_config_source=False, recompute_preflight=False):
+    return operation("export", model_path, package_name, config_path=config_path, reference_urdf=reference_urdf, timeout_seconds=timeout_seconds, stall_timeout_seconds=stall_timeout_seconds, use_saved_files=use_saved_files,
+                     accept_source_change=accept_source_change, kinematics_tolerance_mm=kinematics_tolerance_mm, kinematics_tolerance_deg=kinematics_tolerance_deg, compare_previous=compare_previous, write_config_source=write_config_source, recompute_preflight=recompute_preflight)
 
 
-def check_configuration(model_path, config_path, *, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds=DEFAULT_STALL_SECONDS, use_saved_files=False):
+def check_configuration(model_path, config_path, *, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds=DEFAULT_STALL_SECONDS, use_saved_files=False,
+                        accept_source_change=False, kinematics_tolerance_mm=provenance.DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg=provenance.DEFAULT_TOLERANCE_DEG, write_config_source=False, recompute_preflight=False):
     """Run an export up to the joints and Link frames, without inertia or meshes."""
-    return operation("check", model_path, config_path=config_path, timeout_seconds=timeout_seconds, stall_timeout_seconds=stall_timeout_seconds, use_saved_files=use_saved_files)
+    return operation("check", model_path, config_path=config_path, timeout_seconds=timeout_seconds, stall_timeout_seconds=stall_timeout_seconds, use_saved_files=use_saved_files,
+                     accept_source_change=accept_source_change, kinematics_tolerance_mm=kinematics_tolerance_mm, kinematics_tolerance_deg=kinematics_tolerance_deg, write_config_source=write_config_source, recompute_preflight=recompute_preflight)
 
 
 def inspect_model(model_path, *, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds=DEFAULT_STALL_SECONDS, use_saved_files=False):
@@ -714,8 +913,10 @@ def prepare_model(model_path, *, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_
     return operation("prepare", model_path, timeout_seconds=timeout_seconds, stall_timeout_seconds=stall_timeout_seconds, use_saved_files=use_saved_files)
 
 
-def start_export(model_path, package_name="robot_description", *, config_path=None, reference_urdf=None, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds=DEFAULT_STALL_SECONDS, use_saved_files=False):
-    return start_job("export", model_path, package_name, config_path=config_path, reference_urdf=reference_urdf, timeout_seconds=timeout_seconds, stall_timeout_seconds=stall_timeout_seconds, use_saved_files=use_saved_files)
+def start_export(model_path, package_name="robot_description", *, config_path=None, reference_urdf=None, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds=DEFAULT_STALL_SECONDS, use_saved_files=False,
+                 accept_source_change=False, kinematics_tolerance_mm=provenance.DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg=provenance.DEFAULT_TOLERANCE_DEG, compare_previous=True, write_config_source=False, recompute_preflight=False):
+    return start_job("export", model_path, package_name, config_path=config_path, reference_urdf=reference_urdf, timeout_seconds=timeout_seconds, stall_timeout_seconds=stall_timeout_seconds, use_saved_files=use_saved_files,
+                     accept_source_change=accept_source_change, kinematics_tolerance_mm=kinematics_tolerance_mm, kinematics_tolerance_deg=kinematics_tolerance_deg, compare_previous=compare_previous, write_config_source=write_config_source, recompute_preflight=recompute_preflight)
 
 
 def start_job(operation_name, model_path, package_name="robot_description", **options):
@@ -725,4 +926,7 @@ def start_job(operation_name, model_path, package_name="robot_description", **op
     identity = process_identity(process.pid)
     if identity:
         write_json(job_directory(identifier) / "worker.json", identity)
-    return {"job_id": identifier, "job": str(job_directory(identifier)), "status": "queued", "worker_pid": process.pid, "next_step": "Poll get_export_job with this job_id and wait_seconds (for example 300) until status is terminal; only status=succeeded with passed=true is a success."}
+    record = read_json(job_directory(identifier) / "result.json") or {}
+    started = {"job_id": identifier, "job": str(job_directory(identifier)), "status": "queued", "worker_pid": process.pid, "next_step": "Poll get_export_job with this job_id and wait_seconds (for example 300) until status is terminal; only status=succeeded with passed=true is a success."}
+    started.update({key: record[key] for key in ("warnings", "config_stale", "previous_export") if record.get(key) is not None})
+    return started

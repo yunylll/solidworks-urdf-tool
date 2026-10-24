@@ -71,11 +71,17 @@ Run from the workspace root:
 # Check a configuration without starting SolidWorks
 .\.venv\Scripts\python.exe scripts\tool_cli.py validate-config examples\arm-custom-config.json
 
+# Also report whether the configuration was made for the model's current CAD version (reads files only)
+.\.venv\Scripts\python.exe scripts\tool_cli.py validate-config "C:\path\robot-config.json" --model "C:\path\robot.SLDASM"
+
 # Validate any URDF package on this computer, e.g. one copied into a project
 .\.venv\Scripts\python.exe scripts\tool_cli.py validate-urdf "C:\project\robot_description\urdf\robot_description.urdf"
+
+# Compare two exports: numeric differences fail, reference_motion shows how each mesh and joint origin moved
+.\.venv\Scripts\python.exe scripts\tool_cli.py validate-urdf "C:\new\urdf\robot.urdf" --reference "C:\old\urdf\robot.urdf"
 ```
 
-The CAD commands accept `--timeout` (hard limit, default 14400 s), `--stall-timeout` (default 900 s, see below) and `--use-saved-files`.
+The CAD commands accept `--timeout` (hard limit, default 14400 s), `--stall-timeout` (default 900 s, see below) and `--use-saved-files`. `check`, `export` and `start-export` also take `--accept-source-change`, `--kinematics-tolerance-mm`, `--kinematics-tolerance-deg`, `--write-config-source` and `--recompute-preflight`, and `export`/`start-export` take `--no-compare-previous` (see [CAD versions and the previous export](#cad-versions-and-the-previous-export)).
 
 Every operation creates `validation/jobs/<job_id>/`. `result.json` records the status, the SHA-256 of the original files, settings restoration, physical validation and errors; `stdout.log`/`stderr.log` keep the native logs. Only `status=succeeded` with `passed=true` means every check of the operation passed. `queued`/`running`, or "some files were produced", must never be treated as success.
 
@@ -90,11 +96,20 @@ The directory may contain the source snapshot, the prepared CAD and the export p
 - **Progress.** `job` / `get_export_job` return `progress` with the stage (for example `export_meshes`), a summary such as `Exporting STL meshes: 7/18 (gripper_z)`, step counters, elapsed seconds, seconds in the current stage, SolidWorks CPU seconds and `idle_seconds` since the last sign of work, plus the last log lines. `stderr.log` carries timestamps.
 - On a failure, `error.stage` names the stage where it happened.
 
+### CAD versions and the previous export
+
+A configuration with `recompute_kinematics=false` holds absolute joint origins copied from one version of the CAD. If the assembly is later saved with the model moved relative to its origin, the meshes follow the CAD but the joint origins do not, and every check of the new URDF on its own still passes. Two checks catch this:
+
+- **The configuration's CAD version.** A passed `check` or `export` with a JSON configuration records the CAD version it verified: `config_with_source_path` in the job is the configuration with a `source` block (`model_sha256`, `model_path`, `exported_at`, `job_id`, `operation`, `link_frames`, the pose of every Link frame in the root Link's frame, and `component_poses`, where each Link's first component sits in the assembly), and `--write-config-source` (MCP/Python: `write_config_source=true`) writes that block into the `--config` file itself, unless the file changed during the job. A configuration without a `source` block is attributed to the earlier jobs of the same model that used the same joint origins (`config_source.origin=inferred_from_job`; that job's component placements are used when it recorded them). When that version differs from the model's SHA-256 (for a reusable copy: the original's), the result says so in `warnings` and `config_stale=true`; `validate-config --model` gives the same answer without starting SolidWorks. The export then compares each Link's first component with its recorded placement, in the same SolidWorks session right after the configuration is resolved and before any Link frame or mesh is made, which takes seconds. A component moved or turned by more than `--kinematics-tolerance-mm` / `--kinematics-tolerance-deg` (default 0.1 mm / 0.1°) fails the job with `CONFIG_OUTDATED`; the message lists each Link with its old and new position, and if all of them moved by one rigid translation it names that vector (the rows are in `component_pose_check`). Without recorded placements (configurations from before this check), the job only warns and relies on the comparison with the previous export below. `--recompute-preflight` (`recompute_preflight=true`) instead recomputes the "Automatically Generate" joints from the current CAD in a separate check-only session (`preflight/`) and compares origins and axes, failing with `CONFIG_OUTDATED` or `KINEMATICS_PREFLIGHT_FAILED`; on assemblies of hundreds of parts the mate analysis this needs takes hours, so it is off by default. `--accept-source-change` (`accept_source_change=true`) skips these checks and exports the configured joints.
+- **The previous export.** Unless `--reference` is given or `--no-compare-previous` (`compare_previous=false`) is set, an export is compared with the newest successful export of the same model, or else of the same package name (`previous_export` in result.json). Differences from it are listed in `validation.reference_changes` and summarized in `warnings` without failing. `validation.reference_motion` gives the move of each mesh (center of its bounding box and its centroid) and of each joint origin, both in the frame of the topmost Link with a mesh. If every mesh moved by the same vector, each revolute or continuous joint origin must have moved with them, apart from a slide along its own axis, which changes nothing (`reference_motion.rotation_axis_offset_mm` gives the sideways remainder per joint). An axis more than 0.5 mm behind fails the export with a "Mesh/joint-origin mismatch" error that names the vector, each axis that stayed behind and how far it now misses its part, and the axes that did follow; so a configuration corrected for only some axes still fails. Prismatic and fixed joint origins that stayed put only move Link frames and are listed as changes; with `--accept-source-change` this is a warning. An explicit `--reference` stays strict: any difference fails.
+
+Waiting jobs are not stopped by sleep or standby: a gap of more than 60 s between two polls is treated as suspended time, which counts neither as idle time for `--stall-timeout` nor towards `--timeout`. The optional recompute preflight is a second SolidWorks session with its own `--timeout`.
+
 ## JSON configuration
 
 Run `inspect` first, then edit the `configuration_path` it returns. Runnable samples: [arm-config.json](examples/arm-config.json) and [a configuration with limits and a fixed frame](examples/arm-custom-config.json).
 
-The format is `schema_version=1`, `robot_name`, `recompute_kinematics` and `links`. Each link specifies `name`, `parent`, `components`, `coordinate_system`, `mesh_quality`, `frame_only` and `joint`; component names use the full instance names returned by inspect.
+The format is `schema_version=1`, `robot_name`, `recompute_kinematics` and `links`, plus the optional `world` and `source` (the CAD version the configuration was verified against; written by the tool, see [CAD versions and the previous export](#cad-versions-and-the-previous-export)). Each link specifies `name`, `parent`, `components`, `coordinate_system`, `mesh_quality`, `frame_only` and `joint`; component names use the full instance names returned by inspect.
 
 - `recompute_kinematics=true`: recompute joint transforms from the CAD coordinate systems/axes named in the configuration; where the coordinate system or axis is "Automatically Generate", the original exporter infers them from mates. Inference only looks at the remaining degrees of freedom of each child link's **first component** with the parent link's components held fixed, so mates inside flexible sub-assemblies or through other links are not seen. If an inferred joint type differs from the JSON `type`, the export fails and lists each joint instead of silently producing `fixed`.
 - `recompute_kinematics=false`: use the local xyz, rpy and axis from the JSON (axis in the child link frame). For a link whose `coordinate_system` is "Automatically Generate", the tool creates a coordinate system `Origin_<joint name>` in the CAD copy from the joint chain, so meshes and inertia are exported in that link's own frame. A link that names an existing coordinate system must agree with its JSON origin; otherwise the export fails and reports the xyz/rpy of that coordinate system. Put the xyz of continuous/revolute joints on the rotation axis.
@@ -121,7 +136,8 @@ sys.path.insert(0, r"C:\path\to\solidworks-urdf-tool\scripts")
 from tool_service import inspect_model, check_configuration, export_urdf, start_export, wait_job, cancel_job
 
 result = export_urdf(r"C:\path\robot.SLDASM", "robot_description")
-# config_path / reference_urdf / timeout_seconds / stall_timeout_seconds / use_saved_files are keyword-only
+# config_path / reference_urdf / timeout_seconds / stall_timeout_seconds / use_saved_files and the options
+# accept_source_change / kinematics_tolerance_mm / kinematics_tolerance_deg / compare_previous / write_config_source / recompute_preflight are keyword-only
 check = check_configuration(r"C:\path\robot.SLDASM", r"C:\path\robot-config.json")
 result = export_urdf(check.get("reusable_model") or r"C:\path\robot.SLDASM", "robot_description", config_path=r"C:\path\robot-config.json")
 assert result["passed"], result.get("error")
@@ -132,7 +148,7 @@ print(result["bridge"]["urdf"])
 
 The server is `scripts/mcp_server.py`, launched with the workspace Python. Other stdio clients can use [mcp-connection.example.json](mcp-connection.example.json) as a template, replacing `<REPO_ROOT>` with the path of this repository. In the Codex setup used for development the startup timeout is 60 s and the tool timeout 1200 s, and the registration adds only this server (other servers and security settings are left alone).
 
-9 tools: `inspect_solidworks`, `inspect_model_configuration`, `prepare_model`, `validate_configuration`, `export_urdf`, `start_urdf_export`, `get_export_job`, `cancel_export_job`, `validate_urdf`. `export_urdf` and `start_urdf_export` take `check_only`, `use_saved_files`, `timeout_seconds` and `stall_timeout_seconds`. For large models prefer `start_urdf_export`, then call `get_export_job` with `wait_seconds` (for example 300): the call waits for the job and returns as soon as it is terminal, so the client needs neither a shell `sleep` nor many polls. `validate_urdf` accepts any URDF file on this computer and an optional `reference_urdf`.
+9 tools: `inspect_solidworks`, `inspect_model_configuration`, `prepare_model`, `validate_configuration`, `export_urdf`, `start_urdf_export`, `get_export_job`, `cancel_export_job`, `validate_urdf`. `export_urdf` and `start_urdf_export` take `check_only`, `use_saved_files`, `timeout_seconds`, `stall_timeout_seconds`, `compare_previous` (default true), `accept_source_change`, `kinematics_tolerance_mm`, `kinematics_tolerance_deg` (default 0.1 each) `write_config_source` and `recompute_preflight`; `validate_configuration` takes an optional `model_path` for the CAD version check. For large models prefer `start_urdf_export`, then call `get_export_job` with `wait_seconds` (for example 300): the call waits for the job and returns as soon as it is terminal, so the client needs neither a shell `sleep` nor many polls. `validate_urdf` accepts any URDF file on this computer and an optional `reference_urdf`.
 
 The blocking tools (`export_urdf`, `inspect_model_configuration`, `prepare_model`) also run as background jobs and wait at most 1000 s (adjustable with the `SW_URDF_SYNC_WAIT_SECONDS` environment variable, which should stay below the client's tool timeout). If the job is not finished by then, the call returns `still_running=true` and a `job_id`; the job keeps running and can be queried with `get_export_job`.
 
@@ -159,12 +175,13 @@ The output is the original project's traditional ROS URDF package. ROS 2 launch 
 .\.venv\Scripts\python.exe scripts\test_validation.py
 .\.venv\Scripts\python.exe scripts\test_jobs.py
 .\.venv\Scripts\python.exe scripts\test_postprocess.py
+.\.venv\Scripts\python.exe scripts\test_provenance.py
 .\.venv\Scripts\python.exe scripts\test_cad_regressions.py
 .\.venv\Scripts\python.exe scripts\test_tool_mcp.py
 .\.venv\Scripts\python.exe scripts\test_registered_mcp.py
 ```
 
-`test_cad_regressions.py` needs SolidWorks: it authors a copy of the sample arm with a virtual component, then covers Pack and Go with virtual components, joints that share one origin, check-only runs, reuse of a prepared copy, progress records, mimic/world settings and error messages that name the wrong component.
+`test_provenance.py` runs without SolidWorks; where `validation/jobs` (or `SW_URDF_JOBS_DATA`) holds real jobs listed in an untracked `validation/private-fixture.json` (or `SW_URDF_PRIVATE_FIXTURE`), it also shows on them that the old flow passed and the new checks catch the moved model. `test_cad_regressions.py` needs SolidWorks: it authors a copy of the sample arm with a virtual component, then covers Pack and Go with virtual components, joints that share one origin, check-only runs, reuse of a prepared copy, progress records, mimic/world settings and error messages that name the wrong component.
 
 Original export source snapshot: 882169e28952f0d17c87d7eab98826454421aabf, MIT. `build/core-source-manifest.json` records the hash and adaptation marker of every upstream file, and `build/core-source` holds the generated source for review. The source preparation rules are in `scripts/prepare-core.py`. The comment at the top of each exported URDF credits this tool and the upstream author; upstream's own header is replaced by a patch in the same script.
 
