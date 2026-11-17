@@ -77,6 +77,53 @@ class ValidatorChecks(unittest.TestCase):
         bounds = validate(self.urdf)["link_world_bounds_m"]
         self.assertEqual(set(bounds), {"base_link", "prox_link", "dist_Link", "effector_link"})
 
+    def cad_geometry(self, volume_scale=1.0, frame=None, extra=()):
+        """CAD geometry recorded for base_link as the export does, built from its own mesh."""
+        mesh = trimesh.load_mesh(self.package / "meshes" / "base_link.STL")
+        frame = np.eye(4) if frame is None else frame
+        box = (mesh.bounds @ frame[:3, :3].T + frame[:3, 3]).tolist()
+        components = [{"name": "3_DOF_ARM_BASE-1", "assembly": False, "box_m": box}] + list(extra)
+        return {"base_link": {"cad_volume_m3": abs(mesh.volume) * volume_scale, "frame_to_assembly": frame.tolist(), "components": components}}
+
+    def test_cad_geometry_matches(self):
+        frame = np.eye(4)
+        frame[:3, 3] = [0.5, -0.2, 1.0]  # The STL is in the Link frame, the boxes in the assembly frame.
+        result = validate(self.urdf, cad_geometry=self.cad_geometry(frame=frame))
+        self.assertTrue(result["passed"], result["errors"])
+        self.assertEqual(result["cad_geometry"]["base_link"]["components_without_mesh"], [])
+        self.assertAlmostEqual(result["cad_geometry"]["base_link"]["volume_ratio"], 1.0, places=4)
+
+    def test_cad_geometry_missing_parts(self):
+        # A sub-assembly listed whole whose parts never reached the STL (the vials of a workstation).
+        away = [[1.0, 1.0, 1.0], [1.02, 1.02, 1.05]]
+        rack = {"name": "rack-1/cap-5", "assembly": True, "box_m": away, "parts": [{"name": "rack-1/cap-5/vial-1", "box_m": away}, {"name": "rack-1/cap-5/cap-1", "box_m": away}]}
+        result = validate(self.urdf, cad_geometry=self.cad_geometry(volume_scale=1.6, extra=[rack]))
+        self.assertFalse(result["passed"])
+        message = next(e for e in result["errors"] if e.startswith("Mesh of base_link"))
+        self.assertIn("2 of 3 component(s)", message)
+        self.assertIn("rack-1/cap-5/vial-1 (in rack-1/cap-5)", message)
+        self.assertIn("62.5% of the CAD volume", message)
+
+    def test_cad_geometry_volume_only(self):
+        # Every component box holds mesh vertices, but most of the volume is gone: name the sub-assemblies.
+        sub = {"name": "frame_asm-1", "assembly": True, "box_m": None, "parts": []}
+        result = validate(self.urdf, cad_geometry=self.cad_geometry(volume_scale=3.0, extra=[sub]))
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("33.3% of the CAD volume" in e and "frame_asm-1" in e for e in result["errors"]), result["errors"])
+
+    def test_cad_geometry_tessellation_warning(self):
+        result = validate(self.urdf, cad_geometry=self.cad_geometry(volume_scale=1.08))
+        self.assertTrue(result["passed"], result["errors"])
+        self.assertTrue(any("tessellation" in w for w in result["warnings"]), result["warnings"])
+
+    def test_empty_mesh_lists_every_component(self):
+        path = self.package / "meshes" / "base_link.STL"
+        geometry = self.cad_geometry()
+        path.write_bytes(b"\0" * 80)  # What SolidWorks wrote for a Link whose parts were all hidden.
+        result = validate(self.urdf, cad_geometry=geometry)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("1 of 1 component(s)" in e and "3_DOF_ARM_BASE-1" in e for e in result["errors"]), result["errors"])
+
     def test_previews(self):
         result = render_preview.render(self.urdf, self.package / "previews")
         self.assertEqual(set(result["images"]), {"front", "side", "top"})

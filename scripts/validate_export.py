@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import time
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -19,6 +20,80 @@ MESH_SHIFT_MIN_M = 0.0005
 MESH_SHIFT_COMMON_SHARE = 0.02
 # Joint origins that moved less than this count as unchanged.
 JOINT_SHIFT_MAX_M = 0.0001
+# A Link mesh against the CAD it was made from. Tessellation changes the volume by a few percent at
+# most; a mesh outside the error band has lost or gained geometry. A component's CAD box is widened
+# by this share of its largest extent (or the minimum) before looking for mesh vertices in it.
+MESH_VOLUME_ERROR_BAND = (0.85, 1.15)
+MESH_VOLUME_WARNING_BAND = (0.95, 1.05)
+COMPONENT_BOX_MARGIN_SHARE = 0.01
+COMPONENT_BOX_MARGIN_MIN_M = 0.0005
+
+
+def _names(rows, limit=15) -> str:
+    return ", ".join(rows[:limit]) + (f", ... ({len(rows)} in all)" if len(rows) > limit else "")
+
+
+def check_cad_geometry(name: str, vertices: np.ndarray, mesh_volume: float, geometry: dict, errors: list, warnings: list) -> dict:
+    """Compare one Link mesh with the CAD geometry recorded for it.
+
+    geometry is the export's bridge.linkGeometry entry: cad_volume_m3, frame_to_assembly (the STL
+    frame as a 4x4 Link-to-assembly transform) and components, each with an assembly-frame box_m and,
+    for a sub-assembly, the boxes of its parts. Every component and part with a box must have mesh
+    vertices inside it, and the mesh volume must match the CAD volume.
+    """
+    summary = {"cad_volume_m3": geometry.get("cad_volume_m3"), "mesh_volume_m3": mesh_volume}
+    cad_volume = geometry.get("cad_volume_m3")
+    if cad_volume and cad_volume > 0:
+        ratio = mesh_volume / cad_volume
+        summary["volume_ratio"] = round(ratio, 4)
+    else:
+        ratio = None
+    empty = []
+    frame = geometry.get("frame_to_assembly")
+    if frame is not None:
+        matrix = np.asarray(frame, dtype=float)
+        points = np.asarray(vertices, dtype=float).reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3]
+        points = points[np.argsort(points[:, 0], kind="stable")]
+        xs = points[:, 0]
+
+        def occupied(box):
+            low, high = np.asarray(box[0], dtype=float), np.asarray(box[1], dtype=float)
+            margin = max(COMPONENT_BOX_MARGIN_MIN_M, float((high - low).max()) * COMPONENT_BOX_MARGIN_SHARE)
+            low, high = low - margin, high + margin
+            part = points[np.searchsorted(xs, low[0]):np.searchsorted(xs, high[0], side="right")]
+            return bool(np.any(np.all((part[:, 1:] >= low[1:]) & (part[:, 1:] <= high[1:]), axis=1)))
+
+        checked = 0
+        for component in geometry.get("components") or []:
+            parts = component.get("parts")
+            if parts:
+                # A listed sub-assembly: each of its parts must be in the mesh.
+                for part in parts:
+                    if part.get("box_m") is not None:
+                        checked += 1
+                        if not occupied(part["box_m"]):
+                            empty.append(f"{part['name']} (in {component['name']})")
+            elif component.get("box_m") is not None:
+                checked += 1
+                if not occupied(component["box_m"]):
+                    empty.append(component["name"])
+        summary["components_checked"] = checked
+    summary["components_without_mesh"] = empty
+    volume_off = ratio is not None and not (MESH_VOLUME_ERROR_BAND[0] <= ratio <= MESH_VOLUME_ERROR_BAND[1])
+    if empty or volume_off:
+        message = f"Mesh of {name} does not match its CAD geometry: "
+        details = []
+        if ratio is not None:
+            details.append(f"mesh volume {mesh_volume:.6g} m^3 is {ratio:.1%} of the CAD volume {cad_volume:.6g} m^3")
+        if empty:
+            details.append(f"{len(empty)} of {summary['components_checked']} component(s) have no mesh vertex inside their CAD bounding box and are probably missing from the STL: {_names(empty)}")
+        suspects = [c["name"] for c in geometry.get("components") or [] if c.get("assembly")]
+        if suspects and not empty:
+            details.append("sub-assemblies listed whole, the likeliest place for missing parts: " + _names(suspects))
+        errors.append(message + "; ".join(details) + ".")
+    elif ratio is not None and not (MESH_VOLUME_WARNING_BAND[0] <= ratio <= MESH_VOLUME_WARNING_BAND[1]):
+        warnings.append(f"Mesh volume of {name} is {ratio:.1%} of its CAD volume ({mesh_volume:.6g} vs {cad_volume:.6g} m^3); every component is in the mesh, so this is probably tessellation (mesh_quality) or overlapping bodies.")
+    return summary
 
 
 def origin_matrix(origin) -> np.ndarray:
@@ -203,7 +278,18 @@ def _reference_motion(root, baseline, reference_path: Path, package_dir: Path, m
     return motion
 
 
-def _validate(urdf_path: str | Path, reference: str | Path | None = None, reference_mode: str = "strict", allow_mesh_shift: bool = False) -> dict:
+def _load_mesh(path: Path):
+    """trimesh.load_mesh, waiting out a SolidWorks process that has not yet released a file it just wrote."""
+    for attempt in range(20):
+        try:
+            return trimesh.load_mesh(path, process=True)
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.5)
+
+
+def _validate(urdf_path: str | Path, reference: str | Path | None = None, reference_mode: str = "strict", allow_mesh_shift: bool = False, cad_geometry: dict | None = None) -> dict:
     path = Path(urdf_path).resolve()
     root = ET.parse(path).getroot()
     package_dir = path.parent.parent
@@ -211,7 +297,7 @@ def _validate(urdf_path: str | Path, reference: str | Path | None = None, refere
     joints = root.findall("joint")
     if reference_mode not in {"strict", "changes"}:
         raise ValueError(f"reference_mode must be strict or changes, got {reference_mode!r}")
-    errors, meshes, masses, changes = [], {}, {}, []
+    errors, meshes, masses, changes, geometry_warnings, cad_checks = [], {}, {}, [], [], {}
     names = [link.attrib["name"] for link in links]
     joint_names = [joint.attrib["name"] for joint in joints]
     if root.tag != "robot" or not links:
@@ -304,10 +390,12 @@ def _validate(urdf_path: str | Path, reference: str | Path | None = None, refere
                 errors.append(f"Missing or invalid {role} mesh of {name}: {uri} (looked for {target})")
                 continue
             if target.name not in meshes:
-                geometry = trimesh.load_mesh(target, process=True)
+                geometry = _load_mesh(target)
                 if len(geometry.faces) == 0 or not np.all(np.isfinite(geometry.vertices)):
                     errors.append(f"Invalid mesh {target.name}: {len(geometry.faces)} triangles" + ("" if np.all(np.isfinite(geometry.vertices)) else ", non-finite vertices"))
                 meshes[target.name] = {"triangles": len(geometry.faces), "bounds_m": geometry.bounds.tolist() if geometry.bounds is not None else None, "watertight": bool(geometry.is_watertight), "volume_m3": float(abs(geometry.volume)) if len(geometry.faces) else 0.0, "centroid_m": geometry.centroid.tolist() if len(geometry.faces) else None}
+                if cad_geometry and name in cad_geometry and name not in cad_checks:
+                    cad_checks[name] = check_cad_geometry(name, np.asarray(geometry.vertices), meshes[target.name]["volume_m3"], cad_geometry[name], errors, geometry_warnings)
     world_bounds = _placement(root, links, package_dir, meshes, errors) if reachable == set(names) else {}
     comparison, motion = {}, {}
     if reference:
@@ -369,12 +457,12 @@ def _validate(urdf_path: str | Path, reference: str | Path | None = None, refere
                         differ(f"Cannot compare reference mesh for {name}: reference {old_path} " + ("exists" if old_path.is_file() else "is missing") + f", exported mesh {current_name} " + ("was read" if current_name in meshes else "was not read"))
         if reachable == set(names):
             motion = _reference_motion(root, baseline, Path(reference).resolve(), package_dir, meshes, reference_meshes, errors, changes, allow_mesh_shift)
-    return {"passed": not errors, "errors": errors, "links": len(links), "joints": len(joints), "link_names": names, "joint_types": {j.attrib["name"]: j.attrib["type"] for j in joints}, "total_mass_kg": sum(masses.values()), "link_masses_kg": masses, "meshes": meshes, "link_world_bounds_m": world_bounds, "reference_numeric_deltas": comparison, "reference_mode": reference_mode if reference else None, "reference_changes": changes, "reference_motion": motion}
+    return {"passed": not errors, "errors": errors, "links": len(links), "joints": len(joints), "link_names": names, "joint_types": {j.attrib["name"]: j.attrib["type"] for j in joints}, "total_mass_kg": sum(masses.values()), "link_masses_kg": masses, "meshes": meshes, "link_world_bounds_m": world_bounds, "reference_numeric_deltas": comparison, "reference_mode": reference_mode if reference else None, "reference_changes": changes, "reference_motion": motion, "cad_geometry": cad_checks, "warnings": geometry_warnings}
 
 
-def validate(urdf_path: str | Path, reference: str | Path | None = None, reference_mode: str = "strict", allow_mesh_shift: bool = False) -> dict:
+def validate(urdf_path: str | Path, reference: str | Path | None = None, reference_mode: str = "strict", allow_mesh_shift: bool = False, cad_geometry: dict | None = None) -> dict:
     try:
-        return _validate(urdf_path, reference, reference_mode, allow_mesh_shift)
+        return _validate(urdf_path, reference, reference_mode, allow_mesh_shift, cad_geometry)
     except (OSError, ValueError, TypeError, KeyError, AttributeError, ET.ParseError) as exc:
         return {"passed": False, "errors": [f"Malformed or unreadable URDF/mesh {urdf_path}: {type(exc).__name__}: {exc}"]}
 

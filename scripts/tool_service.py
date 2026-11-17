@@ -16,7 +16,7 @@ import sys
 import time
 import uuid
 
-from configuration import AUTOMATIC, load_config, native_config, needs_postprocess, skeleton_config, validate_config
+from configuration import AUTOMATIC, expand_subassemblies, load_config, native_config, needs_postprocess, skeleton_config, validate_config
 from validate_export import validate
 import provenance
 import render_preview
@@ -556,7 +556,12 @@ def _validate_export(directory, record, bridge, config):
     reference, mode = record.get("reference_urdf"), "strict"
     if not reference and record.get("previous_export"):
         reference, mode = record["previous_export"]["urdf"], "changes"
-    checks = validate(bridge["urdf"], reference, mode, allow_mesh_shift=record.get("accept_source_change", False))
+    checks = validate(bridge["urdf"], reference, mode, allow_mesh_shift=record.get("accept_source_change", False), cad_geometry=bridge.get("linkGeometry"))
+    if bridge.get("documentType") == 2 and "errors" in checks:
+        # Masses come from the CAD components, so only this check sees geometry missing from the meshes.
+        if bridge.get("linkGeometryError") or not bridge.get("linkGeometry"):
+            checks["errors"].append("The meshes could not be compared with the CAD geometry: " + (bridge.get("linkGeometryError") or "the export recorded no Link geometry") + ".")
+        record.setdefault("notes", []).extend(checks.get("warnings") or [])
     cad_mass = bridge["cadAssemblyMassKg"]
     if "total_mass_kg" in checks:
         delta = abs(checks["total_mass_kg"] - cad_mass)
@@ -585,6 +590,19 @@ def _validate_export(directory, record, bridge, config):
         record["previews"] = render_preview.render(bridge["urdf"], Path(bridge["urdf"]).parent.parent / "previews")
     except Exception as exc:
         record["previews"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _note_subassemblies(directory, record, rows, config):
+    """Warn about sub-assemblies a configuration lists whole, and offer the configuration with their parts."""
+    expanded = expand_subassemblies(config, rows)
+    write_json(directory / "robot-config.expanded.json", expanded)
+    record["subassembly_components"] = [{k: row[k] for k in ("link", "component", "depth")} | {"parts": len(row["parts"])} for row in rows]
+    record["expanded_config_path"] = str(directory / "robot-config.expanded.json")
+    names = [f"{row['link']}: {row['component']} ({len(row['parts'])} parts)" for row in rows]
+    record.setdefault("notes", []).append(
+        f"{len(rows)} sub-assembly component(s) are listed whole in Links: " + ", ".join(names[:10]) + (", ..." if len(names) > 10 else "")
+        + ". The tool exports and weighs all their parts; expanded_config_path names the parts instead, which is easier to review and survives a restructured sub-assembly"
+        + (" (a sub-assembly listed first in a child Link stays, as recompute_kinematics detects the joint from it)" if config.get("recompute_kinematics", True) else "") + ".")
 
 
 def _preflight_kinematics(directory, record, request_data, config):
@@ -719,6 +737,8 @@ def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
                 preferences_ok = bridge.get("preferencesRestored", record["operation"] in {"prepare", "check"} or "preferencesBefore" not in bridge)
                 config_path = directory / "robot-config.json"
                 config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else None
+                if config and bridge.get("subassemblyComponents"):
+                    _note_subassemblies(directory, record, bridge["subassemblyComponents"], config)
                 if record["operation"] == "export" and native_ok:
                     _set_phase(directory, record, "validating")
                     _validate_export(directory, record, bridge, config)

@@ -436,6 +436,7 @@ public static partial class LegacyExportBridge
             ValidateResolvedTree(node);
             RequireComponentCoverage(unassigned, overlapping);
             report["componentsResolved"] = true;
+            report["subassemblyComponents"] = DescribeSubassemblyComponents(node);
             // Where each Link's first component sits in the assembly: reading it costs nothing, and against
             // the placements recorded with the configuration it shows a moved CAD model before any mesh is written.
             report["linkComponentPoses"] = DescribeComponentPoses(node);
@@ -464,6 +465,10 @@ public static partial class LegacyExportBridge
                 goto OperationComplete;
             }
             ApplyComponentMassProperties(helper, doc, node, report);
+            SW2URDF.Headless.Progress.Stage("link_geometry", "Recording the CAD volume and component boxes of each Link for the mesh check...");
+            // Read before the export hides every component; the mesh check fails without it.
+            try { report["linkGeometry"] = DescribeLinkGeometry(helper, doc, node, report); }
+            catch (Exception e) when (e is COMException || e is InvalidOperationException || e is NullReferenceException) { report["linkGeometryError"] = e.Message; }
             SW2URDF.Headless.Progress.Stage("export_meshes", "Exporting URDF and STL through original ExportHelper...", CountLinks(node, true));
             helper.ExportRobot(true, MeshExportFormat.STL);
             SW2URDF.Headless.Progress.Stage("closing", "Closing the private session...");

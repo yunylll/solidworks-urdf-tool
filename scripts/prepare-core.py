@@ -99,6 +99,12 @@ for source in files:
         text = patch(text, key, "// Copy the texture file (if it was specified) to the textures directory", "if (link.isFixedFrame) return;\n\n            // Copy the texture file (if it was specified) to the textures directory", 1)
         # Progress for job queries: one step per mesh.
         text = patch(text, key, 'logger.Info(link.Name + ": Exporting STL with coordinate frame " + coordsysName);', 'logger.Info(link.Name + ": Exporting STL with coordinate frame " + coordsysName);\n            SW2URDF.Headless.Progress.Step(link.Name);', 1)
+        # The export hides every top-level component, then shows each Link's components to save its STL.
+        # Showing a sub-assembly that sits inside a hidden sub-assembly makes it visible but not its parts,
+        # so a Link that lists it whole got an STL without it (all 144 vials of a workstation, 0 triangles
+        # in a two-level fixture). Showing and hiding every part below the listed components avoids that.
+        text = patch(text, key, "CommonSwOperations.ShowComponents(ActiveSWModel, link.SWComponents);", "CommonSwOperations.ShowComponents(ActiveSWModel, SW2URDF.Headless.Visibility.WithParts(link.SWComponents));", 2)
+        text = patch(text, key, "CommonSwOperations.HideComponents(ActiveSWModel, link.SWComponents);", "CommonSwOperations.HideComponents(ActiveSWModel, SW2URDF.Headless.Visibility.WithParts(link.SWComponents));", 2)
         # Restoring visibility component by component took 10 of 38 minutes on a 700-part model.
         # The tool exports from a private copy that is closed without saving, so it skips it.
         text = patch(text, key, "CommonSwOperations.ShowAllComponents(ActiveSWModel, hiddenComponents);", "if (!SW2URDF.Headless.Options.DiscardDocumentAfterExport) CommonSwOperations.ShowAllComponents(ActiveSWModel, hiddenComponents);", 1)
@@ -132,6 +138,25 @@ namespace SW2URDF.Headless {
     public static class Options {
         // Set when the document is a private copy closed without saving after the export.
         public static bool DiscardDocumentAfterExport;
+    }
+    public static class Visibility {
+        // The components and, below each listed sub-assembly, every component that is not suppressed
+        // or an envelope; mass properties include the same parts, hidden ones too.
+        public static System.Collections.Generic.List<SolidWorks.Interop.sldworks.Component2> WithParts(System.Collections.Generic.List<SolidWorks.Interop.sldworks.Component2> components) {
+            var all = new System.Collections.Generic.List<SolidWorks.Interop.sldworks.Component2>();
+            var seen = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            System.Action<SolidWorks.Interop.sldworks.Component2> add = null;
+            add = component => {
+                if (!seen.Add(component.Name2)) return;
+                all.Add(component);
+                foreach (object child in component.GetChildren() as object[] ?? new object[0]) {
+                    var item = (SolidWorks.Interop.sldworks.Component2)child;
+                    if (!item.IsSuppressed() && !item.IsEnvelope()) add(item);
+                }
+            };
+            foreach (var component in components) add(component);
+            return all;
+        }
     }
     // Stage and step counters for job queries, written to a JSON file the tool reads.
     public static class Progress {

@@ -265,3 +265,26 @@ def load_config(path: str | Path) -> dict:
     if not result["passed"]:
         raise ValueError(f"Invalid robot configuration {path}: " + "; ".join(result["errors"]))
     return config
+
+
+def expand_subassemblies(config, rows):
+    """The configuration with every sub-assembly a Link lists replaced by its parts, in place.
+
+    With recompute_kinematics the first component of a child Link decides the detected joint, so a
+    sub-assembly listed first there stays whole: its first part is mated inside it, not to the parent.
+    """
+    expanded = json.loads(json.dumps(config))
+    by_link = {}
+    for row in rows:
+        by_link.setdefault(row["link"], {})[row["component"].lower()] = row
+    for link in expanded.get("links", []):
+        found = by_link.get(link.get("name"))
+        if not found:
+            continue
+        components = []
+        for index, name in enumerate(link.get("components") or []):
+            row = found.get(name.lower())
+            keep = row is None or not row["parts"] or (index == 0 and link.get("parent") is not None and expanded.get("recompute_kinematics", True))
+            components.extend([name] if keep else row["parts"])
+        link["components"] = components
+    return expanded

@@ -87,6 +87,8 @@ CAD コマンドはいずれも `--timeout`（総時間の上限、既定 14400 
 
 エクスポートの検証では各 Link をゼロ姿勢に配置し、子 Link のメッシュの境界ボックスが親からロボット寸法の 0.5 %（最小 2 mm）より離れていると失敗にします。"Automatically Generate" で回転したルート座標系などの座標系のずれを検出できます。各 Link のワールド境界ボックスは `validation.link_world_bounds_m` にあります。また、エクスポートごとにパッケージの `previews/` に `front.png`、`side.png`、`top.png`（+X、-Y、+Z から見た図、Link ごとに色分け）を書き出し、パスは result.json の `previews.images` に記録されます。親の内部の点まわりの回転では境界ボックスが接したままのことがあるため、使う前に必ず画像を確認してください。`validate-urdf --previews` と `validate_urdf(render_previews=true)` で任意の URDF の画像も作れます。
 
+質量はメッシュではなく CAD コンポーネントから取るため、STL から部品が抜けても質量は正しいままです。そこでエクスポートごとに各 Link のメッシュを CAD 形状と比較します（`validation.cad_geometry`）。列挙された各部品と、サブアセンブリごと列挙された場合はその下の各部品について、CAD 境界ボックス内にメッシュ頂点がなければならず、メッシュ体積は CAD 体積の 85–115 % に収まる必要があります（95–105 % を外れると警告。多くはテッセレーション誤差）。満たさない場合はエクスポートを失敗とし、Link と欠けている可能性の高い部品を示します。サブアセンブリごと列挙すると、抑制・エンベロープ以外の全部品（質量と同じく非表示部品も含む）をエクスポートします。旧バージョンでは別のサブアセンブリの中にあるサブアセンブリ（ワークステーションのラック上のバイアルなど）の部品が一つも出力されませんでした。そのような設定で作ったエクスポートはやり直してください。結果の `subassembly_components` にこうしたコンポーネントを警告付きで示し、`expanded_config_path` はその部品を列挙した設定です（`recompute_kinematics` が true のとき、子 Link の先頭にあるサブアセンブリは関節の検出に使うためそのまま残します）。
+
 ディレクトリには、元のスナップショット、準備済みの CAD、エクスポートパッケージが同居することがあります。最終的な URDF の絶対パスは `bridge.urdf` にあります。既定では過去のジョブや出力を上書きしません。
 
 ### 試行錯誤を速くする
@@ -177,11 +179,12 @@ print(result["bridge"]["urdf"])
 .\.venv\Scripts\python.exe scripts\test_postprocess.py
 .\.venv\Scripts\python.exe scripts\test_provenance.py
 .\.venv\Scripts\python.exe scripts\test_cad_regressions.py
+.\.venv\Scripts\python.exe scripts\test_nested_subassemblies.py
 .\.venv\Scripts\python.exe scripts\test_tool_mcp.py
 .\.venv\Scripts\python.exe scripts\test_registered_mcp.py
 ```
 
-`test_cad_regressions.py` には SolidWorks が必要です。仮想部品を含むサンプルアームのコピーを作成し、仮想部品を含む Pack and Go、同じ原点を共有する関節、チェック専用モード、準備済みコピーの再利用、進捗記録、mimic/world 設定、誤ったコンポーネント名を示すエラーメッセージを検証します。
+`test_cad_regressions.py` には SolidWorks が必要です。仮想部品を含むサンプルアームのコピーを作成し、仮想部品を含む Pack and Go、同じ原点を共有する関節、チェック専用モード、準備済みコピーの再利用、進捗記録、mimic/world 設定、誤ったコンポーネント名を示すエラーメッセージを検証します。`test_nested_subassemblies.py` も SolidWorks が必要です。ワークスペースのコピーを新しいアセンブリに入れ子にし、2 階層下のサブアセンブリを丸ごと列挙した Link をエクスポートして、全部品がメッシュに含まれることを確認します（サンプルアームと、ワークステーションの CAD がある場合は 48 個のバイアルのサブアセンブリを持つラック。パスは `SW_URDF_VIAL_RACK` で指定可能）。
 
 元のエクスポートソースのスナップショット：882169e28952f0d17c87d7eab98826454421aabf（MIT）。`build/core-source-manifest.json` に上流の各ファイルのハッシュと改造マーカーが記録され、`build/core-source` で生成後のソースを確認できます。ソース準備のルールは `scripts/prepare-core.py` にあります。
 

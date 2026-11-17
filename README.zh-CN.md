@@ -87,6 +87,8 @@ CAD 命令都接受 --timeout（总时长上限，默认 14400 秒）、--stall-
 
 导出校验还会把每个 Link 放到零位，若子 Link 的网格包围盒与父 Link 的相距超过机器人尺寸的 0.5%（至少 2 mm）即判为失败，可拦住被 "Automatically Generate" 旋转的根坐标系等坐标系偏移；`validation.link_world_bounds_m` 列出各 Link 的世界包围盒。每次导出还会在包内 `previews/` 生成 `front.png`、`side.png`、`top.png`（分别从 +X、-Y、+Z 看，每个 Link 一种颜色），路径见 result.json 的 `previews.images`；使用导出前请先看一眼，因为绕父 Link 内部某点的旋转仍可能让包围盒相接。`validate-urdf --previews` 和 `validate_urdf(render_previews=true)` 可为任意 URDF 生成同样的图。
 
+质量取自 CAD 组件而不是网格，STL 里少了零件，质量仍然是对的。因此每次导出还会把每个 Link 的网格与其 CAD 几何比较（`validation.cad_geometry`）：列出的每个零件、以及作为整体列出的子装配体下的每个零件，其 CAD 包围盒内都必须有网格顶点；网格体积须在 CAD 体积的 85–115% 之间（超出 95–105% 给警告，通常是网格化误差）。否则导出失败，并写明是哪个 Link、哪些零件可能缺失。作为整体列出的子装配体按其全部未压缩、非封套的零件导出（与质量一致，隐藏的零件也算）。旧版本对嵌套在另一个子装配体里的子装配体（如工作站中料架上的样品瓶）一个零件也不导出；用这种配置做过的导出应重做。结果在 `subassembly_components` 中列出这类组件并给出警告，`expanded_config_path` 是改为逐个列出其零件的配置（`recompute_kinematics` 为 true 时，子 Link 中排在第一个的子装配体保持整体，因为关节是根据它识别的）。
+
 目录中可能同时存在源快照、准备后的 CAD 和导出包；最终 URDF 的绝对路径在 bridge.urdf 中。默认不覆盖旧任务或旧输出。
 
 ### 加快排查
@@ -177,11 +179,12 @@ Codex 客户端需要重新加载 MCP 配置后才会把新服务加入当前工
 .\.venv\Scripts\python.exe scripts\test_postprocess.py
 .\.venv\Scripts\python.exe scripts\test_provenance.py
 .\.venv\Scripts\python.exe scripts\test_cad_regressions.py
+.\.venv\Scripts\python.exe scripts\test_nested_subassemblies.py
 .\.venv\Scripts\python.exe scripts\test_tool_mcp.py
 .\.venv\Scripts\python.exe scripts\test_registered_mcp.py
 ```
 
-test_cad_regressions.py 需要 SolidWorks：它先生成一份含虚拟零件的示例机械臂副本，再覆盖含虚拟零件的 Pack and Go、多个关节共用同一原点、只检查模式、复用准备好的副本、进度记录、mimic/world 设置，以及写明错误组件名的报错。
+test_cad_regressions.py 需要 SolidWorks：它先生成一份含虚拟零件的示例机械臂副本，再覆盖含虚拟零件的 Pack and Go、多个关节共用同一原点、只检查模式、复用准备好的副本、进度记录、mimic/world 设置，以及写明错误组件名的报错。test_nested_subassemblies.py 同样需要 SolidWorks：它把工作区副本嵌进新建的装配体，导出把两层深的子装配体作为整体列出的 Link（示例机械臂；本机有工作站 CAD 时还有带 48 个样品瓶子装配体的料架，路径可用 `SW_URDF_VIAL_RACK` 指定），要求每个零件都在网格里。
 
 原导出源码快照：882169e28952f0d17c87d7eab98826454421aabf，MIT。build/core-source-manifest.json 记录每个上游文件的哈希和适配标记，build/core-source 可审查生成后的源码。源码准备规则在 scripts/prepare-core.py。
 

@@ -5,7 +5,12 @@ if (-not $SolidWorksDir) { $SolidWorksDir = (Get-ItemProperty -LiteralPath 'HKLM
 if (-not $ExporterDir) { $ExporterDir = Join-Path $SolidWorksDir 'URDFExporter' }
 $bin = Join-Path $workspaceDir 'build\bin'
 [void][IO.Directory]::CreateDirectory($bin)
-foreach ($name in @('log4net.dll','MathNet.Numerics.dll','CsvHelper.dll')) { Copy-Item -LiteralPath (Join-Path $ExporterDir $name) -Destination $bin -Force }
+foreach ($name in @('log4net.dll','MathNet.Numerics.dll','CsvHelper.dll')) {
+    $from = Join-Path $ExporterDir $name
+    # A machine without the old add-in installed can rebuild with the copies from an earlier build.
+    if (Test-Path -LiteralPath $from) { Copy-Item -LiteralPath $from -Destination $bin -Force }
+    elseif (-not (Test-Path -LiteralPath (Join-Path $bin $name))) { throw "$name is neither in $ExporterDir nor in $bin; pass -ExporterDir." }
+}
 foreach ($name in @('sldworks','swconst','swpublished')) { Copy-Item -LiteralPath (Join-Path $SolidWorksDir "api\redist\SolidWorks.Interop.$name.dll") -Destination $bin -Force }
 $pythonExe = Join-Path $workspaceDir '.venv\Scripts\python.exe'
 & $pythonExe (Join-Path $PSScriptRoot 'prepare-core.py')

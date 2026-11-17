@@ -731,7 +731,7 @@ public static partial class LegacyExportBridge
         }
     }
 
-    // Returns mass, center of mass (3) and the 3x3 moment of inertia at the center of mass.
+    // Returns mass, center of mass (3), the 3x3 moment of inertia at the center of mass and the volume.
     private static double[] ComponentMassProperties(ModelDoc2 model, IEnumerable<Component2> components, MathTransform frame)
     {
         var extension = model.Extension;
@@ -746,7 +746,7 @@ public static partial class LegacyExportBridge
             if (!mass.Recalculate()) throw new InvalidOperationException("Component mass properties could not be recalculated.");
             var center = (double[])mass.CenterOfMass;
             var moment = (double[])mass.GetMomentOfInertia((int)swMomentsOfInertiaReferenceFrame_e.swMomentsOfInertiaReferenceFrame_CenterOfMass);
-            return new[] { mass.Mass, center[0], center[1], center[2] }.Concat(moment).ToArray();
+            return new[] { mass.Mass, center[0], center[1], center[2] }.Concat(moment).Concat(new[] { mass.Volume }).ToArray();
         }
         finally
         {
@@ -786,6 +786,8 @@ public static partial class LegacyExportBridge
         collect(root);
         SW2URDF.Headless.Progress.Stage("mass_properties", "Reading component mass properties of each Link...", links.Count);
         var cad = links.ToDictionary(l => l, l => { SW2URDF.Headless.Progress.Step(l.Name); return ComponentMassProperties(model, l.SWComponents, helper.GetToolFrameTransform(l.Joint.CoordinateSystemName)); });
+        // Kept for the mesh check even if the transfer below stops.
+        report["linkCadVolumes"] = cad.ToDictionary(item => item.Key.Name, item => (object)item.Value[13]);
         var disagreeing = new List<string>();
         var overrides = new List<object>();
         // Instances of one part file and configuration share their masses; large links repeat the
@@ -835,5 +837,92 @@ public static partial class LegacyExportBridge
         }
         report["exporterInertia"] = exporterInertia;
         report["massPropertiesSource"] = "components";
+    }
+
+    private static bool IsAssemblyComponent(Component2 component)
+    {
+        return (component.GetPathName() ?? "").EndsWith(".sldasm", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // The part components below a sub-assembly that carry geometry: not suppressed, not envelopes.
+    private static void CollectLeafParts(Component2 component, List<Component2> parts)
+    {
+        foreach (Component2 child in component.GetChildren() as object[] ?? new object[0])
+        {
+            if (child.IsSuppressed() || child.IsEnvelope()) continue;
+            if (IsAssemblyComponent(child)) CollectLeafParts(child, parts);
+            else parts.Add(child);
+        }
+    }
+
+    // Sub-assemblies a Link lists as a whole. Their parts are exported and weighed with the Link,
+    // but a configuration naming the parts is easier to review and keeps working if the
+    // sub-assembly is restructured, so the tool reports them with the parts they stand for.
+    private static List<Dictionary<string, object>> DescribeSubassemblyComponents(LinkNode root)
+    {
+        var rows = new List<Dictionary<string, object>>();
+        Action<LinkNode> visit = null;
+        visit = node => {
+            if (!node.Link.isFixedFrame)
+                for (int i = 0; i < node.Link.SWComponents.Count; i++)
+                {
+                    var component = node.Link.SWComponents[i];
+                    if (!IsAssemblyComponent(component)) continue;
+                    var parts = new List<Component2>();
+                    CollectLeafParts(component, parts);
+                    rows.Add(new Dictionary<string, object> { { "link", node.Link.Name }, { "component", component.Name2 }, { "index", i }, { "depth", component.Name2.Count(c => c == '/') + 1 }, { "parts", parts.Select(p => p.Name2).ToArray() } });
+                }
+            foreach (LinkNode child in node.Nodes) visit(child);
+        };
+        visit(root);
+        return rows;
+    }
+
+    private static double[][] BoxOf(Component2 component)
+    {
+        var box = component.GetBox(false, false) as double[];
+        if (box == null || box.Length < 6 || box.Any(v => double.IsNaN(v) || double.IsInfinity(v)) || box[3] < box[0] || box[4] < box[1] || box[5] < box[2]) return null;
+        return new[] { new[] { box[0], box[1], box[2] }, new[] { box[3], box[4], box[5] } };
+    }
+
+    // What each Link mesh must contain, for the check after the export: the Link's CAD volume, the
+    // frame its STL is written in (4x4, Link to assembly, meters) and the assembly-frame box of every
+    // listed component, with the boxes of the parts of a listed sub-assembly. A component whose box
+    // holds no mesh vertex did not reach the STL.
+    private static Dictionary<string, object> DescribeLinkGeometry(ExportHelper helper, ModelDoc2 model, LinkNode root, Dictionary<string, object> report)
+    {
+        object known;
+        var volumes = report.TryGetValue("linkCadVolumes", out known) ? (Dictionary<string, object>)known : new Dictionary<string, object>();
+        var links = new Dictionary<string, object>();
+        Action<LinkNode> visit = null;
+        visit = node => {
+            var link = node.Link;
+            if (!link.isFixedFrame && link.SWComponents.Count != 0)
+            {
+                var transform = helper.GetToolFrameTransform(link.Joint.CoordinateSystemName);
+                var frame = transform == null ? null : MathOps.GetTransformation(transform);
+                object volume;
+                if (!volumes.TryGetValue(link.Name, out volume)) volume = ComponentMassProperties(model, link.SWComponents, null)[13];
+                var components = new List<Dictionary<string, object>>();
+                foreach (var component in link.SWComponents)
+                {
+                    var row = new Dictionary<string, object> { { "name", component.Name2 }, { "assembly", IsAssemblyComponent(component) }, { "box_m", BoxOf(component) } };
+                    if (IsAssemblyComponent(component))
+                    {
+                        var parts = new List<Component2>();
+                        CollectLeafParts(component, parts);
+                        row["parts"] = parts.Select(p => new Dictionary<string, object> { { "name", p.Name2 }, { "box_m", BoxOf(p) } }).ToList();
+                    }
+                    components.Add(row);
+                }
+                links[link.Name] = new Dictionary<string, object> {
+                    { "cad_volume_m3", volume },
+                    { "frame_to_assembly", frame == null ? null : Enumerable.Range(0, 4).Select(r => Enumerable.Range(0, 4).Select(c => frame[r, c]).ToArray()).ToArray() },
+                    { "components", components } };
+            }
+            foreach (LinkNode child in node.Nodes) visit(child);
+        };
+        visit(root);
+        return links;
     }
 }

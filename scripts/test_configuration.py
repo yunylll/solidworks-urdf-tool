@@ -2,7 +2,7 @@ import copy
 import json
 from pathlib import Path
 import unittest
-from configuration import native_config, needs_postprocess, skeleton_config, validate_config
+from configuration import expand_subassemblies, native_config, needs_postprocess, skeleton_config, validate_config
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -81,6 +81,23 @@ class ConfigChecks(unittest.TestCase):
         skeleton = skeleton_config(components, "robot")
         self.assertEqual(skeleton["links"][0]["components"], ["base-1", "arm-1"])
         self.assertTrue(validate_config(skeleton)["passed"])
+
+    def test_expand_subassemblies(self):
+        # The old workstation configuration listed vial sub-assemblies whole; the expansion names their parts.
+        self.config["links"][1]["components"] = ["rack-1/cap-5", "3_DOF_ARM_SEGMENT-1", "rack-1/cap-6"]
+        self.config["links"][0]["components"] = ["3_DOF_ARM_BASE-1", "frame-1"]
+        rows = [{"link": "prox_link", "component": "rack-1/cap-5", "parts": ["rack-1/cap-5/vial-1", "rack-1/cap-5/cap-1"]},
+                {"link": "prox_link", "component": "rack-1/cap-6", "parts": ["rack-1/cap-6/vial-1", "rack-1/cap-6/cap-1"]},
+                {"link": "base_link", "component": "frame-1", "parts": ["frame-1/profile-1"]}]
+        original = copy.deepcopy(self.config)
+        expanded = expand_subassemblies(self.config, rows)
+        self.assertEqual(self.config, original, "the configuration itself stays as written")
+        self.assertEqual(expanded["links"][0]["components"], ["3_DOF_ARM_BASE-1", "frame-1/profile-1"])
+        # recompute_kinematics detects the joint from a child Link's first component: it stays whole.
+        self.assertEqual(expanded["links"][1]["components"], ["rack-1/cap-5", "3_DOF_ARM_SEGMENT-1", "rack-1/cap-6/vial-1", "rack-1/cap-6/cap-1"])
+        self.config["recompute_kinematics"] = False
+        self.assertEqual(expand_subassemblies(self.config, rows)["links"][1]["components"][:2], ["rack-1/cap-5/vial-1", "rack-1/cap-5/cap-1"])
+        self.assertTrue(validate_config(expanded)["passed"])
 
     def test_assembly_origin_root_only(self):
         self.config["links"][0]["coordinate_system"] = "Assembly Origin"

@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Web.Script.Serialization;
@@ -110,6 +111,79 @@ public static partial class LegacyExportBridge
         }
     }
 
+    // Copies an assembly and the part and assembly files next to it into one workspace folder, then
+    // nests the copy inside new assemblies, levels deep: wrap_1 holds the copy, wrap_2 holds wrap_1, and
+    // so on. A sub-assembly of the copy then sits levels + 1 deep, as racks of vials do in a workstation.
+    // One private session does all of it and exits once.
+    public static void CreateWrapperFixture(string original, string destination, int levels)
+    {
+        original = Path.GetFullPath(original);
+        destination = Path.GetFullPath(destination);
+        string workspace = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..")) + Path.DirectorySeparatorChar;
+        if (!original.StartsWith(workspace, StringComparison.OrdinalIgnoreCase) || !destination.StartsWith(workspace, StringComparison.OrdinalIgnoreCase)) throw new ArgumentException("Fixture paths must be inside the workspace.");
+        if (Directory.Exists(destination)) throw new IOException("Fixture destination already exists: " + destination);
+        if (levels < 1 || levels > 5) throw new ArgumentException("levels must be 1 to 5.");
+        string folder = Path.GetDirectoryName(original), model = Path.Combine(destination, "model");
+        Directory.CreateDirectory(model);
+        foreach (string file in Directory.GetFiles(folder))
+        {
+            string extension = Path.GetExtension(file).ToLowerInvariant();
+            if (extension == ".sldprt" || extension == ".sldasm") File.Copy(file, Path.Combine(model, Path.GetFileName(file)));
+        }
+        Process process;
+        var app = StartFixtureSession(destination, out process);
+        try
+        {
+            app.SetCurrentWorkingDirectory(model);
+            // Point every copied assembly at the copies, never at the originals.
+            foreach (string assembly in Directory.GetFiles(model, "*.sldasm"))
+            {
+                string[] references = app.GetDocumentDependencies2(assembly, false, false, false) as string[] ?? new string[0];
+                for (int i = 1; i < references.Length; i += 2)
+                {
+                    string target = Path.Combine(model, Path.GetFileName(references[i]));
+                    if (!File.Exists(target)) throw new FileNotFoundException("Fixture reference is not next to the original assembly: " + references[i]);
+                    if (!string.Equals(Path.GetFullPath(references[i]), target, StringComparison.OrdinalIgnoreCase) && !app.ReplaceReferencedDocument(assembly, references[i], target))
+                        throw new IOException("Cannot author fixture reference: " + references[i]);
+                }
+            }
+            string template = app.GetUserPreferenceStringValue((int)SolidWorks.Interop.swconst.swUserPreferenceStringValue_e.swDefaultTemplateAssembly);
+            if (string.IsNullOrEmpty(template) || !File.Exists(template))
+            {
+                string templates = Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.CommonApplicationData), "SOLIDWORKS", "SOLIDWORKS 2026", "templates");
+                template = Directory.Exists(templates) ? Directory.GetFiles(templates, "*.asmdot").FirstOrDefault() : null;
+            }
+            if (template == null) throw new FileNotFoundException("No SolidWorks assembly template found.");
+            int errors = 0, warnings = 0;
+            string inner = Path.Combine(model, Path.GetFileName(original));
+            var opened = app.OpenDoc6(inner, 2, 1, "", ref errors, ref warnings);
+            if (opened == null) throw new IOException("Cannot open fixture copy: " + errors);
+            ModelDoc2 top = null;
+            for (int level = 1; level <= levels; level++)
+            {
+                var wrapper = (ModelDoc2)app.NewDocument(template, 0, 0, 0);
+                if (wrapper == null) throw new InvalidOperationException("Cannot create an assembly from " + template);
+                var added = ((AssemblyDoc)wrapper).AddComponent5(inner, 0, "", false, "", 0, 0, 0);
+                if (added == null) throw new InvalidOperationException("Cannot insert " + inner + " into wrapper level " + level);
+                string path = Path.Combine(destination, "wrap_" + level + ".SLDASM");
+                if (!wrapper.Extension.SaveAs(path, 0, 1, null, ref errors, ref warnings)) throw new IOException("Cannot save fixture " + path + ": " + errors);
+                inner = path;
+                top = wrapper;
+            }
+            ((AssemblyDoc)top).ResolveAllLightWeightComponents(false);
+            foreach (Component2 item in ((AssemblyDoc)top).GetComponents(false) as object[] ?? new object[0])
+                Console.WriteLine("COMPONENT=" + item.Name2 + "|" + item.GetPathName());
+            Console.WriteLine("FIXTURE=" + inner);
+            CloseAllPrivateDocuments(app);
+        }
+        finally
+        {
+            app.ExitApp();
+            Marshal.ReleaseComObject(app);
+            process.Dispose();
+        }
+    }
+
     private static SldWorks StartFixtureSession(string destination, out Process process)
     {
         string swFolder = Microsoft.Win32.Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\SolidWorks\SOLIDWORKS 2026\Setup", "SolidWorks Folder", null) as string;
@@ -141,6 +215,7 @@ public static class NestedFixtureBuilder
         try
         {
             if (args.Length == 4 && args[0] == "virtual") { LegacyExportBridge.CreateVirtualFixture(args[1], args[2], args[3]); return 0; }
+            if (args.Length == 4 && args[0] == "wrap") { LegacyExportBridge.CreateWrapperFixture(args[1], args[2], int.Parse(args[3])); return 0; }
             if (args.Length != 2) return 2;
             LegacyExportBridge.CreateNestedFixture(args[0], args[1]);
             return 0;
