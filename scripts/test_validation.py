@@ -116,6 +116,25 @@ class ValidatorChecks(unittest.TestCase):
         self.assertTrue(result["passed"], result["errors"])
         self.assertTrue(any("tessellation" in w for w in result["warnings"]), result["warnings"])
 
+    def test_hidden_bodies_explain_the_gap(self):
+        # A mirrored part that kept its source body hidden: the mass counts both, the STL one (clamp_R).
+        geometry = self.cad_geometry(volume_scale=2.0)
+        part = geometry["base_link"]["components"][0]
+        part["hidden_bodies"] = [{"body": "Cut-Extrude1", "volume_m3": geometry["base_link"]["cad_volume_m3"] / 2}]
+        result = validate(self.urdf, cad_geometry=geometry)
+        self.assertFalse(result["passed"])
+        message = next(e for e in result["errors"] if e.startswith("Mesh of base_link"))
+        self.assertIn("50.0% of the CAD volume", message)
+        self.assertIn("which accounts for the difference: 3_DOF_ARM_BASE-1 > Cut-Extrude1", message)
+        self.assertEqual(result["cad_geometry"]["base_link"]["hidden_bodies"][0]["body"], "Cut-Extrude1")
+
+    def test_small_hidden_body_warns(self):
+        geometry = self.cad_geometry(volume_scale=1.01)
+        geometry["base_link"]["components"][0]["hidden_bodies"] = [{"body": "Boss1", "volume_m3": geometry["base_link"]["cad_volume_m3"] * 0.01}]
+        result = validate(self.urdf, cad_geometry=geometry)
+        self.assertTrue(result["passed"], result["errors"])
+        self.assertTrue(any("hidden inside parts of base_link" in w and "Boss1" in w for w in result["warnings"]), result["warnings"])
+
     def test_empty_mesh_lists_every_component(self):
         path = self.package / "meshes" / "base_link.STL"
         geometry = self.cad_geometry()

@@ -79,18 +79,33 @@ def check_cad_geometry(name: str, vertices: np.ndarray, mesh_volume: float, geom
                     empty.append(component["name"])
         summary["components_checked"] = checked
     summary["components_without_mesh"] = empty
+    # Solid bodies hidden inside parts are in the CAD volume and the mass, but not in the STL.
+    hidden = [(row["name"], body["body"], body.get("volume_m3") or 0.0)
+              for component in geometry.get("components") or [] for row in ([component] + list(component.get("parts") or []))
+              for body in row.get("hidden_bodies") or []]
+    hidden_volume = sum(v for _, _, v in hidden)
+    if hidden:
+        summary["hidden_bodies"] = [{"component": c, "body": b, "volume_m3": v} for c, b, v in hidden]
+        summary["hidden_volume_m3"] = hidden_volume
+    hidden_text = ", ".join(f"{c} > {b} ({v * 1e6:.3g} cm^3)" for c, b, v in hidden[:10]) + (f", ... ({len(hidden)} in all)" if len(hidden) > 10 else "")
+    explained = bool(hidden) and ratio is not None and MESH_VOLUME_WARNING_BAND[0] <= (mesh_volume + hidden_volume) / cad_volume <= MESH_VOLUME_WARNING_BAND[1]
     volume_off = ratio is not None and not (MESH_VOLUME_ERROR_BAND[0] <= ratio <= MESH_VOLUME_ERROR_BAND[1])
     if empty or volume_off:
         message = f"Mesh of {name} does not match its CAD geometry: "
         details = []
         if ratio is not None:
             details.append(f"mesh volume {mesh_volume:.6g} m^3 is {ratio:.1%} of the CAD volume {cad_volume:.6g} m^3")
+        if hidden:
+            details.append(f"{len(hidden)} solid bod{'y' if len(hidden) == 1 else 'ies'} hidden inside parts ({hidden_volume:.6g} m^3) {'counts' if len(hidden) == 1 else 'count'} in the CAD volume and in the Link mass and inertia but are not in the STL"
+                           + (", which accounts for the difference" if explained else "") + f": {hidden_text}. Delete or suppress them in the CAD if they are leftovers (for example the source body of a mirror)")
         if empty:
             details.append(f"{len(empty)} of {summary['components_checked']} component(s) have no mesh vertex inside their CAD bounding box and are probably missing from the STL: {_names(empty)}")
         suspects = [c["name"] for c in geometry.get("components") or [] if c.get("assembly")]
         if suspects and not empty:
             details.append("sub-assemblies listed whole, the likeliest place for missing parts: " + _names(suspects))
         errors.append(message + "; ".join(details) + ".")
+    elif hidden:
+        warnings.append(f"{len(hidden)} solid bod{'y' if len(hidden) == 1 else 'ies'} hidden inside parts of {name} ({hidden_volume:.6g} m^3" + (f", mesh volume {ratio:.1%} of the CAD volume" if ratio is not None else "") + f") {'counts' if len(hidden) == 1 else 'count'} in its mass and inertia but {'is' if len(hidden) == 1 else 'are'} not in its mesh: {hidden_text}.")
     elif ratio is not None and not (MESH_VOLUME_WARNING_BAND[0] <= ratio <= MESH_VOLUME_WARNING_BAND[1]):
         warnings.append(f"Mesh volume of {name} is {ratio:.1%} of its CAD volume ({mesh_volume:.6g} vs {cad_volume:.6g} m^3); every component is in the mesh, so this is probably tessellation (mesh_quality) or overlapping bodies.")
     return summary

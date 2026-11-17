@@ -885,6 +885,21 @@ public static partial class LegacyExportBridge
         return new[] { new[] { box[0], box[1], box[2] }, new[] { box[3], box[4], box[5] } };
     }
 
+    // Solid bodies hidden inside a part (e.g. the source body a Mirror feature kept): mass properties
+    // include them, the STL does not, so they explain a mesh smaller than the CAD volume.
+    private static List<Dictionary<string, object>> HiddenBodies(Component2 part)
+    {
+        var rows = new List<Dictionary<string, object>>();
+        object info;
+        foreach (Body2 body in part.GetBodies3((int)swBodyType_e.swSolidBody, out info) as object[] ?? new object[0])
+        {
+            if (body.Visible) continue;
+            var mass = body.GetMassProperties(1.0) as double[];
+            rows.Add(new Dictionary<string, object> { { "body", body.Name }, { "volume_m3", mass == null ? (object)null : mass[3] } });
+        }
+        return rows;
+    }
+
     // What each Link mesh must contain, for the check after the export: the Link's CAD volume, the
     // frame its STL is written in (4x4, Link to assembly, meters) and the assembly-frame box of every
     // listed component, with the boxes of the parts of a listed sub-assembly. A component whose box
@@ -911,7 +926,17 @@ public static partial class LegacyExportBridge
                     {
                         var parts = new List<Component2>();
                         CollectLeafParts(component, parts);
-                        row["parts"] = parts.Select(p => new Dictionary<string, object> { { "name", p.Name2 }, { "box_m", BoxOf(p) } }).ToList();
+                        row["parts"] = parts.Select(p => {
+                            var part = new Dictionary<string, object> { { "name", p.Name2 }, { "box_m", BoxOf(p) } };
+                            var hidden = HiddenBodies(p);
+                            if (hidden.Count != 0) part["hidden_bodies"] = hidden;
+                            return part;
+                        }).ToList();
+                    }
+                    else
+                    {
+                        var hidden = HiddenBodies(component);
+                        if (hidden.Count != 0) row["hidden_bodies"] = hidden;
                     }
                     components.Add(row);
                 }

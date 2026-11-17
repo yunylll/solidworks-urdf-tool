@@ -174,7 +174,48 @@ public static partial class LegacyExportBridge
             foreach (Component2 item in ((AssemblyDoc)top).GetComponents(false) as object[] ?? new object[0])
                 Console.WriteLine("COMPONENT=" + item.Name2 + "|" + item.GetPathName());
             Console.WriteLine("FIXTURE=" + inner);
-            CloseAllPrivateDocuments(app);
+            // Closing an assembly also closes its parts; the list of documents would go stale.
+            app.CloseAllDocuments(true);
+        }
+        finally
+        {
+            app.ExitApp();
+            Marshal.ReleaseComObject(app);
+            process.Dispose();
+        }
+    }
+
+    // Diagnostic: opens a workspace assembly read-only and prints, for each named component, its solid
+    // bodies with their visibility and volume (m^3), one JSON line per component. Saves nothing.
+    public static void DescribeBodies(string assembly, string[] names)
+    {
+        assembly = Path.GetFullPath(assembly);
+        string workspace = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..")) + Path.DirectorySeparatorChar;
+        if (!assembly.StartsWith(workspace, StringComparison.OrdinalIgnoreCase)) throw new ArgumentException("The assembly must be inside the workspace.");
+        string session = Path.Combine(workspace, "validation", "fixtures", "bodies-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+        Directory.CreateDirectory(session);
+        Process process;
+        var app = StartFixtureSession(session, out process);
+        try
+        {
+            app.SetCurrentWorkingDirectory(Path.GetDirectoryName(assembly));
+            int errors = 0, warnings = 0;
+            var doc = app.OpenDoc6(assembly, 2, 1 | 2, "", ref errors, ref warnings); // silent, read-only
+            if (doc == null) throw new IOException("Cannot open " + assembly + ": " + errors);
+            ((AssemblyDoc)doc).ResolveAllLightWeightComponents(false);
+            var all = (((AssemblyDoc)doc).GetComponents(false) as object[] ?? new object[0]).Cast<Component2>().ToDictionary(c => c.Name2, StringComparer.OrdinalIgnoreCase);
+            var json = new JavaScriptSerializer();
+            foreach (string name in names)
+            {
+                Component2 component;
+                if (!all.TryGetValue(name, out component)) { Console.WriteLine(json.Serialize(new { component = name, found = false })); continue; }
+                object info;
+                var bodies = (component.GetBodies3((int)SolidWorks.Interop.swconst.swBodyType_e.swSolidBody, out info) as object[] ?? new object[0]).Cast<Body2>()
+                    .Select(b => { var mass = b.GetMassProperties(1.0) as double[]; return new { name = b.Name, visible = b.Visible, volume_m3 = mass == null ? (double?)null : mass[3] }; }).ToList();
+                Console.WriteLine(json.Serialize(new { component = name, found = true, path = component.GetPathName(), configuration = component.ReferencedConfiguration, hidden = component.IsHidden(false), bodies }));
+            }
+            // Closing an assembly also closes its parts; the list of documents would go stale.
+            app.CloseAllDocuments(true);
         }
         finally
         {
@@ -215,6 +256,7 @@ public static class NestedFixtureBuilder
         try
         {
             if (args.Length == 4 && args[0] == "virtual") { LegacyExportBridge.CreateVirtualFixture(args[1], args[2], args[3]); return 0; }
+            if (args.Length >= 3 && args[0] == "bodies") { LegacyExportBridge.DescribeBodies(args[1], args.Skip(2).ToArray()); return 0; }
             if (args.Length == 4 && args[0] == "wrap") { LegacyExportBridge.CreateWrapperFixture(args[1], args[2], int.Parse(args[3])); return 0; }
             if (args.Length != 2) return 2;
             LegacyExportBridge.CreateNestedFixture(args[0], args[1]);
