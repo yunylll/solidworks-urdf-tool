@@ -121,6 +121,7 @@ recompute_kinematics=false 的配置保存的是从某一版 CAD 抄来的绝对
 - 质量、质心和惯量取自 SolidWorks 组件质量属性。原导出器把各实体的惯量直接相加，由多个零件组成的 Link 惯量比导出网格实际算得的小 3–5 倍；它还按几何和密度计算质量，丢失 SolidWorks 中覆盖的质量。组件质量属性与网格一致，也计入覆盖值。工具先确认未覆盖的 Link 两种算法的质量和质心一致、各 Link 质量之和等于装配体质量，才替换；否则保留原导出器的值并在 warnings 中说明。用到覆盖值的 Link 和组件列在 warnings 与 bridge.massOverrides 中，原导出器的惯量保留在 bridge.exporterInertia。
 - revolute/prismatic 必须给出有限的 lower/upper 与正的 effort/velocity；角度使用弧度、平移使用米。
 - frame_only=true 的 Link 不导出质量、视觉或碰撞几何；它的子树仍正常处理。
+- exclude_hidden_bodies（顶层）：零件文件名列表，例如 ["gantry_z1_p05.SLDPRT"]，这些零件中的隐藏实体不计入质量、惯量，也不计入网格检查用的 CAD 体积。用于 CAD 仍需要的隐藏实体，例如被配合引用的镜像源实体：删掉它会使配合失效。SolidWorks 计算装配体质量时包含隐藏实体，因此各项质量检查会减去排除的部分；warnings 和 bridge.excludedHiddenBodies 按 Link 列出排除的质量。文件名不是任何组件的文件时立即报错，并给出相近的名字。必须由 SolidWorks 在装配体中称重的实例（见 bridge.partMassCheck）仍包含隐藏实体，并列为未生效。
 - 坐标系和参考轴应来自模型已有参考几何。工具不会凭空推断真实机器人关节意图或执行器参数。
 
 下面两项由工具在 CAD 导出器写出 URDF 之后加入；导出器原始文件保留为任务目录下的 native.urdf，改动记录在 postprocess 中：

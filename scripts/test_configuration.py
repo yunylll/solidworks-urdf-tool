@@ -99,6 +99,14 @@ class ConfigChecks(unittest.TestCase):
         self.assertEqual(expand_subassemblies(self.config, rows)["links"][1]["components"][:2], ["rack-1/cap-5/vial-1", "rack-1/cap-5/cap-1"])
         self.assertTrue(validate_config(expanded)["passed"])
 
+    def test_exclude_hidden_bodies(self):
+        self.config["exclude_hidden_bodies"] = ["gantry_z1_p05.SLDPRT", "gantry_z2_p05.sldprt"]
+        self.assertTrue(validate_config(self.config)["passed"])
+        self.assertEqual(native_config(self.config)["exclude_hidden_bodies"], ["gantry_z1_p05.SLDPRT", "gantry_z2_p05.sldprt"], "the native exporter applies it")
+        for wrong in (["gan\\gantry_z1_p05.SLDPRT"], ["gantry_z1_asm.SLDASM"], "gantry_z1_p05.SLDPRT", ["a.SLDPRT", "A.sldprt"]):
+            self.config["exclude_hidden_bodies"] = wrong
+            self.assertFalse(validate_config(self.config)["passed"], wrong)
+
     def test_assembly_origin_root_only(self):
         self.config["links"][0]["coordinate_system"] = "Assembly Origin"
         self.assertTrue(validate_config(self.config)["passed"])

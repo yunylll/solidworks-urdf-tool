@@ -135,6 +135,15 @@ class ValidatorChecks(unittest.TestCase):
         self.assertTrue(result["passed"], result["errors"])
         self.assertTrue(any("hidden inside parts of base_link" in w and "Boss1" in w for w in result["warnings"]), result["warnings"])
 
+    def test_excluded_hidden_bodies_are_not_missing(self):
+        # A hidden body the configuration leaves out of the mass (exclude_hidden_bodies) is out of the CAD volume too.
+        geometry = self.cad_geometry()
+        geometry["base_link"]["components"][0]["hidden_bodies"] = [{"body": "Mirror1", "volume_m3": geometry["base_link"]["cad_volume_m3"], "excluded_from_mass": True}]
+        result = validate(self.urdf, cad_geometry=geometry)
+        self.assertTrue(result["passed"], result["errors"])
+        self.assertEqual(result["warnings"], [])
+        self.assertEqual(result["cad_geometry"]["base_link"]["hidden_bodies_excluded_from_mass"], ["3_DOF_ARM_BASE-1 > Mirror1"])
+
     def test_empty_mesh_lists_every_component(self):
         path = self.package / "meshes" / "base_link.STL"
         geometry = self.cad_geometry()

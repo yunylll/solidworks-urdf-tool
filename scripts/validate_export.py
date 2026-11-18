@@ -80,9 +80,12 @@ def check_cad_geometry(name: str, vertices: np.ndarray, mesh_volume: float, geom
         summary["components_checked"] = checked
     summary["components_without_mesh"] = empty
     # Solid bodies hidden inside parts are in the CAD volume and the mass, but not in the STL.
-    hidden = [(row["name"], body["body"], body.get("volume_m3") or 0.0)
-              for component in geometry.get("components") or [] for row in ([component] + list(component.get("parts") or []))
-              for body in row.get("hidden_bodies") or []]
+    # Bodies of parts listed in exclude_hidden_bodies are out of the CAD volume and the mass already.
+    rows = [(row["name"], body) for component in geometry.get("components") or [] for row in ([component] + list(component.get("parts") or [])) for body in row.get("hidden_bodies") or []]
+    hidden = [(name, body["body"], body.get("volume_m3") or 0.0) for name, body in rows if not body.get("excluded_from_mass")]
+    excluded = [f"{name} > {body['body']}" for name, body in rows if body.get("excluded_from_mass")]
+    if excluded:
+        summary["hidden_bodies_excluded_from_mass"] = excluded
     hidden_volume = sum(v for _, _, v in hidden)
     if hidden:
         summary["hidden_bodies"] = [{"component": c, "body": b, "volume_m3": v} for c, b, v in hidden]

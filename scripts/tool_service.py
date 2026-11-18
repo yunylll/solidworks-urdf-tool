@@ -580,12 +580,16 @@ def _validate_export(directory, record, bridge, config):
         if bridge.get("linkGeometryError") or not bridge.get("linkGeometry"):
             checks["errors"].append("The meshes could not be compared with the CAD geometry: " + (bridge.get("linkGeometryError") or "the export recorded no Link geometry") + ".")
         record.setdefault("notes", []).extend(checks.get("warnings") or [])
-    cad_mass = bridge["cadAssemblyMassKg"]
+    # Hidden bodies the configuration leaves out (exclude_hidden_bodies) are in SolidWorks' assembly mass.
+    excluded = bridge.get("excludedHiddenBodyMassKg") or 0.0
+    cad_mass = bridge["cadAssemblyMassKg"] - excluded
     if "total_mass_kg" in checks:
         delta = abs(checks["total_mass_kg"] - cad_mass)
         checks["cad_mass_delta_kg"] = delta
+        if excluded:
+            checks["excluded_hidden_body_mass_kg"] = excluded
         if delta > max(1e-8, abs(cad_mass) * 1e-6):
-            message = f"URDF link masses sum to {checks['total_mass_kg']:.9g} kg, but the CAD assembly mass is {cad_mass:.9g} kg (difference {delta:.3g} kg)."
+            message = f"URDF link masses sum to {checks['total_mass_kg']:.9g} kg, but the CAD assembly mass is {cad_mass:.9g} kg" + (f" (without {excluded:.6g} kg of hidden bodies left out by exclude_hidden_bodies)" if excluded else "") + f" (difference {delta:.3g} kg)."
             overrides = bridge.get("massOverrides") or []
             if overrides and not bridge.get("massOverridesApplied"):
                 message += " Overridden CAD mass properties could not be transferred for Links: " + ", ".join(o["link"] for o in overrides) + " (see bridge.massOverrides)."
@@ -894,6 +898,12 @@ def bridge_warnings(bridge):
         warnings.append(f"{len(suppressed)} suppressed component(s) have no file and were left out: " + ", ".join(suppressed))
     if bridge.get("massPropertiesSource") == "exporter" and (bridge.get("massPropertiesCrossCheckFailed") or bridge.get("massPropertiesError")):
         warnings.append("Link inertia is the original exporter's, which underestimates Links of several parts: component mass properties were not used (" + "; ".join(bridge.get("massPropertiesCrossCheckFailed") or [bridge["massPropertiesError"]]) + ")")
+    excluded = bridge.get("excludedHiddenBodies")
+    if excluded:
+        by_link = excluded.get("mass_kg_by_link") or {}
+        warnings.append(f"Hidden solid bodies of {', '.join(excluded['files'])} are left out of the mass, inertia and CAD volume (exclude_hidden_bodies): "
+                        + (", ".join(f"{link} {mass:.6g} kg" for link, mass in by_link.items()) if by_link else "none of these parts has a hidden body in the Links")
+                        + (f". Not applied to {', '.join(excluded['not_applied_to'])}: SolidWorks weighs these instances in the assembly, hidden bodies included." if excluded.get("not_applied_to") else "."))
     if bridge.get("massOverridesApplied"):
         parts = [c["component"] for o in bridge.get("massOverrides", []) for c in o["components"]]
         warnings.append("Mass properties overridden in the CAD were used instead of geometry for Links " + ", ".join(o["link"] for o in bridge["massOverrides"]) + (f" (components: {', '.join(parts)})" if parts else ""))

@@ -20,7 +20,7 @@ import unittest
 import uuid
 import xml.etree.ElementTree as ET
 
-from tool_service import export_urdf, prepare_model, write_json
+from tool_service import check_configuration, export_urdf, inspect_model, prepare_model, write_json
 
 ROOT = Path(__file__).resolve().parent.parent
 ARM = ROOT / "vendor" / "solidworks_urdf_exporter" / "examples" / "3_DOF_ARM" / "3_DOF_ARM.SLDASM"
@@ -59,7 +59,7 @@ def describe(result):
 class NestedSubassemblies(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        FIXTURES.mkdir(parents=True)
+        FIXTURES.mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -127,6 +127,37 @@ class NestedSubassemblies(unittest.TestCase):
         self.assertTrue(moved["reused_meshes"]["rack_consumables"]["moved"])
         self.assertFalse(moved["reused_meshes"]["base_link"]["moved"])
         self.assertAlmostEqual(geometry["rack_consumables"]["volume_ratio"], 1.0, delta=0.05)
+
+
+class ExcludedHiddenBodies(unittest.TestCase):
+    """gantry_z1_p05 keeps a hidden mirror body that a mate of gantry_z1_asm uses; exclude_hidden_bodies leaves it out of the mass."""
+
+    def test_exclude_hidden_bodies(self):
+        source = VIAL_RACK.parent.parent / "gan" / "gantry_z1_asm.SLDASM"
+        if not source.is_file():
+            self.skipTest(f"{source} is not on this computer")
+        inspection = inspect_model(source)
+        self.assertTrue(inspection["passed"], describe(inspection))
+        config = json.loads(Path(inspection["configuration_path"]).read_text(encoding="utf-8"))
+        config["links"][0]["coordinate_system"] = "Assembly Origin"
+        config["recompute_kinematics"] = False
+        FIXTURES.mkdir(parents=True, exist_ok=True)
+        results = {}
+        for name, extra in (("plain", {}), ("excluded", {"exclude_hidden_bodies": ["gantry_z1_p05.SLDPRT"]})):
+            path = FIXTURES / f"gantry_{name}.json"
+            write_json(path, dict(config, **extra))
+            results[name] = export_urdf(inspection["reusable_model"], f"gantry_{name}", config_path=path, compare_previous=False, reuse_meshes=False)
+            self.assertTrue(results[name]["passed"], describe(results[name]))
+        hidden = results["excluded"]["bridge"]["excludedHiddenBodyMassKg"]
+        self.assertGreater(hidden, 0)
+        self.assertAlmostEqual(results["plain"]["validation"]["total_mass_kg"] - results["excluded"]["validation"]["total_mass_kg"], hidden, delta=1e-9)
+        self.assertAlmostEqual(results["excluded"]["validation"]["cad_geometry"]["base_link"]["volume_ratio"], 1.0, delta=0.03)
+        report["exclude_hidden_bodies"] = {name: r["job_id"] for name, r in results.items()} | {"hidden_mass_kg": hidden}
+        typo = FIXTURES / "gantry_typo.json"
+        write_json(typo, dict(config, exclude_hidden_bodies=["gantry_z1_p5.SLDPRT"]))
+        check = check_configuration(inspection["reusable_model"], typo)
+        self.assertFalse(check["passed"])
+        self.assertIn("gantry_z1_p05.SLDPRT", check["error"]["message"], "similar names help fix the typo")
 
 
 if __name__ == "__main__":

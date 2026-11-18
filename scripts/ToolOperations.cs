@@ -19,6 +19,8 @@ public sealed class ConfigDocument
     public string robot_name;
     public bool recompute_kinematics = true;
     public List<LinkSettings> links;
+    // Part file names whose hidden solid bodies are left out of mass, inertia and CAD volume.
+    public string[] exclude_hidden_bodies;
 }
 public sealed class LinkSettings
 {
@@ -405,6 +407,14 @@ public static partial class LegacyExportBridge
         if (config == null || config.schema_version != 1 || config.links == null || config.links.Count == 0) throw new ArgumentException("Invalid JSON configuration.");
         var all = ((AssemblyDoc)model).GetComponents(false) as object[] ?? new object[0];
         var components = all.Cast<Component2>().ToDictionary(c => c.Name2, StringComparer.OrdinalIgnoreCase);
+        excludedHiddenParts.Clear();
+        if (config.exclude_hidden_bodies != null)
+        {
+            var files = new HashSet<string>(components.Values.Select(c => Path.GetFileName(c.GetPathName() ?? "")), StringComparer.OrdinalIgnoreCase);
+            var unknown = config.exclude_hidden_bodies.Where(f => !files.Contains(f)).ToList();
+            if (unknown.Count != 0) throw new ArgumentException("exclude_hidden_bodies names part files that no component of the assembly uses: " + string.Join(", ", unknown) + ". " + string.Join(" ", unknown.Select(f => SimilarNames(f, files))));
+            foreach (string file in config.exclude_hidden_bodies) excludedHiddenParts.Add(file);
+        }
         var nodes = new Dictionary<string, LinkNode>();
         foreach (var settings in config.links)
         {
@@ -738,12 +748,12 @@ public static partial class LegacyExportBridge
     private static readonly int MassPropertyChunk = int.TryParse(System.Environment.GetEnvironmentVariable("SW_URDF_MASS_CHUNK"), out int chunk) && chunk > 0 ? chunk : 100;
 
     // Returns mass, center of mass (3), the 3x3 moment of inertia at the center of mass and the volume.
-    private static double[] ComponentMassProperties(ModelDoc2 model, IEnumerable<Component2> components, MathTransform frame)
+    private static double[] ComponentMassProperties(ModelDoc2 model, IEnumerable<Component2> components, MathTransform frame, bool includeHidden = true)
     {
         var list = components.ToList();
-        if (list.Count <= MassPropertyChunk) return ComponentMassPropertiesOnce(model, list, frame);
+        if (list.Count <= MassPropertyChunk) return ComponentMassPropertiesOnce(model, list, frame, includeHidden);
         var chunks = new List<double[]>();
-        for (int i = 0; i < list.Count; i += MassPropertyChunk) chunks.Add(ComponentMassPropertiesOnce(model, list.Skip(i).Take(MassPropertyChunk), frame));
+        for (int i = 0; i < list.Count; i += MassPropertyChunk) chunks.Add(ComponentMassPropertiesOnce(model, list.Skip(i).Take(MassPropertyChunk), frame, includeHidden));
         return CombineMassProperties(chunks);
     }
 
@@ -753,9 +763,19 @@ public static partial class LegacyExportBridge
     // configuration that is not the document's active one.
     private static readonly Dictionary<string, double[]> partMassProperties = new Dictionary<string, double[]>(StringComparer.OrdinalIgnoreCase);
 
-    private static double[] PartMassProperties(Component2 part)
+    // Part files the configuration names in exclude_hidden_bodies: their hidden solid bodies (for example
+    // the source of a mirror that mates still use) are not weighed and not part of the CAD volume.
+    private static readonly HashSet<string> excludedHiddenParts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    private static bool ExcludesHidden(Component2 part)
     {
-        string key = part.GetPathName() + "|" + part.ReferencedConfiguration;
+        return excludedHiddenParts.Count != 0 && excludedHiddenParts.Contains(Path.GetFileName(part.GetPathName() ?? ""));
+    }
+
+    private static double[] PartMassProperties(Component2 part, bool? includeHidden = null)
+    {
+        bool hidden = includeHidden ?? !ExcludesHidden(part);
+        string key = part.GetPathName() + "|" + part.ReferencedConfiguration + "|" + hidden;
         double[] known;
         if (partMassProperties.TryGetValue(key, out known)) return known;
         known = null;
@@ -768,7 +788,7 @@ public static partial class LegacyExportBridge
                 var extension = document.Extension;
                 var mass = (IMassProperty2)extension.CreateMassProperty2();
                 mass.UseSystemUnits = true;
-                mass.IncludeHiddenBodiesOrComponents = true;
+                mass.IncludeHiddenBodiesOrComponents = hidden;
                 if (mass.Recalculate())
                 {
                     var center = (double[])mass.CenterOfMass;
@@ -808,13 +828,14 @@ public static partial class LegacyExportBridge
         Action<List<Component2>> check = null;
         check = items => {
             var expected = CombineMassProperties(items.Select(c => PlacedPartMassProperties(PartMassProperties(c), MathOps.GetTransformation(c.Transform2))).ToList());
-            var actual = ComponentMassPropertiesOnce(model, items, null);
+            var actual = ComponentMassPropertiesOnce(model, items, null, !ExcludesHidden(items[0]));
             if (Agree(expected, actual)) { foreach (var c in items) partVerified[PartKey(c)] = true; return; }
             if (items.Count == 1) { partVerified[PartKey(items[0])] = false; partMismatches.Add(items[0].Name2 + " (" + Path.GetFileName(items[0].GetPathName()) + ")"); return; }
             check(items.Take(items.Count / 2).ToList());
             check(items.Skip(items.Count / 2).ToList());
         };
-        for (int i = 0; i < pending.Count; i += MassPropertyChunk) check(pending.Skip(i).Take(MassPropertyChunk).ToList());
+        foreach (var group in pending.GroupBy(ExcludesHidden).Select(g => g.ToList()))
+            for (int i = 0; i < group.Count; i += MassPropertyChunk) check(group.Skip(i).Take(MassPropertyChunk).ToList());
     }
 
     // A part instance's mass properties in the Link frame: the center moves with the instance's pose,
@@ -842,8 +863,13 @@ public static partial class LegacyExportBridge
     // own mass properties are overridden (or may be), parts in a non-active configuration, scaled
     // instances and anything unreadable are weighed by SolidWorks itself and combined with the rest.
     // SW_URDF_MASS_METHOD=items weighs every Link by SolidWorks alone, for comparison.
-    private static double[] LinkMassProperties(ModelDoc2 model, List<Component2> components, MathTransform frame, Dictionary<string, bool?> flags)
+    // Mass of hidden bodies left out per Link (exclude_hidden_bodies), and instances it could not apply to.
+    private static readonly Dictionary<string, double> excludedHiddenMass = new Dictionary<string, double>();
+    private static readonly List<string> exclusionNotApplied = new List<string>();
+
+    private static double[] LinkMassProperties(ModelDoc2 model, Link link, MathTransform frame, Dictionary<string, bool?> flags)
     {
+        var components = link.SWComponents;
         if (System.Environment.GetEnvironmentVariable("SW_URDF_MASS_METHOD") == "items") return ComponentMassProperties(model, components, frame);
         var toLink = frame == null ? DenseMatrix.CreateIdentity(4) : MathOps.GetTransformation(frame).Inverse();
         var parts = new List<Component2>();
@@ -865,12 +891,21 @@ public static partial class LegacyExportBridge
         foreach (var component in components) add(component);
         VerifyPartDocuments(model, parts);
         var contributions = new List<double[]>();
+        double excluded = 0;
         foreach (var part in parts)
         {
-            if (partVerified.TryGetValue(PartKey(part), out bool verified) && verified) contributions.Add(PlacedPartMassProperties(PartMassProperties(part), toLink * MathOps.GetTransformation(part.Transform2)));
+            if (partVerified.TryGetValue(PartKey(part), out bool verified) && verified)
+            {
+                contributions.Add(PlacedPartMassProperties(PartMassProperties(part), toLink * MathOps.GetTransformation(part.Transform2)));
+                if (ExcludesHidden(part)) excluded += PartMassProperties(part, true)[0] - PartMassProperties(part)[0];
+            }
             else weighed.Add(part);
         }
+        // SolidWorks weighs these with their hidden bodies: leaving them out there would also leave out
+        // hidden components, so the exclusion is reported as not applied instead.
+        exclusionNotApplied.AddRange(weighed.Where(ExcludesHidden).Select(c => c.Name2));
         if (weighed.Count != 0) contributions.Add(ComponentMassProperties(model, weighed, frame));
+        excludedHiddenMass[link.Name] = excluded;
         return CombineMassProperties(contributions);
     }
 
@@ -896,14 +931,14 @@ public static partial class LegacyExportBridge
         return new[] { mass, center[0], center[1], center[2] }.Concat(moment).Concat(new[] { parts.Sum(p => p[13]) }).ToArray();
     }
 
-    private static double[] ComponentMassPropertiesOnce(ModelDoc2 model, IEnumerable<Component2> components, MathTransform frame)
+    private static double[] ComponentMassPropertiesOnce(ModelDoc2 model, IEnumerable<Component2> components, MathTransform frame, bool includeHidden = true)
     {
         var extension = model.Extension;
         var mass = (IMassProperty2)extension.CreateMassProperty2();
         try
         {
             mass.UseSystemUnits = true;
-            mass.IncludeHiddenBodiesOrComponents = true;
+            mass.IncludeHiddenBodiesOrComponents = includeHidden;
             mass.SelectedItems = components.Select(c => new DispatchWrapper(c)).ToArray();
             if (frame != null) mass.SetCoordinateSystem(frame);
             // Without this the properties still describe the previous selection.
@@ -951,10 +986,16 @@ public static partial class LegacyExportBridge
         SW2URDF.Headless.Progress.Stage("mass_properties", "Reading component mass properties of each Link...", links.Count);
         // Override flags of each document, read once (see OwnOverride).
         var flags = new Dictionary<string, bool?>(StringComparer.OrdinalIgnoreCase);
-        var cad = links.ToDictionary(l => l, l => { SW2URDF.Headless.Progress.Step(l.Name); return LinkMassProperties(model, l.SWComponents, helper.GetToolFrameTransform(l.Joint.CoordinateSystemName), flags); });
+        var cad = links.ToDictionary(l => l, l => { SW2URDF.Headless.Progress.Step(l.Name); return LinkMassProperties(model, l, helper.GetToolFrameTransform(l.Joint.CoordinateSystemName), flags); });
         // Kept for the mesh check even if the transfer below stops.
         report["linkCadVolumes"] = cad.ToDictionary(item => item.Key.Name, item => (object)item.Value[13]);
         report["partMassCheck"] = new Dictionary<string, object> { { "documents_verified", partVerified.Count(p => p.Value) }, { "documents_weighed_in_assembly", partMismatches } };
+        double excludedTotal = excludedHiddenMass.Values.Sum();
+        if (excludedHiddenParts.Count != 0)
+        {
+            report["excludedHiddenBodyMassKg"] = excludedTotal;
+            report["excludedHiddenBodies"] = new Dictionary<string, object> { { "files", excludedHiddenParts.ToArray() }, { "mass_kg_by_link", excludedHiddenMass.Where(e => e.Value > 0).ToDictionary(e => e.Key, e => (object)e.Value) }, { "not_applied_to", exclusionNotApplied.Distinct().ToArray() } };
+        }
         var disagreeing = new List<string>();
         var overrides = new List<object>();
         // Instances of one part file and configuration share their masses; large links repeat the
@@ -973,10 +1014,12 @@ public static partial class LegacyExportBridge
         foreach (var link in links)
         {
             var values = cad[link];
-            if (Close(values[0], link.Inertial.Mass.Value, 1e-5, 1e-12))
+            // The exporter weighs hidden bodies too; its center of mass then differs by design.
+            double left = excludedHiddenMass.TryGetValue(link.Name, out double leftOut) ? leftOut : 0;
+            if (Close(values[0], link.Inertial.Mass.Value - left, 1e-5, 1e-12))
             {
                 var center = link.Inertial.Origin.GetXYZ();
-                if (!Enumerable.Range(0, 3).All(i => Close(values[1 + i], center[i], 0, 1e-6))) disagreeing.Add(link.Name + " center of mass");
+                if (left == 0 && !Enumerable.Range(0, 3).All(i => Close(values[1 + i], center[i], 0, 1e-6))) disagreeing.Add(link.Name + " center of mass");
                 continue;
             }
             SW2URDF.Headless.Progress.Stage("mass_overrides", "Mass of " + link.Name + " differs from its geometry; checking its components for overrides...", link.SWComponents.Count);
@@ -988,7 +1031,7 @@ public static partial class LegacyExportBridge
             overrides.Add(new Dictionary<string, object> { { "link", link.Name }, { "cad_mass_kg", values[0] }, { "geometric_mass_kg", link.Inertial.Mass.Value }, { "components", components } });
         }
         report["massOverrides"] = overrides;
-        double total = links.Sum(l => cad[l][0]), assembly = Convert.ToDouble(report["cadAssemblyMassKg"]);
+        double total = links.Sum(l => cad[l][0]), assembly = Convert.ToDouble(report["cadAssemblyMassKg"]) - excludedTotal;
         if (!Close(total, assembly, 1e-6, 1e-8)) disagreeing.Add("sum of Link masses " + total + " kg != assembly " + assembly + " kg");
         if (disagreeing.Count != 0)
         {
@@ -1110,7 +1153,7 @@ public static partial class LegacyExportBridge
         {
             if (body.Visible) continue;
             var mass = body.GetMassProperties(1.0) as double[];
-            rows.Add(new Dictionary<string, object> { { "body", body.Name }, { "volume_m3", mass == null ? (object)null : mass[3] } });
+            rows.Add(new Dictionary<string, object> { { "body", body.Name }, { "volume_m3", mass == null ? (object)null : mass[3] }, { "excluded_from_mass", ExcludesHidden(part) } });
         }
         return rows;
     }

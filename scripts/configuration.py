@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 import re
 
-CONFIG_KEYS = {"schema_version", "robot_name", "recompute_kinematics", "links", "world", "source"}
+CONFIG_KEYS = {"schema_version", "robot_name", "recompute_kinematics", "links", "world", "source", "exclude_hidden_bodies"}
 LINK_KEYS = {"name", "parent", "components", "coordinate_system", "mesh_quality", "frame_only", "joint"}
 JOINT_KEYS = {"name", "type", "axis_name", "axis", "xyz", "rpy", "lower", "upper", "effort", "velocity", "damping", "friction", "mimic"}
 MIMIC_KEYS = {"joint", "multiplier", "offset"}
@@ -225,6 +225,14 @@ def validate_config(config: dict) -> dict:
         errors.extend(validate_world(config["world"], names))
     if "source" in config:
         errors.extend(validate_source(config["source"]))
+    if "exclude_hidden_bodies" in config:
+        # Part files whose hidden solid bodies (e.g. the source of a mirror that mates still use) are
+        # not weighed: they stay in the CAD, out of the mass, inertia and the mesh check's CAD volume.
+        files = config["exclude_hidden_bodies"]
+        if not isinstance(files, list) or not all(isinstance(f, str) and f.lower().endswith(".sldprt") and "/" not in f and "\\" not in f for f in files):
+            errors.append(f"exclude_hidden_bodies must be a list of part file names such as \"bracket.SLDPRT\" (no folders), got {_show(files)}")
+        elif len({f.lower() for f in files}) != len(files):
+            errors.append(f"exclude_hidden_bodies lists a file more than once: {_show(files)}")
     if len(roots) != 1:
         errors.append(f"Exactly one root Link (parent null) is required, found {len(roots)}" + (f": {', '.join(roots)}" if roots else ""))
     for name in names:
