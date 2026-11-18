@@ -469,8 +469,10 @@ public static partial class LegacyExportBridge
             // Read before the export hides every component; the mesh check fails without it.
             try { report["linkGeometry"] = DescribeLinkGeometry(helper, doc, node, report); }
             catch (Exception e) when (e is COMException || e is InvalidOperationException || e is NullReferenceException) { report["linkGeometryError"] = e.Message; }
+            PlanMeshReuse(request, report);
             SW2URDF.Headless.Progress.Stage("export_meshes", "Exporting URDF and STL through original ExportHelper...", CountLinks(node, true));
             helper.ExportRobot(true, MeshExportFormat.STL);
+            report["reusedMeshes"] = SW2URDF.Headless.Meshes.Reused;
             SW2URDF.Headless.Progress.Stage("closing", "Closing the private session...");
             string urdf = Path.Combine(output, package, "urdf", package + ".urdf");
             if (!File.Exists(urdf)) throw new IOException("Exporter returned without producing a URDF at " + urdf + "; see bridge-export.log.");

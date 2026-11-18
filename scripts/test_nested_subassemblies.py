@@ -7,6 +7,8 @@ components. Two fixtures reproduce that nesting from workspace copies:
 - the workstation's rack_x4_asm inside a new assembly with its 48 vial sub-assemblies listed whole,
   as in the old configuration (run when the CAD is on this computer; SW_URDF_VIAL_RACK overrides the path).
 Before the fix these meshes were empty (0 triangles); now every part must be in its Link mesh.
+The vial rack also checks that mass properties read in chunks equal one whole reading, and that a
+re-export reuses the meshes, moving them into a Link frame changed by a joint origin.
 
 Needs SolidWorks 2026. The vial rack source is only read: prepare_model makes the tool's own copy first.
 """
@@ -16,6 +18,7 @@ from pathlib import Path
 import subprocess
 import unittest
 import uuid
+import xml.etree.ElementTree as ET
 
 from tool_service import export_urdf, prepare_model, write_json
 
@@ -38,6 +41,17 @@ def wrap(assembly, name, levels):
     return top, [line.partition("=")[2].partition("|")[0] for line in lines if line.startswith("COMPONENT=")]
 
 
+def inertials(result):
+    """Mass, center of mass and inertia (ixx ixy ixz iyy iyz izz) of each Link of an export."""
+    rows = {}
+    for link in ET.parse(result["bridge"]["urdf"]).getroot().findall("link"):
+        inertial = link.find("inertial")
+        if inertial is not None:
+            tensor = inertial.find("inertia").attrib
+            rows[link.attrib["name"]] = (float(inertial.find("mass").attrib["value"]), [float(v) for v in inertial.find("origin").attrib["xyz"].split()], [float(tensor[k]) for k in ("ixx", "ixy", "ixz", "iyy", "iyz", "izz")])
+    return rows
+
+
 def describe(result):
     return json.dumps({k: result.get(k) for k in ("job_id", "status", "passed", "error")} | {"validation_errors": (result.get("validation") or {}).get("errors")}, ensure_ascii=False, indent=1)[:4000]
 
@@ -51,10 +65,10 @@ class NestedSubassemblies(unittest.TestCase):
     def tearDownClass(cls):
         REPORT.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    def export(self, model, package, config):
+    def export(self, model, package, config, reuse_meshes=True):
         path = FIXTURES / f"{package}.json"
         write_json(path, config)
-        result = export_urdf(model, package, config_path=path, compare_previous=False)
+        result = export_urdf(model, package, config_path=path, compare_previous=False, reuse_meshes=reuse_meshes)
         geometry = (result.get("validation") or {}).get("cad_geometry") or {}
         report[package] = {"job_id": result.get("job_id"), "passed": result.get("passed"), "error": result.get("error"),
                            "cad_geometry": {k: {kk: (len(vv) if kk == "components_without_mesh" else vv) for kk, vv in v.items()} for k, v in geometry.items()}}
@@ -90,8 +104,28 @@ class NestedSubassemblies(unittest.TestCase):
             {"name": "base_link", "parent": None, "components": rack, "coordinate_system": "Assembly Origin", "mesh_quality": "coarse", "frame_only": False, "joint": None},
             {"name": "rack_consumables", "parent": "base_link", "components": caps, "coordinate_system": "Automatically Generate", "mesh_quality": "coarse", "frame_only": False,
              "joint": {"name": "rack_consumables_joint", "type": "fixed", "xyz": [0, 0, 0], "rpy": [0, 0, 0]}}]}
-        result, geometry = self.export(model, "nested_vials", config)
+        result, geometry = self.export(model, "nested_vials", config, reuse_meshes=False)
         self.assertEqual(geometry["rack_consumables"]["components_checked"], 96, "a vial and a cap in each of 48 sub-assemblies")
+        self.assertAlmostEqual(geometry["rack_consumables"]["volume_ratio"], 1.0, delta=0.05)
+        whole = inertials(result)
+
+        # Mass properties read in chunks (7 components at a time here) and combined equal one whole reading.
+        os.environ["SW_URDF_MASS_CHUNK"] = "7"
+        try:
+            chunked, _ = self.export(model, "nested_vials_chunked", config)
+        finally:
+            del os.environ["SW_URDF_MASS_CHUNK"]
+        for link, (mass, center, inertia) in inertials(chunked).items():
+            self.assertAlmostEqual(mass, whole[link][0], delta=1e-12 * mass)
+            self.assertLess(max(abs(a - b) for a, b in zip(center, whole[link][1])), 1e-12)
+            self.assertLess(max(abs(a - b) for a, b in zip(inertia, whole[link][2])), 1e-12 * max(map(abs, whole[link][2])), link)
+        self.assertEqual(set(chunked.get("reused_meshes") or {}), {"base_link", "rack_consumables"}, "the same geometry reuses both meshes")
+
+        # A moved joint origin moves the Link frame: the mesh is reused, moved into the new frame, and still matches the CAD.
+        config["links"][1]["joint"]["xyz"] = [0.01, 0.02, 0]
+        moved, geometry = self.export(model, "nested_vials_moved", config)
+        self.assertTrue(moved["reused_meshes"]["rack_consumables"]["moved"])
+        self.assertFalse(moved["reused_meshes"]["base_link"]["moved"])
         self.assertAlmostEqual(geometry["rack_consumables"]["volume_ratio"], 1.0, delta=0.05)
 
 

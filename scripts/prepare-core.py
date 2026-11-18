@@ -91,6 +91,12 @@ for source in files:
         text = patch(text, key, "        //Creates the Origin_global coordinate system\n", TOOL_HOOKS + "\n        //Creates the Origin_global coordinate system\n", 1)
         # Progress for job queries: one step per Link built.
         text = patch(text, key, 'progressBar.UpdateTitle("Building link: " + node.Name);', 'progressBar.UpdateTitle("Building link: " + node.Name);\n            SW2URDF.Headless.Progress.Step(node.Name);', 1)
+    if key == "URDFExport/CommonSwOperations.cs":
+        # Every show, hide, fix and unfix of the export selects its components first. Appending one
+        # component at a time costs time in proportion to the selection already made: 800 parts of the
+        # workstation took 194 s with Select4, 0.9 s with one MultiSelect2 (joint recomputation spent
+        # 15 of every 15.5 minutes per Link fixing and unfixing about 640 components this way).
+        text = patch(text, key, "            foreach (Component2 component in components)\n            {\n                component.Select4(true, data, false);\n            }", "            SW2URDF.Headless.Selection.Append(model, components, data);", 1)
     if key == "URDF/Link.cs":
         for name in ("Inertial", "Visual", "Collision"):
             text = patch(text, key, f"if ({name} != null)", f"if ({name} != null && !isFixedFrame)", 1)
@@ -98,7 +104,9 @@ for source in files:
         text = patch(text, key, "if (!child.isFixedFrame)\n                {\n                    ExportFiles(child, package, count, exportSTL, meshFormat);\n                }", "ExportFiles(child, package, count, exportSTL, meshFormat);", 1)
         text = patch(text, key, "// Copy the texture file (if it was specified) to the textures directory", "if (link.isFixedFrame) return;\n\n            // Copy the texture file (if it was specified) to the textures directory", 1)
         # Progress for job queries: one step per mesh.
-        text = patch(text, key, 'logger.Info(link.Name + ": Exporting STL with coordinate frame " + coordsysName);', 'logger.Info(link.Name + ": Exporting STL with coordinate frame " + coordsysName);\n            SW2URDF.Headless.Progress.Step(link.Name);', 1)
+        # A Link whose geometry an earlier passed export already meshed reuses that STL, moved into this
+        # Link's frame, instead of showing its components and tessellating them again.
+        text = patch(text, key, 'logger.Info(link.Name + ": Exporting STL with coordinate frame " + coordsysName);', 'logger.Info(link.Name + ": Exporting STL with coordinate frame " + coordsysName);\n            SW2URDF.Headless.Progress.Step(link.Name);\n            if (SW2URDF.Headless.Meshes.TryReuse(link.Name, windowsMeshFilename)) return true;', 1)
         # The export hides every top-level component, then shows each Link's components to save its STL.
         # Showing a sub-assembly that sits inside a hidden sub-assembly makes it visible but not its parts,
         # so a Link that lists it whole got an STL without it (all 144 vials of a workstation, 0 triangles
@@ -139,17 +147,99 @@ namespace SW2URDF.Headless {
         // Set when the document is a private copy closed without saving after the export.
         public static bool DiscardDocumentAfterExport;
     }
+    public static class Meshes {
+        public sealed class Plan {
+            public string Source, Sha256, Job;
+            public double[] FromFrame, ToFrame; // Link to assembly, 4x4 row-major, of the earlier and this export
+        }
+        public static readonly System.Collections.Generic.Dictionary<string, Plan> Reuse = new System.Collections.Generic.Dictionary<string, Plan>();
+        public static readonly System.Collections.Generic.Dictionary<string, object> Reused = new System.Collections.Generic.Dictionary<string, object>();
+
+        // Writes the planned earlier STL to target, its vertices and normals moved from the earlier Link
+        // frame to this one. Any doubt (changed file, unreadable mesh) leaves the export to SolidWorks.
+        public static bool TryReuse(string link, string target) {
+            Plan plan;
+            if (!Reuse.TryGetValue(link, out plan)) return false;
+            try {
+                byte[] data = System.IO.File.ReadAllBytes(plan.Source);
+                using (var sha = System.Security.Cryptography.SHA256.Create())
+                    if (BitConverter.ToString(sha.ComputeHash(data)).Replace("-", "").ToLowerInvariant() != plan.Sha256) throw new System.IO.IOException("the file changed since it was exported");
+                if (data.Length < 84) throw new System.IO.IOException("not a binary STL");
+                int count = BitConverter.ToInt32(data, 80);
+                if (data.Length != 84 + 50L * count) throw new System.IO.IOException("not a binary STL of " + count + " triangles");
+                // Old Link frame to new: inverse(new) * old, both rigid.
+                var a = plan.FromFrame; var b = plan.ToFrame;
+                var m = new double[12];
+                for (int r = 0; r < 3; r++) {
+                    for (int c = 0; c < 3; c++) m[4 * r + c] = b[r] * a[c] + b[4 + r] * a[4 + c] + b[8 + r] * a[8 + c];
+                    m[4 * r + 3] = b[r] * (a[3] - b[3]) + b[4 + r] * (a[7] - b[7]) + b[8 + r] * (a[11] - b[11]);
+                }
+                bool identity = true;
+                for (int r = 0; r < 3; r++) for (int c = 0; c < 4; c++) if (Math.Abs(m[4 * r + c] - (r == c ? 1 : 0)) > 1e-12) identity = false;
+                if (!identity) {
+                    for (long t = 0; t < count; t++) {
+                        int offset = (int)(84 + 50 * t);
+                        for (int v = 0; v < 4; v++) {
+                            int at = offset + 12 * v;
+                            double x = BitConverter.ToSingle(data, at), y = BitConverter.ToSingle(data, at + 4), z = BitConverter.ToSingle(data, at + 8);
+                            double w = v == 0 ? 0 : 1; // the normal turns, the vertices also move
+                            for (int r = 0; r < 3; r++) BitConverter.GetBytes((float)(m[4 * r] * x + m[4 * r + 1] * y + m[4 * r + 2] * z + w * m[4 * r + 3])).CopyTo(data, at + 4 * r);
+                        }
+                    }
+                }
+                System.IO.File.WriteAllBytes(target, data);
+                Reused[link] = new System.Collections.Generic.Dictionary<string, object> { { "source", plan.Source }, { "job_id", plan.Job }, { "moved", !identity } };
+                Console.Error.WriteLine("[" + DateTime.Now.ToString("HH:mm:ss") + "]   Reused the mesh of " + link + " from job " + plan.Job + (identity ? "" : " (moved into the new Link frame)"));
+                return true;
+            } catch (Exception e) {
+                Console.Error.WriteLine("Mesh of " + link + " not reused (" + e.Message + "); exporting it.");
+                return false;
+            }
+        }
+    }
+    public static class Selection {
+        // Adds the components to the selection in one call; falls back to one call per component if
+        // SolidWorks selected fewer than asked.
+        public static void Append(SolidWorks.Interop.sldworks.ModelDoc2 model, System.Collections.Generic.List<SolidWorks.Interop.sldworks.Component2> components, SolidWorks.Interop.sldworks.SelectData data) {
+            if (components == null || components.Count == 0) return;
+            var manager = (SolidWorks.Interop.sldworks.SelectionMgr)model.SelectionManager;
+            int before = manager.GetSelectedObjectCount2(-1);
+            var distinct = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var items = new System.Collections.Generic.List<System.Runtime.InteropServices.DispatchWrapper>();
+            foreach (var component in components) if (distinct.Add(component.Name2)) items.Add(new System.Runtime.InteropServices.DispatchWrapper(component));
+            // The exporter selects with mark -1, which means "any mark" when reading a selection; show,
+            // hide, fix and unfix ignore the mark, so 0 serves. Passing an object[] with append=true to an
+            // empty selection, MultiSelect2 selected nothing; a DispatchWrapper[] without append selects all.
+            var multiple = manager.CreateSelectData();
+            if (data.Mark >= 0) multiple.Mark = data.Mark;
+            model.Extension.MultiSelect2(items.ToArray(), before != 0, multiple);
+            int count = manager.GetSelectedObjectCount2(-1);
+            if (count >= before + items.Count) return;
+            // Select only the components that are missing, one at a time.
+            var selected = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 1; i <= count; i++) {
+                var item = manager.GetSelectedObject6(i, -1) as SolidWorks.Interop.sldworks.Component2;
+                if (item != null) selected.Add(item.Name2);
+            }
+            int missing = 0;
+            foreach (var component in components) if (!selected.Contains(component.Name2)) { component.Select4(true, data, false); missing++; }
+            Console.Error.WriteLine("MultiSelect2 left out " + missing + " of " + items.Count + " components; selected them one at a time.");
+        }
+    }
     public static class Visibility {
-        // The components and, below each listed sub-assembly, every component that is not suppressed
-        // or an envelope; mass properties include the same parts, hidden ones too.
+        // The parts that make up the components: each listed part, and below each listed sub-assembly
+        // every part that is not suppressed or an envelope (mass properties include the same parts,
+        // hidden ones too). Showing a part shows its sub-assemblies with it; selecting a sub-assembly
+        // together with its own parts makes SolidWorks select fewer items than asked.
         public static System.Collections.Generic.List<SolidWorks.Interop.sldworks.Component2> WithParts(System.Collections.Generic.List<SolidWorks.Interop.sldworks.Component2> components) {
             var all = new System.Collections.Generic.List<SolidWorks.Interop.sldworks.Component2>();
             var seen = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
             System.Action<SolidWorks.Interop.sldworks.Component2> add = null;
             add = component => {
                 if (!seen.Add(component.Name2)) return;
-                all.Add(component);
-                foreach (object child in component.GetChildren() as object[] ?? new object[0]) {
+                var children = component.GetChildren() as object[];
+                if (children == null || children.Length == 0) { all.Add(component); return; }
+                foreach (object child in children) {
                     var item = (SolidWorks.Interop.sldworks.Component2)child;
                     if (!item.IsSuppressed() && !item.IsEnvelope()) add(item);
                 }

@@ -48,7 +48,7 @@ async def inspect_solidworks() -> dict[str, Any]:
 
 @server.tool(structured_output=True)
 async def export_urdf(model_path: str, package_name: str = "robot_description", reference_urdf: str | None = None, config_path: str | None = None, check_only: bool = False, use_saved_files: bool = False, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds: int = DEFAULT_STALL_SECONDS,
-                      compare_previous: bool = True, accept_source_change: bool = False, kinematics_tolerance_mm: float = DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg: float = DEFAULT_TOLERANCE_DEG, write_config_source: bool = False, recompute_preflight: bool = False) -> dict[str, Any]:
+                      compare_previous: bool = True, accept_source_change: bool = False, kinematics_tolerance_mm: float = DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg: float = DEFAULT_TOLERANCE_DEG, write_config_source: bool = False, recompute_preflight: bool = False, reuse_meshes: bool = True) -> dict[str, Any]:
     """Export an assembly or part using the SolidWorks 2026 headless core.
 
     Snapshots all dependencies and only edits copies in a private session.
@@ -69,12 +69,15 @@ async def export_urdf(model_path: str, package_name: str = "robot_description", 
     origins and axes (slow: hours on assemblies of hundreds of parts). accept_source_change=true exports the configured
     joints anyway and keeps a mesh/joint mismatch as a warning. write_config_source=true records the verified CAD version in the config file
     after a passed run (the job always writes config_with_source_path).
+    reuse_meshes (default true): a Link whose parts, their placements in the assembly, mesh quality and CAD volume match
+    a Link of an earlier passed export reuses that STL (moved into the new Link frame) instead of exporting it again;
+    reused meshes are listed in reused_meshes and checked against the CAD like the others.
     Returns validation, source hashes, settings recovery, a persistent job_id and reusable_model.
     If the job outlasts the tool call, returns still_running=true; continue with get_export_job.
     """
     options = dict(accept_source_change=accept_source_change, kinematics_tolerance_mm=kinematics_tolerance_mm, kinematics_tolerance_deg=kinematics_tolerance_deg, write_config_source=write_config_source, recompute_preflight=recompute_preflight)
     if not check_only:
-        options.update(reference_urdf=reference_urdf, compare_previous=compare_previous)
+        options.update(reference_urdf=reference_urdf, compare_previous=compare_previous, reuse_meshes=reuse_meshes)
     return await run_and_wait("check" if check_only else "export", model_path, package_name, config_path=config_path, timeout_seconds=timeout_seconds, stall_timeout_seconds=stall_timeout_seconds, use_saved_files=use_saved_files, **options)
 
 
@@ -92,15 +95,15 @@ async def prepare_model(model_path: str, use_saved_files: bool = False, timeout_
 
 @server.tool(structured_output=True)
 async def start_urdf_export(model_path: str, package_name: str = "robot_description", config_path: str | None = None, reference_urdf: str | None = None, check_only: bool = False, use_saved_files: bool = False, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds: int = DEFAULT_STALL_SECONDS,
-                            compare_previous: bool = True, accept_source_change: bool = False, kinematics_tolerance_mm: float = DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg: float = DEFAULT_TOLERANCE_DEG, write_config_source: bool = False, recompute_preflight: bool = False) -> dict[str, Any]:
+                            compare_previous: bool = True, accept_source_change: bool = False, kinematics_tolerance_mm: float = DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg: float = DEFAULT_TOLERANCE_DEG, write_config_source: bool = False, recompute_preflight: bool = False, reuse_meshes: bool = True) -> dict[str, Any]:
     """Start a long export (or a check_only run) and return a job_id immediately. Follow it with get_export_job and wait_seconds.
 
     Takes the same options as export_urdf (compare_previous, accept_source_change, kinematics_tolerance_mm/deg,
-    write_config_source, recompute_preflight). A configuration made for another CAD version is reported at once in warnings and config_stale.
+    write_config_source, recompute_preflight, reuse_meshes). A configuration made for another CAD version is reported at once in warnings and config_stale.
     """
     options = dict(accept_source_change=accept_source_change, kinematics_tolerance_mm=kinematics_tolerance_mm, kinematics_tolerance_deg=kinematics_tolerance_deg, write_config_source=write_config_source, recompute_preflight=recompute_preflight)
     if not check_only:
-        options.update(reference_urdf=reference_urdf, compare_previous=compare_previous)
+        options.update(reference_urdf=reference_urdf, compare_previous=compare_previous, reuse_meshes=reuse_meshes)
     return await asyncio.to_thread(functools.partial(start_job, "check" if check_only else "export", model_path, package_name, config_path=config_path, timeout_seconds=timeout_seconds, stall_timeout_seconds=stall_timeout_seconds, use_saved_files=use_saved_files, **options))
 
 

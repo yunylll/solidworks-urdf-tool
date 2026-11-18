@@ -31,6 +31,7 @@ def main():
             command.add_argument("--package", default="robot_description")
             command.add_argument("--reference", help="URDF the export must match (differences fail)")
             command.add_argument("--no-compare-previous", action="store_true", help="do not compare with the previous successful export of the same model or package")
+            command.add_argument("--no-reuse-meshes", action="store_true", help="export every Link mesh again, even where an earlier passed export already meshed the same geometry")
         if name == "start-export":
             command.add_argument("--check-only", action="store_true", help="stop after the joints and Link frames")
     job = commands.add_parser("job")
@@ -55,7 +56,7 @@ def main():
                                kinematics_tolerance_deg=arguments.kinematics_tolerance_deg, write_config_source=arguments.write_config_source,
                                recompute_preflight=arguments.recompute_preflight)
             if arguments.command in {"export", "start-export"} and not getattr(arguments, "check_only", False):
-                options.update(reference_urdf=arguments.reference, compare_previous=not arguments.no_compare_previous)
+                options.update(reference_urdf=arguments.reference, compare_previous=not arguments.no_compare_previous, reuse_meshes=not arguments.no_reuse_meshes)
             name = "check" if arguments.command == "check" or getattr(arguments, "check_only", False) else "export" if arguments.command == "start-export" else arguments.command
             package = getattr(arguments, "package", "robot_description")
             result = start_job(name, arguments.model, package, **options) if arguments.command == "start-export" else operation(name, arguments.model, package, **options)

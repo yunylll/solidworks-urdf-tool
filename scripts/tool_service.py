@@ -221,7 +221,7 @@ def _needs_preflight(config):
 
 
 def create_job(operation, model_path, package_name="robot_description", *, config_path=None, reference_urdf=None, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds=DEFAULT_STALL_SECONDS, use_saved_files=False,
-               accept_source_change=False, kinematics_tolerance_mm=provenance.DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg=provenance.DEFAULT_TOLERANCE_DEG, compare_previous=True, write_config_source=False, recompute_preflight=False):
+               accept_source_change=False, kinematics_tolerance_mm=provenance.DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg=provenance.DEFAULT_TOLERANCE_DEG, compare_previous=True, write_config_source=False, recompute_preflight=False, reuse_meshes=True):
     source = Path(model_path).expanduser().resolve()
     if not source.is_file() or source.suffix.lower() not in {".sldasm", ".sldprt"}:
         raise ValueError(f"model_path must be an existing .SLDASM or .SLDPRT, got {str(source)!r}" + (" (file not found)." if not source.is_file() else "."))
@@ -260,6 +260,8 @@ def create_job(operation, model_path, package_name="robot_description", *, confi
     record = {"job_id": identifier, "job": str(directory), "status": "queued", "passed": False, "operation": operation, "model_path": str(source), "created_at": created, "timeout_seconds": timeout_seconds, "stall_timeout_seconds": stall_timeout_seconds, "reference_urdf": str(reference) if reference else None, "source_model_sha256": source_sha256,
               # A prepared copy differs byte-wise from its original; configurations belong to the original's version.
               "cad_version_sha256": cad_version, "accept_source_change": bool(accept_source_change), "kinematics_tolerance": {"mm": kinematics_tolerance_mm, "deg": kinematics_tolerance_deg}, "recompute_preflight": bool(recompute_preflight), "warnings": []}
+    if operation == "export":
+        record["reuse_meshes"] = bool(reuse_meshes)
     if original_path != str(source):
         record["original_model_path"] = original_path
     if config:
@@ -362,6 +364,8 @@ class ActivityMonitor:
         self.cpu_total = self.sample_cpu
         self.last_poll = time.monotonic()
         self.suspended_seconds = 0.0
+        # Each pause of this worker (sleep, standby, a frozen machine) with its length, for the record.
+        self.suspensions = []
 
     def pids(self):
         pids = [self.native_pid]
@@ -383,12 +387,16 @@ class ActivityMonitor:
         gap = now - self.last_poll
         self.last_poll = now
         if gap > SUSPEND_GAP_SECONDS:
-            # Sleep or standby froze SolidWorks and this worker alike: move the clocks past it.
+            # Sleep or standby froze SolidWorks and this worker alike: move the clocks past it. Before this
+            # rule, a check (job a0000007) was stopped as stalled for "3560 s" right after such a pause.
             self.suspended_seconds += gap
+            self.suspensions.append({"resumed_at": stamp(), "seconds": round(gap, 1)})
             self.last_activity += gap
             self.sample_started = now
             self.sample_cpu = self.cpu_seconds()
-        signature = tuple((p.stat().st_mtime_ns, p.stat().st_size) if p.is_file() else None for p in (self.output / "progress.json", self.output.parent / "stderr.log"))
+        # The original exporter's own log keeps growing through its long steps (fixing components for
+        # joint recomputation, for minutes) while the progress file names only the stage.
+        signature = tuple((p.stat().st_mtime_ns, p.stat().st_size) if p.is_file() else None for p in (self.output / "progress.json", self.output.parent / "stderr.log", self.output / "bridge-export.log"))
         if signature != self.last_signature:
             self.last_signature = signature
             self.last_activity = now
@@ -398,7 +406,7 @@ class ActivityMonitor:
             if cpu - self.sample_cpu >= ACTIVITY_CPU_SHARE * (now - self.sample_started) or cpu < self.sample_cpu:
                 self.last_activity = now
             self.sample_started, self.sample_cpu, self.cpu_total = now, cpu, cpu
-            write_json(self.directory / "activity.json", {"sampled_at": stamp(), "cpu_seconds": round(cpu, 1), "idle_seconds": round(now - self.last_activity, 1)})
+            write_json(self.directory / "activity.json", {"sampled_at": stamp(), "cpu_seconds": round(cpu, 1), "idle_seconds": round(now - self.last_activity, 1), "paused_seconds": round(self.suspended_seconds, 1), "pauses": self.suspensions[-20:]})
         return now - self.last_activity
 
 
@@ -501,9 +509,17 @@ def _wait_native(directory, record, process):
     """Wait for the native tool; stop it on cancel, stall or the hard time limit."""
     monitor = ActivityMonitor(directory, process.pid, record.get("native_output", "output"))
     started = time.monotonic()
+
+    def note_pauses():
+        if monitor.suspensions:
+            record["paused_seconds"] = round(record.get("paused_seconds", 0) + monitor.suspended_seconds, 1)
+            record["pauses"] = record.get("pauses", []) + monitor.suspensions
+
     while True:
         try:
-            return process.wait(timeout=POLL_SECONDS)
+            code = process.wait(timeout=POLL_SECONDS)
+            note_pauses()
+            return code
         except subprocess.TimeoutExpired:
             pass
         idle = monitor.poll()
@@ -517,9 +533,11 @@ def _wait_native(directory, record, process):
             record.update(status="timed_out", error={"code": "CAD_TIMEOUT", "message": f"The CAD operation exceeded its {record['timeout_seconds']} s limit during: {where}. Source files were only snapshotted.", "stage": progress.get("stage")})
             problem = True
         elif idle > record["stall_timeout_seconds"]:
-            record.update(status="timed_out", error={"code": "CAD_STALLED", "message": f"No progress and no SolidWorks CPU activity for {int(idle)} s (stall_timeout_seconds={record['stall_timeout_seconds']}) during: {where}. Source files were only snapshotted.", "stage": progress.get("stage"), "cad_cpu_seconds": round(monitor.cpu_total, 1)})
+            paused = f" ({int(monitor.suspended_seconds)} s while the computer or this worker was paused are not counted)" if monitor.suspended_seconds else ""
+            record.update(status="timed_out", error={"code": "CAD_STALLED", "message": f"No progress and no SolidWorks CPU activity for {int(idle)} s (stall_timeout_seconds={record['stall_timeout_seconds']}){paused} during: {where}. Source files were only snapshotted.", "stage": progress.get("stage"), "cad_cpu_seconds": round(monitor.cpu_total, 1)})
             problem = True
         if problem:
+            note_pauses()
             process.kill()
             process.wait(timeout=10)
             return None
@@ -590,6 +608,38 @@ def _validate_export(directory, record, bridge, config):
         record["previews"] = render_preview.render(bridge["urdf"], Path(bridge["urdf"]).parent.parent / "previews")
     except Exception as exc:
         record["previews"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def mesh_reuse_candidates(exclude=None):
+    """Meshes of earlier passed exports by key (see mesh-keys.json), newest first, still on disk."""
+    found = {}
+    for keys_path in sorted(JOBS.glob("*/mesh-keys.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        if keys_path.parent.name == exclude:
+            continue
+        for link, row in (read_json(keys_path) or {}).items():
+            key = row.get("key")
+            if key and key not in found and Path(row["stl"]).is_file():
+                found[key] = dict(row, link=link, job_id=keys_path.parent.name)
+    return found
+
+
+def _record_meshes(directory, record, bridge):
+    """Which meshes were reused, and the keys of this export's meshes for later exports."""
+    reused = bridge.get("reusedMeshes") or {}
+    if reused:
+        record["reused_meshes"] = reused
+        record.setdefault("notes", []).append(f"{len(reused)} of {len(bridge.get('linkGeometry') or {})} Link meshes were reused from earlier exports with the same geometry ("
+                                              + ", ".join(sorted(reused)) + "); the mesh check compared them with the CAD as usual.")
+    if not record.get("validation", {}).get("passed"):
+        return
+    meshes = Path(bridge["urdf"]).parent.parent / "meshes"
+    keys = {}
+    for link, row in (bridge.get("linkGeometry") or {}).items():
+        stl = meshes / (link.replace("/", "_") + ".STL")
+        if row.get("mesh_key") and row.get("frame_to_assembly") and stl.is_file():
+            keys[link] = {"key": row["mesh_key"], "stl": str(stl), "sha256": sha256(stl), "frame_to_assembly": row["frame_to_assembly"]}
+    if keys:
+        write_json(directory / "mesh-keys.json", keys)
 
 
 def _note_subassemblies(directory, record, rows, config):
@@ -707,6 +757,12 @@ def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
             _probe_active_document(directory, request_path, request_data, record)
             if cancel_requested(directory):
                 raise JobCancelled("Cancelled before SolidWorks started.")
+            if record.get("reuse_meshes"):
+                candidates = mesh_reuse_candidates(exclude=identifier)
+                if candidates:
+                    write_json(directory / "mesh-reuse.json", candidates)
+                    request_data["mesh_reuse"] = str(directory / "mesh-reuse.json")
+                    write_json(request_path, request_data)
             job_config = read_json(directory / "robot-config.json")
             if job_config and record.get("config_stale") and record.get("recompute_preflight") and not record.get("accept_source_change") and _needs_preflight(job_config):
                 _preflight_kinematics(directory, record, request_data, job_config)
@@ -742,6 +798,7 @@ def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
                 if record["operation"] == "export" and native_ok:
                     _set_phase(directory, record, "validating")
                     _validate_export(directory, record, bridge, config)
+                    _record_meshes(directory, record, bridge)
                 if record["operation"] == "check" and native_ok:
                     record["resolved_joints"] = bridge.get("resolvedJoints")
                     record["link_frames"] = bridge.get("linkFrames")
@@ -749,6 +806,9 @@ def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
                 record["warnings"] = record.get("warnings", []) + bridge_warnings(bridge) + record.pop("notes", [])
                 validation_ok = record.get("validation", {"passed": True})["passed"]
                 record["passed"] = bool(native_ok and preferences_ok and cleanup["passed"] and record["source_unchanged"] and bool(before) and validation_ok)
+                if not record["passed"]:
+                    # Only meshes of a fully passed export are offered to later ones.
+                    (directory / "mesh-keys.json").unlink(missing_ok=True)
                 if config:
                     record["config_verified_for_sha256"] = None
                     if record["passed"] and record["operation"] in {"export", "check"}:
@@ -913,9 +973,9 @@ def operation(operation_name, model_path, package_name="robot_description", **op
 
 
 def export_urdf(model_path, package_name="robot_description", *, config_path=None, reference_urdf=None, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds=DEFAULT_STALL_SECONDS, use_saved_files=False,
-                accept_source_change=False, kinematics_tolerance_mm=provenance.DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg=provenance.DEFAULT_TOLERANCE_DEG, compare_previous=True, write_config_source=False, recompute_preflight=False):
+                accept_source_change=False, kinematics_tolerance_mm=provenance.DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg=provenance.DEFAULT_TOLERANCE_DEG, compare_previous=True, write_config_source=False, recompute_preflight=False, reuse_meshes=True):
     return operation("export", model_path, package_name, config_path=config_path, reference_urdf=reference_urdf, timeout_seconds=timeout_seconds, stall_timeout_seconds=stall_timeout_seconds, use_saved_files=use_saved_files,
-                     accept_source_change=accept_source_change, kinematics_tolerance_mm=kinematics_tolerance_mm, kinematics_tolerance_deg=kinematics_tolerance_deg, compare_previous=compare_previous, write_config_source=write_config_source, recompute_preflight=recompute_preflight)
+                     accept_source_change=accept_source_change, kinematics_tolerance_mm=kinematics_tolerance_mm, kinematics_tolerance_deg=kinematics_tolerance_deg, compare_previous=compare_previous, write_config_source=write_config_source, recompute_preflight=recompute_preflight, reuse_meshes=reuse_meshes)
 
 
 def check_configuration(model_path, config_path, *, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds=DEFAULT_STALL_SECONDS, use_saved_files=False,
@@ -934,9 +994,9 @@ def prepare_model(model_path, *, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_
 
 
 def start_export(model_path, package_name="robot_description", *, config_path=None, reference_urdf=None, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds=DEFAULT_STALL_SECONDS, use_saved_files=False,
-                 accept_source_change=False, kinematics_tolerance_mm=provenance.DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg=provenance.DEFAULT_TOLERANCE_DEG, compare_previous=True, write_config_source=False, recompute_preflight=False):
+                 accept_source_change=False, kinematics_tolerance_mm=provenance.DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg=provenance.DEFAULT_TOLERANCE_DEG, compare_previous=True, write_config_source=False, recompute_preflight=False, reuse_meshes=True):
     return start_job("export", model_path, package_name, config_path=config_path, reference_urdf=reference_urdf, timeout_seconds=timeout_seconds, stall_timeout_seconds=stall_timeout_seconds, use_saved_files=use_saved_files,
-                     accept_source_change=accept_source_change, kinematics_tolerance_mm=kinematics_tolerance_mm, kinematics_tolerance_deg=kinematics_tolerance_deg, compare_previous=compare_previous, write_config_source=write_config_source, recompute_preflight=recompute_preflight)
+                     accept_source_change=accept_source_change, kinematics_tolerance_mm=kinematics_tolerance_mm, kinematics_tolerance_deg=kinematics_tolerance_deg, compare_previous=compare_previous, write_config_source=write_config_source, recompute_preflight=recompute_preflight, reuse_meshes=reuse_meshes)
 
 
 def start_job(operation_name, model_path, package_name="robot_description", **options):

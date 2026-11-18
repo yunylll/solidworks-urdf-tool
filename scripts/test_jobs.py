@@ -1,8 +1,10 @@
 """Offline checks of CAD queueing and worker-liveness detection (no SolidWorks)."""
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -10,6 +12,8 @@ import uuid
 
 import tool_service
 from tool_service import CadBusyError, get_job, native_lock, process_identity, write_json
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 class JobChecks(unittest.TestCase):
@@ -140,7 +144,66 @@ class JobChecks(unittest.TestCase):
                 child.kill()
         self.assertEqual(record["status"], "timed_out")
         self.assertEqual(record["error"]["code"], "CAD_STALLED")
-        self.assertLess(time.monotonic() - start, 30)
+        # The stall fires at its threshold (plus one CPU sample and a few polls), not long after it.
+        self.assertLess(time.monotonic() - start, 3 + 1 + 4 * tool_service.POLL_SECONDS + 2)
+
+    def test_pause_is_not_idle_time(self):
+        # A worker frozen for two minutes (sleep, standby) comes back: the pause is recorded, not counted as idle.
+        _, directory = self.fake_job(5)
+        monitor = tool_service.ActivityMonitor(directory, tool_service.os.getpid())
+        monitor.poll()
+        monitor.last_poll -= 120
+        monitor.last_activity -= 120
+        self.assertLess(monitor.poll(), 5)
+        self.assertGreaterEqual(monitor.suspended_seconds, 119)
+        self.assertEqual(len(monitor.suspensions), 1)
+
+    def test_mesh_reuse_candidates(self):
+        # Newest passed export wins per key; meshes no longer on disk and the job itself are left out.
+        original = tool_service.JOBS
+        with tempfile.TemporaryDirectory(dir=ROOT / "validation") as temp:
+            jobs = Path(temp)
+            tool_service.JOBS = jobs
+            try:
+                stl = jobs / "mesh.STL"
+                stl.write_bytes(b"\0" * 84)
+                for name, rows, age in (("old", {"base_link": "k1", "arm": "k2"}, 100), ("new", {"base_link": "k1", "gone": "k3"}, 10), ("self", {"tool": "k4"}, 0)):
+                    (jobs / name).mkdir()
+                    keys = jobs / name / "mesh-keys.json"
+                    write_json(keys, {link: {"key": key, "stl": str(stl if link != "gone" else jobs / "missing.STL"), "sha256": "x", "frame_to_assembly": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]} for link, key in rows.items()})
+                    stamp_time = time.time() - age
+                    tool_service.os.utime(keys, (stamp_time, stamp_time))
+                found = tool_service.mesh_reuse_candidates(exclude="self")
+            finally:
+                tool_service.JOBS = original
+        self.assertEqual(sorted(found), ["k1", "k2"])
+        self.assertEqual(found["k1"]["job_id"], "new")
+        self.assertEqual(found["k2"]["job_id"], "old")
+
+    def test_exporter_log_keeps_job_alive(self):
+        # Joint recomputation logs for minutes in bridge-export.log while progress.json stays put.
+        _, directory = self.fake_job(5)
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        log = directory / "output" / "bridge-export.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        stop = threading.Event()
+
+        def append():
+            while not stop.wait(1):
+                with log.open("a", encoding="utf-8") as stream:
+                    stream.write("INFO  Unfixing component 81\n")
+
+        thread = threading.Thread(target=append)
+        thread.start()
+        try:
+            record = self.running_record(directory, stall_timeout_seconds=3, timeout_seconds=8)
+            tool_service._wait_native(directory, record, child)
+        finally:
+            stop.set()
+            thread.join()
+            if child.poll() is None:
+                child.kill()
+        self.assertEqual(record["error"]["code"], "CAD_TIMEOUT", "a growing exporter log is activity")
 
     def test_busy_process_is_not_stalled_until_hard_limit(self):
         _, directory = self.fake_job(5)

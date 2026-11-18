@@ -731,8 +731,172 @@ public static partial class LegacyExportBridge
         }
     }
 
+    // SolidWorks' time for one mass property call grows with the square of its component count: 100 parts
+    // of the workstation took 5.5 s, 800 took 106 s (a 1722-part Link 7 minutes). Larger lists go in
+    // chunks of this size, combined exactly; each call also costs about a second whatever its size.
+    // SW_URDF_MASS_CHUNK sets another size, for the regression test that compares chunked and whole results.
+    private static readonly int MassPropertyChunk = int.TryParse(System.Environment.GetEnvironmentVariable("SW_URDF_MASS_CHUNK"), out int chunk) && chunk > 0 ? chunk : 100;
+
     // Returns mass, center of mass (3), the 3x3 moment of inertia at the center of mass and the volume.
     private static double[] ComponentMassProperties(ModelDoc2 model, IEnumerable<Component2> components, MathTransform frame)
+    {
+        var list = components.ToList();
+        if (list.Count <= MassPropertyChunk) return ComponentMassPropertiesOnce(model, list, frame);
+        var chunks = new List<double[]>();
+        for (int i = 0; i < list.Count; i += MassPropertyChunk) chunks.Add(ComponentMassPropertiesOnce(model, list.Skip(i).Take(MassPropertyChunk), frame));
+        return CombineMassProperties(chunks);
+    }
+
+    // Mass properties of each part document (file and configuration), in the part's own frame: mass,
+    // center (3), moments at the center (SolidWorks order and sign) and volume. Overrides in the part
+    // are honored, hidden bodies included. Null when the document is not loaded or a component uses a
+    // configuration that is not the document's active one.
+    private static readonly Dictionary<string, double[]> partMassProperties = new Dictionary<string, double[]>(StringComparer.OrdinalIgnoreCase);
+
+    private static double[] PartMassProperties(Component2 part)
+    {
+        string key = part.GetPathName() + "|" + part.ReferencedConfiguration;
+        double[] known;
+        if (partMassProperties.TryGetValue(key, out known)) return known;
+        known = null;
+        try
+        {
+            var document = part.GetModelDoc2() as ModelDoc2;
+            var active = document == null ? null : document.ConfigurationManager.ActiveConfiguration;
+            if (active != null && string.Equals(active.Name, part.ReferencedConfiguration, StringComparison.Ordinal))
+            {
+                var extension = document.Extension;
+                var mass = (IMassProperty2)extension.CreateMassProperty2();
+                mass.UseSystemUnits = true;
+                mass.IncludeHiddenBodiesOrComponents = true;
+                if (mass.Recalculate())
+                {
+                    var center = (double[])mass.CenterOfMass;
+                    var moment = (double[])mass.GetMomentOfInertia((int)swMomentsOfInertiaReferenceFrame_e.swMomentsOfInertiaReferenceFrame_CenterOfMass);
+                    known = new[] { mass.Mass, center[0], center[1], center[2] }.Concat(moment).Concat(new[] { mass.Volume }).ToArray();
+                }
+                Marshal.ReleaseComObject(mass);
+                Marshal.ReleaseComObject(extension);
+            }
+        }
+        catch (Exception e) when (e is COMException || e is NullReferenceException || e is InvalidCastException) { known = null; }
+        partMassProperties[key] = known;
+        return known;
+    }
+
+    // Whether a part document's own mass properties equal what SolidWorks weighs for an instance of it in
+    // the assembly. They need not: a material assigned to the component in the assembly changes its mass
+    // without touching the part (13.6 g of the workstation's pipette head). Unverified documents are
+    // weighed by SolidWorks instance by instance.
+    private static readonly Dictionary<string, bool> partVerified = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+    private static readonly List<string> partMismatches = new List<string>();
+
+    private static string PartKey(Component2 part) { return part.GetPathName() + "|" + part.ReferencedConfiguration; }
+
+    private static bool Agree(double[] a, double[] b)
+    {
+        double size = Math.Max(1e-12, Enumerable.Range(4, 9).Max(i => Math.Max(Math.Abs(a[i]), Math.Abs(b[i]))));
+        return Close(a[0], b[0], 1e-9, 1e-15) && Enumerable.Range(1, 3).All(i => Math.Abs(a[i] - b[i]) <= 1e-9) && Enumerable.Range(4, 9).All(i => Math.Abs(a[i] - b[i]) <= 1e-7 * size);
+    }
+
+    // Compares one instance of each document with SolidWorks, 100 at a time; a group that disagrees is
+    // halved until the documents that differ are found.
+    private static void VerifyPartDocuments(ModelDoc2 model, IEnumerable<Component2> instances)
+    {
+        var pending = instances.Where(c => !partVerified.ContainsKey(PartKey(c)) && PartMassProperties(c) != null)
+            .GroupBy(PartKey, StringComparer.OrdinalIgnoreCase).Select(g => g.First()).ToList();
+        Action<List<Component2>> check = null;
+        check = items => {
+            var expected = CombineMassProperties(items.Select(c => PlacedPartMassProperties(PartMassProperties(c), MathOps.GetTransformation(c.Transform2))).ToList());
+            var actual = ComponentMassPropertiesOnce(model, items, null);
+            if (Agree(expected, actual)) { foreach (var c in items) partVerified[PartKey(c)] = true; return; }
+            if (items.Count == 1) { partVerified[PartKey(items[0])] = false; partMismatches.Add(items[0].Name2 + " (" + Path.GetFileName(items[0].GetPathName()) + ")"); return; }
+            check(items.Take(items.Count / 2).ToList());
+            check(items.Skip(items.Count / 2).ToList());
+        };
+        for (int i = 0; i < pending.Count; i += MassPropertyChunk) check(pending.Skip(i).Take(MassPropertyChunk).ToList());
+    }
+
+    // A part instance's mass properties in the Link frame: the center moves with the instance's pose,
+    // the inertia turns with it (R J R^T on the true tensor, whose products are minus SolidWorks' ones).
+    private static double[] PlacedPartMassProperties(double[] own, Matrix<double> partToLink)
+    {
+        var j = new double[9];
+        for (int i = 0; i < 9; i++) j[i] = (i % 4 == 0 ? 1 : -1) * own[4 + i];
+        var turned = new double[9];
+        for (int r = 0; r < 3; r++)
+            for (int s = 0; s < 3; s++)
+            {
+                double sum = 0;
+                for (int a = 0; a < 3; a++)
+                    for (int b = 0; b < 3; b++) sum += partToLink[r, a] * j[3 * a + b] * partToLink[s, b];
+                turned[3 * r + s] = (r == s ? 1 : -1) * sum;
+            }
+        var center = new double[3];
+        for (int r = 0; r < 3; r++) center[r] = partToLink[r, 0] * own[1] + partToLink[r, 1] * own[2] + partToLink[r, 2] * own[3] + partToLink[r, 3];
+        return new[] { own[0], center[0], center[1], center[2] }.Concat(turned).Concat(new[] { own[13] }).ToArray();
+    }
+
+    // A Link's mass properties from those of its part documents, each read once: the workstation repeats
+    // one pipette tip 1434 times, which SolidWorks weighed at 25 s per 100 instances. Sub-assemblies whose
+    // own mass properties are overridden (or may be), parts in a non-active configuration, scaled
+    // instances and anything unreadable are weighed by SolidWorks itself and combined with the rest.
+    // SW_URDF_MASS_METHOD=items weighs every Link by SolidWorks alone, for comparison.
+    private static double[] LinkMassProperties(ModelDoc2 model, List<Component2> components, MathTransform frame, Dictionary<string, bool?> flags)
+    {
+        if (System.Environment.GetEnvironmentVariable("SW_URDF_MASS_METHOD") == "items") return ComponentMassProperties(model, components, frame);
+        var toLink = frame == null ? DenseMatrix.CreateIdentity(4) : MathOps.GetTransformation(frame).Inverse();
+        var parts = new List<Component2>();
+        var weighed = new List<Component2>();
+        Action<Component2> add = null;
+        add = component => {
+            if (IsAssemblyComponent(component))
+            {
+                if (OwnOverride(component, flags) != false) { weighed.Add(component); return; }
+                foreach (Component2 child in component.GetChildren() as object[] ?? new object[0])
+                    if (!child.IsSuppressed() && !child.IsEnvelope()) add(child);
+                return;
+            }
+            var transform = component.Transform2;
+            var data = transform == null ? null : transform.ArrayData as double[];
+            if (PartMassProperties(component) == null || data == null || data.Length < 13 || Math.Abs(data[12] - 1) > 1e-12) weighed.Add(component);
+            else parts.Add(component);
+        };
+        foreach (var component in components) add(component);
+        VerifyPartDocuments(model, parts);
+        var contributions = new List<double[]>();
+        foreach (var part in parts)
+        {
+            if (partVerified.TryGetValue(PartKey(part), out bool verified) && verified) contributions.Add(PlacedPartMassProperties(PartMassProperties(part), toLink * MathOps.GetTransformation(part.Transform2)));
+            else weighed.Add(part);
+        }
+        if (weighed.Count != 0) contributions.Add(ComponentMassProperties(model, weighed, frame));
+        return CombineMassProperties(contributions);
+    }
+
+    // Mass properties of a union from those of its parts, all in one frame: masses and volumes add, the
+    // center of mass is the mass-weighted mean, and each moment of inertia moves from its own center of
+    // mass to the common one by the parallel-axis theorem. SolidWorks gives the products of inertia as
+    // +integral(x y dm) (the URDF writer negates them), so they move by +m dx dy, the moments by
+    // m (|d|^2 - dx^2) and so on.
+    internal static double[] CombineMassProperties(List<double[]> parts)
+    {
+        double mass = parts.Sum(p => p[0]);
+        var center = new double[3];
+        if (mass > 0) for (int k = 0; k < 3; k++) center[k] = parts.Sum(p => p[0] * p[1 + k]) / mass;
+        var moment = new double[9];
+        foreach (var p in parts)
+        {
+            var d = new[] { p[1] - center[0], p[2] - center[1], p[3] - center[2] };
+            double squared = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+            for (int r = 0; r < 3; r++)
+                for (int s = 0; s < 3; s++)
+                    moment[3 * r + s] += p[4 + 3 * r + s] + p[0] * (r == s ? squared - d[r] * d[r] : d[r] * d[s]);
+        }
+        return new[] { mass, center[0], center[1], center[2] }.Concat(moment).Concat(new[] { parts.Sum(p => p[13]) }).ToArray();
+    }
+
+    private static double[] ComponentMassPropertiesOnce(ModelDoc2 model, IEnumerable<Component2> components, MathTransform frame)
     {
         var extension = model.Extension;
         var mass = (IMassProperty2)extension.CreateMassProperty2();
@@ -785,9 +949,12 @@ public static partial class LegacyExportBridge
         collect = node => { if (!node.Link.isFixedFrame && node.Link.SWComponents.Count != 0) links.Add(node.Link); foreach (LinkNode child in node.Nodes) collect(child); };
         collect(root);
         SW2URDF.Headless.Progress.Stage("mass_properties", "Reading component mass properties of each Link...", links.Count);
-        var cad = links.ToDictionary(l => l, l => { SW2URDF.Headless.Progress.Step(l.Name); return ComponentMassProperties(model, l.SWComponents, helper.GetToolFrameTransform(l.Joint.CoordinateSystemName)); });
+        // Override flags of each document, read once (see OwnOverride).
+        var flags = new Dictionary<string, bool?>(StringComparer.OrdinalIgnoreCase);
+        var cad = links.ToDictionary(l => l, l => { SW2URDF.Headless.Progress.Step(l.Name); return LinkMassProperties(model, l.SWComponents, helper.GetToolFrameTransform(l.Joint.CoordinateSystemName), flags); });
         // Kept for the mesh check even if the transfer below stops.
         report["linkCadVolumes"] = cad.ToDictionary(item => item.Key.Name, item => (object)item.Value[13]);
+        report["partMassCheck"] = new Dictionary<string, object> { { "documents_verified", partVerified.Count(p => p.Value) }, { "documents_weighed_in_assembly", partMismatches } };
         var disagreeing = new List<string>();
         var overrides = new List<object>();
         // Instances of one part file and configuration share their masses; large links repeat the
@@ -801,6 +968,8 @@ public static partial class LegacyExportBridge
                 componentMasses[key] = known = new[] { ComponentMassProperties(model, new[] { c }, null)[0], GeometricMass(model, new[] { c }) };
             return known;
         };
+        // Weighing each component twice in the whole assembly costs seconds (14 minutes for 610 components);
+        // the override flags of each document are read once instead, and only flagged components are weighed.
         foreach (var link in links)
         {
             var values = cad[link];
@@ -812,7 +981,8 @@ public static partial class LegacyExportBridge
             }
             SW2URDF.Headless.Progress.Stage("mass_overrides", "Mass of " + link.Name + " differs from its geometry; checking its components for overrides...", link.SWComponents.Count);
             var components = link.SWComponents
-                .Select(c => { SW2URDF.Headless.Progress.Step(c.Name2); var known = massesOf(c); return new { name = c.Name2, cad = known[0], geometric = known[1] }; })
+                .Where(c => { SW2URDF.Headless.Progress.Step(c.Name2); return MayCarryOverride(c, flags); })
+                .Select(c => { var known = massesOf(c); return new { name = c.Name2, cad = known[0], geometric = known[1] }; })
                 .Where(c => !Close(c.cad, c.geometric, 1e-5, 1e-12))
                 .Select(c => new Dictionary<string, object> { { "component", c.name }, { "cad_mass_kg", c.cad }, { "geometric_mass_kg", c.geometric } }).ToList();
             overrides.Add(new Dictionary<string, object> { { "link", link.Name }, { "cad_mass_kg", values[0] }, { "geometric_mass_kg", link.Inertial.Mass.Value }, { "components", components } });
@@ -837,6 +1007,45 @@ public static partial class LegacyExportBridge
         }
         report["exporterInertia"] = exporterInertia;
         report["massPropertiesSource"] = "components";
+    }
+
+    // Whether the mass properties of a document (for the configuration a component uses) are overridden;
+    // null when that configuration is not the document's active one, which the flags would not describe.
+    private static bool? OwnOverride(Component2 component, Dictionary<string, bool?> flags)
+    {
+        string key = component.GetPathName() + "|" + component.ReferencedConfiguration;
+        bool? flag;
+        if (flags.TryGetValue(key, out flag)) return flag;
+        flag = null;
+        try
+        {
+            var document = component.GetModelDoc2() as ModelDoc2;
+            var active = document == null ? null : document.ConfigurationManager.ActiveConfiguration;
+            if (active != null && string.Equals(active.Name, component.ReferencedConfiguration, StringComparison.Ordinal))
+            {
+                var extension = document.Extension;
+                var mass = extension.CreateMassProperty2() as IMassProperty2;
+                var options = mass == null ? null : mass.GetOverrideOptions() as IMassPropertyOverrideOptions;
+                if (options != null) flag = options.OverrideMass || options.OverrideCenterOfMass || options.OverrideMomentsOfInertia;
+                if (options != null) Marshal.ReleaseComObject(options);
+                if (mass != null) Marshal.ReleaseComObject(mass);
+                Marshal.ReleaseComObject(extension);
+            }
+        }
+        // Flags that cannot be read leave the component to be weighed as before.
+        catch (Exception e) when (e is COMException || e is NullReferenceException || e is InvalidCastException) { flag = null; }
+        flags[key] = flag;
+        return flag;
+    }
+
+    // A component whose own document or any document below it overrides its mass properties, or that
+    // cannot be ruled out (a component in a non-active configuration); the others weigh what their geometry does.
+    private static bool MayCarryOverride(Component2 component, Dictionary<string, bool?> flags)
+    {
+        if (OwnOverride(component, flags) != false) return true;
+        foreach (Component2 child in component.GetChildren() as object[] ?? new object[0])
+            if (!child.IsSuppressed() && !child.IsEnvelope() && MayCarryOverride(child, flags)) return true;
+        return false;
     }
 
     private static bool IsAssemblyComponent(Component2 component)
@@ -887,9 +1096,15 @@ public static partial class LegacyExportBridge
 
     // Solid bodies hidden inside a part (e.g. the source body a Mirror feature kept): mass properties
     // include them, the STL does not, so they explain a mesh smaller than the CAD volume.
+    // Hidden bodies belong to the part document, so instances of one file and configuration share them.
+    private static readonly Dictionary<string, List<Dictionary<string, object>>> hiddenBodiesByDocument = new Dictionary<string, List<Dictionary<string, object>>>(StringComparer.OrdinalIgnoreCase);
+
     private static List<Dictionary<string, object>> HiddenBodies(Component2 part)
     {
-        var rows = new List<Dictionary<string, object>>();
+        string key = part.GetPathName() + "|" + part.ReferencedConfiguration;
+        List<Dictionary<string, object>> known;
+        if (hiddenBodiesByDocument.TryGetValue(key, out known)) return known;
+        var rows = hiddenBodiesByDocument[key] = new List<Dictionary<string, object>>();
         object info;
         foreach (Body2 body in part.GetBodies3((int)swBodyType_e.swSolidBody, out info) as object[] ?? new object[0])
         {
@@ -943,11 +1158,109 @@ public static partial class LegacyExportBridge
                 links[link.Name] = new Dictionary<string, object> {
                     { "cad_volume_m3", volume },
                     { "frame_to_assembly", frame == null ? null : Enumerable.Range(0, 4).Select(r => Enumerable.Range(0, 4).Select(c => frame[r, c]).ToArray()).ToArray() },
-                    { "components", components } };
+                    { "components", components },
+                    { "mesh_key", SafeMeshKey(model, link, volume) } };
+                string[] keyRows;
+                if (meshKeyRows.TryGetValue(link.Name, out keyRows)) ((Dictionary<string, object>)links[link.Name])["mesh_key_rows"] = keyRows;
             }
             foreach (LinkNode child in node.Nodes) visit(child);
         };
         visit(root);
         return links;
+    }
+
+    // Raise when the way a Link's STL is made changes, so that no older mesh is reused.
+    private const string MeshExportRevision = "2"; // 2: every part of a listed sub-assembly is shown
+    private static readonly Dictionary<string, string> partFileHashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    private static string documentBox;
+
+    // What a Link's STL depends on, its frame aside: the bytes and configuration of every part shown for
+    // it and where each sits in the assembly, its mesh quality, the size of the whole document (SolidWorks
+    // derives the coarse and fine tolerances from it) and the Link's CAD volume, which also changes with
+    // features cut in an assembly. Null when any of it cannot be read.
+    private static string MeshKey(ModelDoc2 model, Link link, object volume)
+    {
+        if (!(volume is double)) return null;
+        if (documentBox == null)
+        {
+            var box = ((AssemblyDoc)model).GetBox(0) as double[];
+            if (box == null) return null;
+            documentBox = string.Join(",", box.Select(v => v.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture)));
+        }
+        var rows = new List<string>();
+        foreach (var part in SW2URDF.Headless.Visibility.WithParts(link.SWComponents).Where(c => !IsAssemblyComponent(c)))
+        {
+            string path = part.GetPathName();
+            string hash;
+            if (IsInterconnectCache(path) || IsVirtualComponent(path) || string.IsNullOrEmpty(path) || !File.Exists(path))
+            {
+                // Imported (3D Interconnect) and virtual parts live in files SolidWorks writes anew in each
+                // session; their geometry stands in for the file: the document's mass properties and the
+                // instance's box. Without them the Link is exported again.
+                var own = PartMassProperties(part);
+                var box = BoxOf(part);
+                if (own == null || box == null) return null;
+                // Nine significant digits: these numbers vary from session to session in their last digits,
+                // and with hundreds of imported parts some value would cross a finer rounding every run.
+                hash = "geometry:" + string.Join(",", own.Concat(box.SelectMany(b => b)).Select(v => (Math.Abs(v) < 1e-15 ? 0 : v).ToString("G9", System.Globalization.CultureInfo.InvariantCulture)));
+            }
+            else if (!partFileHashes.TryGetValue(path, out hash)) partFileHashes[path] = hash = HashFile(path);
+            var transform = part.Transform2;
+            var data = transform == null ? null : transform.ArrayData as double[];
+            if (data == null) return null;
+            rows.Add(hash + "|" + part.ReferencedConfiguration + "|" + string.Join(",", data.Take(13).Select(v => (Math.Abs(v) < 5e-10 ? 0 : v).ToString("0.000000000", System.Globalization.CultureInfo.InvariantCulture))));
+        }
+        rows.Sort(StringComparer.Ordinal);
+        rows.Insert(0, "mesh " + MeshExportRevision + "|" + (link.STLQualityFine ? "fine" : "coarse") + "|" + documentBox + "|" + ((double)volume).ToString("G9", System.Globalization.CultureInfo.InvariantCulture));
+        // A short digest of each line, so that two exports can be compared when a mesh was not reused.
+        meshKeyRows[link.Name] = rows.Select(r => Digest(r).Substring(0, 12)).ToArray();
+        return Digest(string.Join("\n", rows));
+    }
+
+    private static readonly Dictionary<string, string[]> meshKeyRows = new Dictionary<string, string[]>();
+
+    private static string Digest(string text)
+    {
+        using (var sha = SHA256.Create())
+            return BitConverter.ToString(sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(text))).Replace("-", "").ToLowerInvariant();
+    }
+
+    // Without a key the Link is simply exported again.
+    private static string SafeMeshKey(ModelDoc2 model, Link link, object volume)
+    {
+        try { return MeshKey(model, link, volume); }
+        catch (Exception e) when (e is COMException || e is IOException || e is UnauthorizedAccessException) { return null; }
+    }
+
+    private static double[] Flatten(object value)
+    {
+        var numbers = new List<double>();
+        foreach (object item in (IEnumerable)value)
+        {
+            if (item is IEnumerable && !(item is string)) numbers.AddRange(Flatten(item));
+            else numbers.Add(Convert.ToDouble(item, System.Globalization.CultureInfo.InvariantCulture));
+        }
+        return numbers.ToArray();
+    }
+
+    // Meshes of earlier passed exports with the same key (request.mesh_reuse: key -> stl, sha256,
+    // frame_to_assembly, job_id) are copied instead of exported; TryReuse checks each file again.
+    private static void PlanMeshReuse(Dictionary<string, object> request, Dictionary<string, object> report)
+    {
+        object found;
+        if (request == null || !request.TryGetValue("mesh_reuse", out found) || !report.ContainsKey("linkGeometry")) return;
+        var candidates = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue }.Deserialize<Dictionary<string, Dictionary<string, object>>>(File.ReadAllText(Convert.ToString(found)));
+        var planned = new Dictionary<string, object>();
+        foreach (var item in (Dictionary<string, object>)report["linkGeometry"])
+        {
+            var row = (Dictionary<string, object>)item.Value;
+            Dictionary<string, object> candidate;
+            if (row["mesh_key"] == null || row["frame_to_assembly"] == null || !candidates.TryGetValue((string)row["mesh_key"], out candidate)) continue;
+            SW2URDF.Headless.Meshes.Reuse[item.Key] = new SW2URDF.Headless.Meshes.Plan {
+                Source = Convert.ToString(candidate["stl"]), Sha256 = Convert.ToString(candidate["sha256"]), Job = Convert.ToString(candidate["job_id"]),
+                FromFrame = Flatten(candidate["frame_to_assembly"]), ToFrame = Flatten(row["frame_to_assembly"]) };
+            planned[item.Key] = candidate["job_id"];
+        }
+        report["meshReusePlanned"] = planned;
     }
 }

@@ -81,7 +81,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-tool.ps1
 .\.venv\Scripts\python.exe scripts\tool_cli.py validate-urdf "C:\new\urdf\robot.urdf" --reference "C:\old\urdf\robot.urdf"
 ```
 
-CAD 命令都接受 --timeout（总时长上限，默认 14400 秒）、--stall-timeout（默认 900 秒，见下文）和 --use-saved-files。check、export 和 start-export 还接受 --accept-source-change、--kinematics-tolerance-mm、--kinematics-tolerance-deg、--write-config-source 和 --recompute-preflight，export/start-export 另接受 --no-compare-previous（见下文“CAD 版本与上一次导出”）。
+CAD 命令都接受 --timeout（总时长上限，默认 14400 秒）、--stall-timeout（默认 900 秒，见下文）和 --use-saved-files。check、export 和 start-export 还接受 --accept-source-change、--kinematics-tolerance-mm、--kinematics-tolerance-deg、--write-config-source 和 --recompute-preflight，export/start-export 另接受 --no-compare-previous（见下文“CAD 版本与上一次导出”）和 --no-reuse-meshes（见下文“复用网格”）。
 
 每次操作生成 validation/jobs/<job_id>/。result.json 记录状态、原文件 SHA-256、设置恢复、物理校验和错误；stdout.log/stderr.log 保留原生日志。status=succeeded 且 passed=true 才表示该操作所有检查通过。queued/running 和“已生成部分文件”均不能视为成功。
 
@@ -97,6 +97,8 @@ CAD 命令都接受 --timeout（总时长上限，默认 14400 秒）、--stall-
 - **复用准备好的副本。** 每次跑过 Pack and Go 的 inspect、prepare、check 或 export 都会返回 reusable_model：一份自包含的 CAD 副本，附带文件哈希清单；只要副本没被改动，导出失败后同样可用。下次把它作为模型路径传入：工具核对哈希、复制文件夹后直接打开，跳过只读打开原模型和 Pack and Go。
 - **进度。** job / get_export_job 返回 progress：当前阶段（如 export_meshes）、摘要（如 “Exporting STL meshes: 7/18 (gripper_z)”）、步数、已用时间、本阶段用时、SolidWorks CPU 时间、距上次有活动的 idle_seconds，以及最后几行日志。stderr.log 带时间戳。
 - 失败时 error.stage 写明出错的阶段。
+- **复用网格。** 导出通过后，任务目录里的 mesh-keys.json 记下每个 Link 网格的几何指纹：显示出的每个零件文件的哈希和配置、它在装配体中的位姿、网格质量、整个文档的尺寸（SolidWorks 据此决定粗/细网格的公差）以及该 Link 的 CAD 体积（装配体特征切除也会改变它）。以后的导出中指纹相同的 Link 直接复用那个 STL，只改了关节原点时把它刚性移到新的 Link 坐标系，不再显示组件、重新网格化；复用的网格同样经过与 CAD 的几何一致性检查，列在 reused_meshes 中。--no-reuse-meshes（reuse_meshes=false）关闭复用。
+- **大装配体的耗时。** SolidWorks 逐个追加选择组件的耗时与已选数量成正比（800 个零件 194 秒），导出、关节重算的固定/解除固定和显示/隐藏现在一次性选择（0.9 秒）。读取组件质量属性的耗时同样随组件数增长很快（800 个零件 106 秒，1434 个相同吸头每 100 个 25 秒），现在每个零件文件只在它自己的文档里读一次质量属性（含零件中的覆盖值和隐藏实体），按每个实例在 Link 坐标系中的位姿转动、平移后用平行轴定理精确合并；每个文件先用一个实例与 SolidWorks 在装配体中称得的结果比对（例如在装配体中给组件指定了材料时两者不同），不一致的文件、装配体级覆盖和未激活配置的组件仍由 SolidWorks 称重（结果中的 bridge.partMassCheck）。质量覆盖改为每个文档读一次覆盖标志，只对有覆盖的组件再称重。
 
 ### CAD 版本与上一次导出
 
@@ -139,7 +141,7 @@ from tool_service import inspect_model, check_configuration, export_urdf, start_
 
 result = export_urdf(r"C:\path\robot.SLDASM", "robot_description")
 # config_path / reference_urdf / timeout_seconds / stall_timeout_seconds / use_saved_files 以及
-# accept_source_change / kinematics_tolerance_mm / kinematics_tolerance_deg / compare_previous / write_config_source / recompute_preflight 只能按关键字传入
+# accept_source_change / kinematics_tolerance_mm / kinematics_tolerance_deg / compare_previous / write_config_source / recompute_preflight / reuse_meshes 只能按关键字传入
 check = check_configuration(r"C:\path\robot.SLDASM", r"C:\path\robot-config.json")
 result = export_urdf(check.get("reusable_model") or r"C:\path\robot.SLDASM", "robot_description", config_path=r"C:\path\robot-config.json")
 assert result["passed"], result.get("error")
@@ -150,7 +152,7 @@ print(result["bridge"]["urdf"])
 
 本机已注册 solidworks_urdf_2026，启动程序为工作区 Python，服务脚本为 scripts/mcp_server.py；其他 stdio 客户端可参考 mcp-connection.example.json，把 <REPO_ROOT> 换成本仓库路径。启动超时 60 秒，工具超时 1200 秒。Codex 配置仅新增此服务；其他服务器和安全设置保留。
 
-9 个工具：inspect_solidworks、inspect_model_configuration、prepare_model、validate_configuration、export_urdf、start_urdf_export、get_export_job、cancel_export_job、validate_urdf。export_urdf 和 start_urdf_export 接受 check_only、use_saved_files、timeout_seconds、stall_timeout_seconds、compare_previous（默认 true）、accept_source_change、kinematics_tolerance_mm、kinematics_tolerance_deg（默认均为 0.1）、write_config_source 和 recompute_preflight；validate_configuration 可选 model_path，用于检查 CAD 版本。大型模型优先使用 start_urdf_export，再带 wait_seconds（例如 300）调用 get_export_job：调用会等任务结束，一到终态立即返回，客户端既不需要 shell sleep，也不用频繁轮询。validate_urdf 可校验本机任意位置的 URDF，并可选 reference_urdf。
+9 个工具：inspect_solidworks、inspect_model_configuration、prepare_model、validate_configuration、export_urdf、start_urdf_export、get_export_job、cancel_export_job、validate_urdf。export_urdf 和 start_urdf_export 接受 check_only、use_saved_files、timeout_seconds、stall_timeout_seconds、compare_previous（默认 true）、accept_source_change、kinematics_tolerance_mm、kinematics_tolerance_deg（默认均为 0.1）、write_config_source、recompute_preflight 和 reuse_meshes（默认 true）；validate_configuration 可选 model_path，用于检查 CAD 版本。大型模型优先使用 start_urdf_export，再带 wait_seconds（例如 300）调用 get_export_job：调用会等任务结束，一到终态立即返回，客户端既不需要 shell sleep，也不用频繁轮询。validate_urdf 可校验本机任意位置的 URDF，并可选 reference_urdf。
 
 阻塞式工具（export_urdf、inspect_model_configuration、prepare_model）同样在后台任务中运行，最多等待 1000 秒（环境变量 SW_URDF_SYNC_WAIT_SECONDS 可调，应小于客户端工具超时）。届时未完成会返回 still_running=true 和 job_id，任务继续执行，用 get_export_job 查询即可。
 
@@ -164,7 +166,7 @@ Codex 客户端需要重新加载 MCP 配置后才会把新服务加入当前工
 
 若该装配体已保存且正在 SolidWorks 中打开，工具另外读取只读活动模型清单，要求快照的配置名、组件数和原生质量与之一致。打开的模型有未保存修改时，任务以 UNSAVED_CHANGES 失败：请在 SolidWorks 中保存，或关闭且不保存，然后重跑；也可以加 use_saved_files=true（CLI：--use-saved-files），按磁盘上已保存的文件导出、忽略未保存修改，结果的 warnings 会注明这一点。
 
-操作串行执行，避免多个导出相互覆盖全局 STL 设置：后到的任务保持 queued（result.json 中 queue=waiting_for_cad_lock）最多 3600 秒，超时返回 CAD_BUSY；不保证先到先得。执行进程会登记 PID 与启动时间，进程消失或 120 秒内未登记的任务由 get_export_job 标记为 interrupted。运行中的任务在“卡住”时才会被停止：工具进程和其 SolidWorks 进程在 stall_timeout_seconds（默认 900 秒）内既没有进度更新，也没有 CPU 时间增长（单个大 STL 等长步骤期间 SolidWorks 一直在算，不算卡住）。timeout_seconds（默认 14400 秒）只是总时长硬上限。卡住以 error.code=CAD_STALLED、超出上限以 CAD_TIMEOUT 结束，status 均为 timed_out，消息中写明所处阶段。cancel / cancel_export_job 可停止排队中或运行中的任务（status=cancelled）。无论哪种情况，都会核对 PID+启动时间后清理独立会话，并按下文恢复 STL 设置；不能把 timed_out/interrupted/cancelled 的输出用于正式模型。
+操作串行执行，避免多个导出相互覆盖全局 STL 设置：后到的任务保持 queued（result.json 中 queue=waiting_for_cad_lock）最多 3600 秒，超时返回 CAD_BUSY；不保证先到先得。执行进程会登记 PID 与启动时间，进程消失或 120 秒内未登记的任务由 get_export_job 标记为 interrupted。运行中的任务在“卡住”时才会被停止：工具进程和其 SolidWorks 进程在 stall_timeout_seconds（默认 900 秒）内既没有进度更新，也没有 CPU 时间增长（单个大 STL 等长步骤期间 SolidWorks 一直在算，不算卡住）。timeout_seconds（默认 14400 秒）只是总时长硬上限。原导出器自己的日志（bridge-export.log）增长也算有活动。工作进程被暂停（睡眠、待机、机器卡死）后恢复时，暂停的时间不计入空闲时间，记录在 result.json 的 paused_seconds 和 pauses 中。卡住以 error.code=CAD_STALLED、超出上限以 CAD_TIMEOUT 结束，status 均为 timed_out，消息中写明所处阶段。cancel / cancel_export_job 可停止排队中或运行中的任务（status=cancelled）。无论哪种情况，都会核对 PID+启动时间后清理独立会话，并按下文恢复 STL 设置；不能把 timed_out/interrupted/cancelled 的输出用于正式模型。
 
 私有会话与本机 SolidWorks 共用用户设置。原生核心启动后立即把 STL 相关设置保存到 output/preferences-snapshot.json；任务超时或失败而未确认恢复时，工具会另起私有会话把设置恢复为该快照，结果写入 result.json 的 preference_restore（changed_keys 为实际改回的项）。worker 意外退出的任务由 get_export_job 标记为待恢复，在下一个 CAD 任务开始前执行。
 
