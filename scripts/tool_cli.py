@@ -3,7 +3,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from tool_service import DEFAULT_STALL_SECONDS, DEFAULT_TIMEOUT_SECONDS, TERMINAL, cancel_job, operation, run_job, source_status, start_job, wait_job
+from tool_service import cleanup_jobs, DEFAULT_STALL_SECONDS, DEFAULT_TIMEOUT_SECONDS, TERMINAL, cancel_job, operation, run_job, source_status, start_job, wait_job
 from configuration import validate_config
 from provenance import DEFAULT_TOLERANCE_DEG, DEFAULT_TOLERANCE_MM
 from validate_export import validate
@@ -31,6 +31,7 @@ def main():
             command.add_argument("--package", default="robot_description")
             command.add_argument("--reference", help="URDF the export must match (differences fail)")
             command.add_argument("--no-compare-previous", action="store_true", help="do not compare with the previous successful export of the same model or package")
+            command.add_argument("--publish-to", help="after a passed export, copy the URDF package and export config/request/result into this robot twin directory (old files go to export/history)")
             command.add_argument("--no-reuse-meshes", action="store_true", help="export every Link mesh again, even where an earlier passed export already meshed the same geometry")
         if name == "start-export":
             command.add_argument("--check-only", action="store_true", help="stop after the joints and Link frames")
@@ -40,6 +41,13 @@ def main():
     cancel = commands.add_parser("cancel")
     cancel.add_argument("job_id")
     commands.add_parser("worker").add_argument("job_id")
+    clean = commands.add_parser("cleanup-jobs", help="delete the CAD snapshots of old finished jobs (lists only, unless --delete)")
+    clean.add_argument("--older-than-days", type=float)
+    clean.add_argument("--keep-latest", type=int, help="keep the snapshots of this many newest jobs per model and package")
+    clean.add_argument("--job", action="append", dest="job_ids", help="clean exactly this job (repeatable)")
+    clean.add_argument("--include-logs", action="store_true", help="also delete stdout/stderr logs")
+    clean.add_argument("--no-keep-latest-success", action="store_true", help="also clean the newest succeeded export of a model")
+    clean.add_argument("--delete", action="store_true", help="delete; without it this is a dry run")
     config = commands.add_parser("validate-config")
     config.add_argument("config")
     config.add_argument("--model", help="also report whether the configuration was made for this model's current CAD version (reads files only)")
@@ -56,7 +64,7 @@ def main():
                                kinematics_tolerance_deg=arguments.kinematics_tolerance_deg, write_config_source=arguments.write_config_source,
                                recompute_preflight=arguments.recompute_preflight)
             if arguments.command in {"export", "start-export"} and not getattr(arguments, "check_only", False):
-                options.update(reference_urdf=arguments.reference, compare_previous=not arguments.no_compare_previous, reuse_meshes=not arguments.no_reuse_meshes)
+                options.update(reference_urdf=arguments.reference, compare_previous=not arguments.no_compare_previous, reuse_meshes=not arguments.no_reuse_meshes, publish_to=arguments.publish_to)
             name = "check" if arguments.command == "check" or getattr(arguments, "check_only", False) else "export" if arguments.command == "start-export" else arguments.command
             package = getattr(arguments, "package", "robot_description")
             result = start_job(name, arguments.model, package, **options) if arguments.command == "start-export" else operation(name, arguments.model, package, **options)
@@ -64,6 +72,9 @@ def main():
             result = wait_job(arguments.job_id, arguments.wait)
         elif arguments.command == "cancel":
             result = cancel_job(arguments.job_id)
+        elif arguments.command == "cleanup-jobs":
+            result = cleanup_jobs(arguments.older_than_days, arguments.keep_latest, not arguments.delete, arguments.include_logs, not arguments.no_keep_latest_success, arguments.job_ids)
+            result["passed"] = not any(c.get("errors") for c in result["cleaned"])
         elif arguments.command == "worker":
             result = run_job(arguments.job_id)
         elif arguments.command == "validate-urdf":
