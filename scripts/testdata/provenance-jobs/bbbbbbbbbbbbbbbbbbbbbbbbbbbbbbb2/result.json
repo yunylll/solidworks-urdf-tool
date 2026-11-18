@@ -1,0 +1,15 @@
+{
+  "job_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2",
+  "operation": "export",
+  "status": "succeeded",
+  "passed": true,
+  "created_at": "2026-10-22T08:10:00+00:00",
+  "started_at": "2026-10-22T08:10:00+00:00",
+  "finished_at": "2026-10-22T08:10:30+00:00",
+  "source_model_sha256": "000000000000000000000000000000000000000000000000000000000000000b",
+  "reference_urdf": null,
+  "warnings": [],
+  "bridge": {
+    "urdf": "C:\\Users\\someone\\solidworks_urdf_tool\\validation\\jobs\\bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2\\output\\demo_description\\urdf\\demo_description.urdf"
+  }
+}

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import ctypes
 from ctypes import wintypes
 import hashlib
@@ -131,7 +131,28 @@ def write_json(path: Path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    temporary.replace(path)
+    # On Windows the replace fails while a reader has the target open (describe_progress, a stat of the
+    # activity monitor, a client polling the job); such holds last milliseconds, so retry briefly.
+    for attempt in range(REPLACE_ATTEMPTS):
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError:
+            if attempt == REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(0.02 * (attempt + 1))
+
+
+REPLACE_ATTEMPTS = 25
+
+
+def _file_signature(path: Path):
+    """mtime and size of a file, or None; a file being replaced right now reads as absent this round."""
+    try:
+        info = path.stat()
+    except (FileNotFoundError, PermissionError):
+        return None
+    return (info.st_mtime_ns, info.st_size)
 
 
 def read_json(path: Path, default=None):
@@ -141,8 +162,9 @@ def read_json(path: Path, default=None):
             return json.loads(path.read_text(encoding="utf-8-sig"))
         except FileNotFoundError:
             return default
-        except (PermissionError, json.JSONDecodeError):
+        except (PermissionError, json.JSONDecodeError, UnicodeDecodeError):
             time.sleep(0.1)
+    return default
     return default
 
 
@@ -396,7 +418,7 @@ class ActivityMonitor:
             self.sample_cpu = self.cpu_seconds()
         # The original exporter's own log keeps growing through its long steps (fixing components for
         # joint recomputation, for minutes) while the progress file names only the stage.
-        signature = tuple((p.stat().st_mtime_ns, p.stat().st_size) if p.is_file() else None for p in (self.output / "progress.json", self.output.parent / "stderr.log", self.output / "bridge-export.log"))
+        signature = tuple(_file_signature(p) for p in (self.output / "progress.json", self.output.parent / "stderr.log", self.output / "bridge-export.log"))
         if signature != self.last_signature:
             self.last_signature = signature
             self.last_activity = now
@@ -408,6 +430,69 @@ class ActivityMonitor:
             self.sample_started, self.sample_cpu, self.cpu_total = now, cpu, cpu
             write_json(self.directory / "activity.json", {"sampled_at": stamp(), "cpu_seconds": round(cpu, 1), "idle_seconds": round(now - self.last_activity, 1), "paused_seconds": round(self.suspended_seconds, 1), "pauses": self.suspensions[-20:]})
         return now - self.last_activity
+
+
+STAGE_LINE = re.compile(r"^\[(\d{2}):(\d{2}):(\d{2})\] (\S.*?)\s*$")
+
+
+def stage_durations(log_text, started_at, finished_at, pauses=()):
+    """Stages of a native run with their lengths, from the "[HH:MM:SS] message" lines of its stderr.log.
+
+    The native tool stamps lines with the local wall clock and no date, so each stamp is placed on the
+    first moment at or after the previous one (a run past midnight rolls to the next day). Step lines
+    ("[..]   3/18 link") are indented and are not stages. Time the computer was paused (from ``pauses``,
+    each {"resumed_at", "seconds"}) is subtracted from the stage it fell in and reported separately.
+    """
+    begin = datetime.fromisoformat(started_at).astimezone()
+    end = datetime.fromisoformat(finished_at).astimezone()
+    marks, previous = [], begin.replace(microsecond=0)
+    for line in log_text.splitlines():
+        match = STAGE_LINE.match(line)
+        if not match:
+            continue
+        hour, minute, second = (int(match.group(i)) for i in (1, 2, 3))
+        if hour > 23 or minute > 59 or second > 59:
+            continue
+        moment = previous.replace(hour=hour, minute=minute, second=second)
+        while moment < previous:
+            moment += timedelta(days=1)
+        previous = moment
+        name = re.sub(r"\s*\(\d+\)$", "", match.group(4)).rstrip(".").rstrip()
+        marks.append((name, moment))
+    intervals = []
+    for pause in pauses or ():
+        try:
+            resumed = datetime.fromisoformat(pause["resumed_at"]).astimezone()
+            intervals.append((resumed - timedelta(seconds=float(pause["seconds"])), resumed))
+        except (KeyError, TypeError, ValueError):
+            continue
+    stages = []
+    for index, (name, start) in enumerate(marks):
+        stop = marks[index + 1][1] if index + 1 < len(marks) else max(end, start)
+        paused = sum(max(0.0, (min(stop, b) - max(start, a)).total_seconds()) for a, b in intervals)
+        wall = (stop - start).total_seconds()
+        entry = {"stage": name, "started_at": start.isoformat(), "seconds": round(max(0.0, wall - paused), 1)}
+        if paused:
+            entry["paused_seconds"] = round(paused, 1)
+        stages.append(entry)
+    return stages
+
+
+def job_timing(directory, record):
+    """started_at, finished_at, duration_seconds and stage_durations for a finished job record."""
+    finished = record.get("finished_at") or stamp()
+    started = record.get("started_at") or record.get("created_at") or finished
+    paused = float(record.get("paused_seconds") or 0)
+    wall = (datetime.fromisoformat(finished) - datetime.fromisoformat(started)).total_seconds()
+    timing = {"started_at": started, "finished_at": finished, "duration_seconds": round(max(0.0, wall - paused), 1)}
+    if paused:
+        timing["duration_note"] = f"duration_seconds and stage_durations exclude {paused:g} s while the computer or this worker was paused (see pauses)"
+    try:
+        log = (directory / "stderr.log").read_text(encoding="utf-8", errors="replace")
+    except (FileNotFoundError, PermissionError):
+        log = ""
+    timing["stage_durations"] = stage_durations(log, started, finished, record.get("pauses"))
+    return timing
 
 
 def describe_progress(directory, record):
@@ -434,8 +519,10 @@ def describe_progress(directory, record):
         progress["cad_cpu_seconds"] = activity["cpu_seconds"]
         progress["idle_seconds"] = round(activity["idle_seconds"] + seconds_since(activity["sampled_at"]), 1)
     log = (directory / output_name).parent / "stderr.log"
-    if log.is_file():
+    try:
         progress["log_tail"] = log.read_text(encoding="utf-8", errors="replace").splitlines()[-5:]
+    except (FileNotFoundError, PermissionError):
+        pass
     return progress
 
 
@@ -879,6 +966,7 @@ def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
     finally:
         record.pop("phase", None)
         record["finished_at"] = stamp()
+        record.update(job_timing(directory, record))
         write_json(directory / "result.json", record)
     return record
 
