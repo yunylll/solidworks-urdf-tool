@@ -15,6 +15,21 @@ from tool_service import CadBusyError, get_job, native_lock, process_identity, w
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# These tests create jobs but never run the native tool (they cancel them first or feed a stand-in), so
+# they need no build: without build\bin an empty placeholder passes create_job's check (as on CI).
+_unbuilt = tempfile.TemporaryDirectory() if not tool_service.NATIVE.is_file() else None
+
+
+def setUpModule():
+    if _unbuilt:
+        tool_service.NATIVE = Path(_unbuilt.name) / tool_service.NATIVE.name
+        tool_service.NATIVE.touch()
+
+
+def tearDownModule():
+    if _unbuilt:
+        _unbuilt.cleanup()
+
 
 class JobChecks(unittest.TestCase):
     def setUp(self):

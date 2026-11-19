@@ -48,6 +48,21 @@ JOINT_COUNT, MESH_COUNT = PRIVATE.get("joint_count", 0), PRIVATE.get("mesh_count
 ARM = ROOT / "vendor" / "solidworks_urdf_exporter" / "examples" / "3_DOF_ARM" / "3_DOF_ARM_description"
 HAVE_JOBS = all((JOBS_DATA / job / "result.json").is_file() for job in (OLD_JOB, NEW_JOB))
 
+# These tests create jobs but never run the native tool (they cancel them first or feed a stand-in), so
+# they need no build: without build\bin an empty placeholder passes create_job's check (as on CI).
+_unbuilt = tempfile.TemporaryDirectory() if not tool_service.NATIVE.is_file() else None
+
+
+def setUpModule():
+    if _unbuilt:
+        tool_service.NATIVE = Path(_unbuilt.name) / tool_service.NATIVE.name
+        tool_service.NATIVE.touch()
+
+
+def tearDownModule():
+    if _unbuilt:
+        _unbuilt.cleanup()
+
 
 def job_file(job, *parts):
     return JOBS_DATA / job / Path(*parts)
