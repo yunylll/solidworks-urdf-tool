@@ -1,0 +1,28 @@
+{
+  "links": [
+    {
+      "name": "base_link",
+      "parent": null
+    },
+    {
+      "name": "arm_link",
+      "parent": "base_link",
+      "coordinate_system": "Origin_arm",
+      "joint": {
+        "name": "arm_joint",
+        "type": "revolute",
+        "xyz": [
+          0.1,
+          0.0,
+          0.2
+        ],
+        "rpy": [
+          0,
+          0,
+          0
+        ]
+      }
+    }
+  ],
+  "recompute_kinematics": false
+}

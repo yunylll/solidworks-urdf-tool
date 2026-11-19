@@ -147,6 +147,67 @@ class RealJobs(unittest.TestCase):
         self.assertIn("Unchanged: gantry_x_joint", provenance.describe_differences(comparison))
 
 
+SYNTHETIC_JOBS = Path(__file__).resolve().parent / "testdata" / "provenance-jobs"
+SYNTHETIC_OLD, SYNTHETIC_NEW = "a" * 31 + "1", "b" * 31 + "2"
+
+
+class SyntheticJobs(unittest.TestCase):
+    """The record-lookup assertions of RealJobs on a small synthetic pair of jobs, so they run on any computer.
+
+    Like the real records, these were written on another computer: every absolute path in them names
+    nothing here, and the files are found inside the copied job folders.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.jobs = Path(tempfile.mkdtemp())
+        shutil.copytree(SYNTHETIC_JOBS, cls.jobs, dirs_exist_ok=True)
+        cls.new_record = read(cls.jobs / SYNTHETIC_NEW / "result.json")
+        cls.new_request = read(cls.jobs / SYNTHETIC_NEW / "request.json")
+        cls.new_config = read(cls.jobs / SYNTHETIC_NEW / "robot-config.json")
+        cls.old_sha = read(cls.jobs / SYNTHETIC_OLD / "result.json")["source_model_sha256"]
+        cls.new_sha = cls.new_record["source_model_sha256"]
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.jobs, ignore_errors=True)
+
+    def test_recorded_paths_are_from_another_computer(self):
+        self.assertFalse(Path(self.new_request["model_path"]).exists())
+        self.assertFalse(Path(read(self.jobs / SYNTHETIC_OLD / "result.json")["bridge"]["urdf"]).exists())
+
+    def test_previous_export_is_found(self):
+        previous = provenance.previous_export(self.new_request["model_path"], "demo_description", self.jobs, before=self.new_record["created_at"], exclude=SYNTHETIC_NEW)
+        self.assertEqual(previous["matched_by"], "model_path")
+        self.assertEqual(previous["job_id"], SYNTHETIC_OLD)
+        self.assertEqual(previous["model_sha256"], self.old_sha)
+        self.assertTrue(Path(previous["urdf"]).is_file())
+        self.assertTrue(provenance.same_path(previous["urdf"], self.jobs / SYNTHETIC_OLD / "output" / "demo_description" / "urdf" / "demo_description.urdf"))
+
+    def test_previous_export_by_package_name(self):
+        previous = provenance.previous_export(r"D:\elsewhere\other.SLDASM", "demo_description", self.jobs, exclude=SYNTHETIC_NEW)
+        self.assertEqual((previous["matched_by"], previous["job_id"]), ("package_name", SYNTHETIC_OLD))
+
+    def test_no_previous_export_when_its_urdf_is_gone(self):
+        jobs = Path(tempfile.mkdtemp())
+        try:
+            shutil.copytree(self.jobs, jobs, dirs_exist_ok=True)
+            (jobs / SYNTHETIC_OLD / "output" / "demo_description" / "urdf" / "demo_description.urdf").unlink()
+            self.assertIsNone(provenance.previous_export(self.new_request["model_path"], "demo_description", jobs, before=self.new_record["created_at"], exclude=SYNTHETIC_NEW))
+        finally:
+            shutil.rmtree(jobs, ignore_errors=True)
+
+    def test_configuration_attributed_to_old_cad(self):
+        source = provenance.config_source(self.new_config, self.new_request["model_path"], self.jobs, before=self.new_record["created_at"])
+        self.assertEqual(source["model_sha256"], self.old_sha)
+        self.assertEqual((source["origin"], source["job_id"]), ("inferred_from_job", SYNTHETIC_OLD))
+        message = provenance.describe_staleness(source, self.new_sha)
+        self.assertIn(self.old_sha[:12], message)
+        self.assertIn(self.new_sha[:12], message)
+        recorded = dict(self.new_config, source={"model_sha256": self.old_sha, "exported_at": "2026-10-08T05:28:39+00:00"})
+        self.assertEqual(provenance.config_source(recorded, self.new_request["model_path"], self.jobs)["origin"], "config")
+
+
 @unittest.skipUnless(HAVE_JOBS and (JOBS_DATA / SAME_VERSION_JOB / "result.json").is_file(), "second 2026-10-08 export not present")
 class RealSameVersion(unittest.TestCase):
     def test_two_exports_of_one_cad_version_agree(self):

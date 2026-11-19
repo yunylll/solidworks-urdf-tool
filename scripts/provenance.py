@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 import math
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import numpy as np
 
@@ -40,6 +40,26 @@ def _jobs(jobs: Path):
             continue
         found.append((path.parent, record, _read(path.parent / "request.json") or {}))
     return sorted(found, key=lambda item: item[1]["created_at"])
+
+
+def _job_file(recorded, directory: Path):
+    """A file a job recorded by absolute path, or the same file in the job folder if the jobs were moved.
+
+    Job records keep absolute paths of the computer that ran them; after validation/jobs is copied to
+    another computer (or the checkout moves) those paths name nothing, while the file is still inside
+    the job folder at the same place below the job id.
+    """
+    if not recorded:
+        return None
+    path = Path(recorded)
+    if path.is_file():
+        return path
+    parts = PureWindowsPath(recorded).parts if "\\" in str(recorded) else Path(recorded).parts
+    for index in range(len(parts) - 1, -1, -1):
+        if parts[index].casefold() == directory.name.casefold():
+            candidate = directory.joinpath(*parts[index + 1:])
+            return candidate if candidate.is_file() else None
+    return None
 
 
 def _model_of(record, request):
@@ -258,8 +278,8 @@ def previous_export(model_path, package_name: str, jobs: Path, before: str | Non
             continue
         if record.get("operation") != "export" or record.get("status") != "succeeded" or record.get("passed") is not True:
             continue
-        urdf = (record.get("bridge") or {}).get("urdf")
-        if not urdf or not Path(urdf).is_file():
+        urdf = _job_file((record.get("bridge") or {}).get("urdf"), directory)
+        if not urdf:
             continue
         found = {"job_id": directory.name, "urdf": str(urdf), "finished_at": record.get("finished_at"), "model_sha256": _cad_version(record)}
         if same_path(_model_of(record, request), model_path):

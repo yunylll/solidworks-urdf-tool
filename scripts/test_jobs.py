@@ -258,6 +258,57 @@ class JobChecks(unittest.TestCase):
         self.assertEqual(record["status"], "cancelled")
         self.assertIsNotNone(child.poll(), "the native process must be stopped")
 
+    def test_write_json_waits_for_a_reader_holding_the_file(self):
+        _, directory = self.fake_job(5)
+        target = directory / "output" / "progress.json"
+        write_json(target, {"step": 1})
+        reader = target.open("rb")  # Python opens without FILE_SHARE_DELETE: a replace fails while it is open.
+        timer = threading.Timer(0.3, reader.close)
+        timer.start()
+        try:
+            write_json(target, {"step": 2})
+        finally:
+            timer.join()
+            reader.close()
+        self.assertEqual(tool_service.read_json(target), {"step": 2})
+
+    def test_readers_tolerate_a_file_being_replaced(self):
+        _, directory = self.fake_job(5)
+        target = directory / "output" / "progress.json"
+        target.write_text('{"stage": "export_me', encoding="utf-8")  # torn write
+        self.assertEqual(tool_service.read_json(target, {}), {})
+        self.assertIsNone(tool_service._file_signature(directory / "output" / "missing.json"))
+
+    def test_stage_durations_from_stderr_log(self):
+        start = datetime(2026, 11, 17, 23, 58, 0).astimezone()
+        finish = start + timedelta(minutes=5)  # 00:03:00 on the next day
+        log = "\n".join([
+            "[23:58:05] Starting private SolidWorks session...",
+            "[23:58:40] Opening private copy of the prepared model...",
+            "[23:59:50] Exporting part URDF and STL... (18)",
+            "[23:59:51]   1/18 base_link",
+            "[00:01:00]   18/18 gripper_z",
+            "Exporter notice: unrelated text",
+            "[00:02:10] Validating the export...",
+        ])
+        pauses = [{"resumed_at": (start + timedelta(minutes=3, seconds=50)).isoformat(), "seconds": 60}]
+        stages = tool_service.stage_durations(log, start.isoformat(), finish.isoformat(), pauses)
+        self.assertEqual([s["stage"] for s in stages], ["Starting private SolidWorks session", "Opening private copy of the prepared model", "Exporting part URDF and STL", "Validating the export"])
+        self.assertEqual([s["seconds"] for s in stages], [35.0, 70.0, 80.0, 50.0])
+        self.assertEqual(stages[2]["paused_seconds"], 60.0)
+        self.assertNotIn("paused_seconds", stages[3])
+        self.assertEqual(datetime.fromisoformat(stages[3]["started_at"]).date(), (start + timedelta(days=1)).date(), "a stamp after midnight is on the next day")
+
+        _, directory = self.fake_job(5)
+        (directory / "stderr.log").write_text(log + "\n", encoding="utf-8")
+        record = {"created_at": (start - timedelta(seconds=20)).isoformat(), "started_at": start.isoformat(), "finished_at": finish.isoformat(), "paused_seconds": 60, "pauses": pauses}
+        timing = tool_service.job_timing(directory, record)
+        self.assertEqual(timing["duration_seconds"], 240.0)
+        self.assertIn("60 s", timing["duration_note"])
+        self.assertEqual((timing["started_at"], timing["finished_at"]), (record["started_at"], record["finished_at"]))
+        self.assertEqual(timing["stage_durations"], stages)
+        self.assertEqual(tool_service.job_timing(directory / "nothing", {"created_at": start.isoformat(), "finished_at": finish.isoformat()})["stage_durations"], [])
+
     def test_progress_summary(self):
         identifier, directory = self.fake_job(5)
         record = self.running_record(directory)
