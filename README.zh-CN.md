@@ -92,7 +92,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-tool.ps1
 | `job <job_id> [--wait 秒]` | 查询任务；`--wait` 等到任务结束或超时即返回 |
 | `cancel <job_id>` | 取消排队中或运行中的任务 |
 | `check-deps <模型>` | 几秒内列出模型全部已保存引用（不打开、不复制模型）：缺失、其他电脑或账户的路径、Toolbox/设计库、外部文件，并给出修复建议，见[源模型保护](#源模型保护) |
-| `validate-config <配置> [--model 模型]` | 不启动 SolidWorks 检查配置；给出 `--model` 时还会判断配置是否对应模型当前的 CAD 版本 |
+| `validate-config <配置> [--model 模型]` | 不启动 SolidWorks 检查配置，一次列出所有问题；给出 `--model` 时还按之前任务记录的组件清单检查组件名、未归属的零件和关节类型，并判断配置是否对应模型当前的 CAD 版本，见[配置检查](#配置检查) |
 | `validate-urdf <urdf> [--reference 参考] [--previews]` | 校验任意位置的 URDF 包；`--reference` 严格比较两次导出；`--previews` 生成三视图 |
 | `cleanup-jobs …` | 列出（加 `--delete` 才删除）旧任务的 CAD 快照，见[发布与清理](#发布与清理) |
 
@@ -184,6 +184,11 @@ Link 字段：`name`、`parent`、`components`（检查返回的完整实例名�
 
 - 模型里没有保存的配置（或保存的配置引用了已不存在的组件）时，inspect 返回一份骨架配置（`configuration_source=template`）：所有顶层组件都归到同一个 `base_link`。它可以通过检查、按单个刚体导出，可在此基础上拆出活动 Link。
 - 检查器会拒绝循环或断开的 Link 树、重复的组件归属、错误的轴长度、无效的限位和非有限数值，每条错误都写明 Link 或关节、期望值和实际值。
+- **对照模型检查。** `validate-config --model`（MCP：`validate_configuration` 的 `model_path`）以及每次带配置的 check 和导出在启动 SolidWorks 之前，先把配置与同一模型、同一 CAD 版本最近一次任务（inspect、check 或导出）记录的组件清单对照，一次列出所有问题，结果在 `model_check.issues`，每条写明 Link 或关节、期望值（`expected`）、实际值（`actual`），名称类问题附相近名称（`similar`）：
+  - 错误：组件名不在装配体中（如 `3_DOF_ARM_SEGMNT-1`，相近名称 `3_DOF_ARM_SEGMENT-1`）；组件在当前配置中被压缩；有实体的零件没有归属任何 Link；组件既直接分配、又随父子装配体分配；`exclude_hidden_bodies` 中的文件不属于任何组件；`recompute_kinematics=true` 时，配置的关节类型与之前从 CAD 推断出的类型不同（只在推断所用的第一个组件与配置相同时比较）。
+  - 有错误时 check 和导出不会创建任务，直接以 `INVALID_INPUT` 拒绝并列出全部问题，几秒内返回。以前这些问题要到打开装配体后才暴露（任务 a0000001、a0000004 的拼写错误在 CAD 阶段失败了 7 次；a0000002 的未归属零件；a0000003 的 8 个关节类型不符）。
+  - 警告：`recompute_kinematics=false` 时关节类型与 CAD 推断不同（工具使用配置中的类型，所有不同之处合并为一条警告）；旧任务的组件清单没有记录零件是否有实体时，未归属的零件只给警告。工具从不修改配置中的关节类型。
+  - 组件清单之后装配体的零件或子装配体文件有改动（对照该任务记录的文件哈希）时，所有错误降为警告并注明。没有任何任务记录过该 CAD 版本时跳过（`model_check.checked=false`），由 SolidWorks 阶段照常检查；先运行一次 inspect 即可启用。
 - inspect 结果中的 `unassigned_components` 列出未归属任何 Link 的实体零件，`overlapping_components` 列出既直接分配、又随父子装配体分配的组件；两者非空时 `configuration_ready=false`，导出会在生成网格前失败并列出组件名。
 - 子装配体可以作为整体列在 Link 中，工具会导出并称量它下面所有未压缩、非封套的零件（包括隐藏零件，与质量计算一致）。结果在 `subassembly_components` 中列出这类组件并给出警告；`expanded_config_path` 是改为逐个列出零件的配置。`recompute_kinematics=true` 时，子 Link 中排在第一个的子装配体保持整体，因为关节是根据它识别的。
 - JSON 配置覆盖上述 Link/Joint 字段；旧配置中的外观设置尚未开放到 JSON。
@@ -324,7 +329,7 @@ print(result["bridge"]["urdf"])
 | `inspect_model_configuration` | 检查模型，返回组件、可编辑配置和未归属组件 |
 | `check_dependencies` | 几秒内列出模型的全部引用和问题，不打开模型 |
 | `prepare_model` | 生成自包含的 CAD 副本 |
-| `validate_configuration` | 不启动 SolidWorks 检查配置；可选 `model_path` 用于判断 CAD 版本 |
+| `validate_configuration` | 不启动 SolidWorks 检查配置；可选 `model_path`：对照模型的组件清单和 CAD 版本 |
 | `export_urdf` | 导出（或 `check_only=true` 只检查），等待结果 |
 | `start_urdf_export` | 在后台开始导出，立即返回 `job_id` |
 | `get_export_job` | 查询任务；`wait_seconds` 等到任务结束即返回 |
@@ -345,7 +350,7 @@ print(result["bridge"]["urdf"])
 | 测试 | 需要 SolidWorks | 覆盖内容 |
 |---|---|---|
 | `test_dependencies.py` | 否 | 依赖预检的分类：Toolbox、其他电脑的路径、导入缓存、虚拟组件、活动/压缩/未使用、路径过长 |
-| `test_configuration.py` | 否 | 配置校验、导出后处理字段、子装配体展开、`exclude_hidden_bodies` |
+| `test_configuration.py` | 否 | 配置校验、导出后处理字段、子装配体展开、`exclude_hidden_bodies`；对照组件清单的检查（本机有历史任务 a0000001、a0000002、a0000003 时用它们的配置复现） |
 | `test_validation.py` | 否 | 校验器能否发现损坏的导出：缺失网格、单位错误、关节方向、零位位置、网格与 CAD 不一致、隐藏实体 |
 | `test_postprocess.py` | 否 | mimic 和 world 后处理 |
 | `test_jobs.py` | 否 | 排队、工作进程存活检测、卡住与暂停、取消、进度、读写 JSON 时的文件占用、网格复用候选、耗时记录 |

@@ -2,6 +2,7 @@
 from __future__ import annotations
 import json
 import math
+import ntpath
 from pathlib import Path
 import re
 
@@ -296,3 +297,120 @@ def expand_subassemblies(config, rows):
             components.extend([name] if keep else row["parts"])
         link["components"] = components
     return expanded
+
+
+def similar_names(wanted, available, count=5):
+    """Up to count names closest to wanted (case-insensitive edit distance, as the native tool's SimilarNames)."""
+    def distance(a, b):
+        a, b = a.lower(), b.lower()
+        row = list(range(len(b) + 1))
+        for i in range(1, len(a) + 1):
+            previous, row[0] = row[0], i
+            for j in range(1, len(b) + 1):
+                current = row[j]
+                row[j] = min(row[j] + 1, row[j - 1] + 1, previous + (a[i - 1] != b[j - 1]))
+                previous = current
+        return row[len(b)]
+    limit = max(3, len(wanted) // 3)
+    scored = sorted((distance(wanted, n), n) for n in set(available))
+    return [n for cost, n in scored if cost <= limit][:count]
+
+
+def check_against_model(config, components, detected_joint_types=None, detected_from=None):
+    """Problems of a valid configuration against an assembly's component list, all at once; reads no CAD.
+
+    components: [{name, path, suppressed, solid?, envelope?}] as recorded by an earlier job of the same CAD version
+    (bridge.components). detected_joint_types: {joint: type} from an earlier recompute_kinematics run of that version,
+    with detected_from {joint: first component it was detected from}. Returns {"errors", "warnings", "issues"}; each
+    issue names the Link or joint, the expected and the actual value and, for names, similar names. Joint types are
+    only reported, never changed.
+    """
+    by_key = {c["name"].casefold(): c for c in components}
+    names = [c["name"] for c in components]
+    issues = []
+
+    def issue(severity, kind, where, expected, actual, message, similar=None):
+        row = {"severity": severity, "kind": kind, "where": where, "expected": expected, "actual": actual, "message": message}
+        if similar:
+            row["similar"] = similar
+        issues.append(row)
+
+    def suppressed_path(name):
+        parts = name.split("/")
+        return next((("/".join(parts[:i])) for i in range(1, len(parts) + 1) if (by_key.get("/".join(parts[:i]).casefold()) or {}).get("suppressed")), None)
+
+    assigned = {}
+    for link in config["links"]:
+        for name in link.get("components") or []:
+            component = by_key.get(name.casefold())
+            if component is None:
+                similar = similar_names(name, names)
+                issue("error", "unknown_component", f"Link {link['name']}", "a component of the assembly", name,
+                      f"Link {link['name']} names component {name!r}, which is not in the assembly." + (f" Similar names: {', '.join(similar)}." if similar else " Run inspect to list component names (components)."), similar)
+                continue
+            assigned[component["name"].casefold()] = link["name"]
+            hidden = suppressed_path(component["name"])
+            if hidden:
+                issue("error", "suppressed_component", f"Link {link['name']}", "an unsuppressed component", name,
+                      f"Link {link['name']} names component {name!r}, which is suppressed in the active configuration" + (f" (through {hidden})" if hidden.casefold() != name.casefold() else "") + "; unsuppress it in the CAD or remove it from the Link.")
+    for component in components:
+        key = component["name"].casefold()
+        if component.get("suppressed") or component.get("envelope") or suppressed_path(component["name"]):
+            continue
+        parts = component["name"].split("/")
+        owner = next((assigned["/".join(parts[:i]).casefold()] for i in range(len(parts) - 1, 0, -1) if "/".join(parts[:i]).casefold() in assigned), None)
+        if key in assigned and owner:
+            issue("error", "overlapping_component", f"Link {assigned[key]}", f"assigned once (its parent sub-assembly already is, to Link {owner})", component["name"],
+                  f"Component {component['name']} is assigned to Link {assigned[key]} and, through its parent sub-assembly, to Link {owner}; list it once.")
+        if key in assigned or owner or not (component.get("path") or "").lower().endswith(".sldprt"):
+            continue
+        if component.get("solid") is False:
+            continue
+        ancestors = ["/".join(parts[:i]) for i in range(1, len(parts))]
+        hint = f" (or its sub-assembly {ancestors[-1]})" if ancestors else ""
+        if component.get("solid") is True:
+            issue("error", "unassigned_component", "no Link", "assigned to a Link", component["name"],
+                  f"Solid part {component['name']} is not assigned to any Link; add it{hint} to a Link (e.g. the base Link) so the URDF mass matches the CAD.")
+        else:
+            issue("warning", "unassigned_component", "no Link", "assigned to a Link", component["name"],
+                  f"Part {component['name']} is not assigned to any Link; if it has solid bodies the export fails. Add it{hint} to a Link (the component list does not record solid bodies; run inspect again to know).")
+    files = {ntpath_basename(c.get("path") or "").lower(): ntpath_basename(c.get("path") or "") for c in components}
+    for file in config.get("exclude_hidden_bodies") or []:
+        if file.lower() not in files:
+            similar = similar_names(file, [f for f in files.values() if f.lower().endswith(".sldprt")])
+            issue("error", "unknown_part_file", "exclude_hidden_bodies", "a part file of the assembly", file,
+                  f"exclude_hidden_bodies names {file}, which no component of the assembly uses." + (f" Similar names: {', '.join(similar)}." if similar else ""), similar)
+    recompute = config.get("recompute_kinematics", True)
+    for link in config["links"]:
+        joint = link.get("joint")
+        if not isinstance(joint, dict) or joint.get("name") not in (detected_joint_types or {}):
+            continue
+        detected, configured = detected_joint_types[joint["name"]], joint.get("type")
+        first = (link.get("components") or [None])[0]
+        source = (detected_from or {}).get(joint["name"])
+        if detected == configured or (source and first and source.casefold() != first.casefold()):
+            continue
+        where = f" from {source!r}" if source else ""
+        if recompute:
+            issue("error", "joint_type_mismatch", f"joint {joint['name']} (Link {link['name']})", configured, detected,
+                  f"Joint {joint['name']} of Link {link['name']}: configured {configured}, but recompute_kinematics detects {detected}{where}; the export fails. "
+                  "Motion is detected only from the first component of the child Link: list a component mated directly to the parent first, or set recompute_kinematics to false and give xyz, rpy and axis. The configured type is not changed.")
+        else:
+            issue("warning", "joint_type_mismatch", f"joint {joint['name']} (Link {link['name']})", configured, detected,
+                  f"Joint {joint['name']} of Link {link['name']}: configured {configured}, the CAD mates suggest {detected}{where}. recompute_kinematics is false, so the configured type is exported; check it is intended.")
+    return dict(summarize(issues), issues=issues)
+
+
+def summarize(issues):
+    """errors and warnings of model-check issues; joint types the CAD merely suggests (recompute_kinematics false) are one warning."""
+    errors = [i["message"] for i in issues if i["severity"] == "error"]
+    suggested = [i for i in issues if i["severity"] == "warning" and i["kind"] == "joint_type_mismatch" and "suggest" in i["message"]]
+    warnings = [i["message"] for i in issues if i["severity"] == "warning" and i not in suggested]
+    if suggested:
+        warnings.append(f"{len(suggested)} joint type(s) differ from what the CAD mates suggest; recompute_kinematics is false, so the configured types are exported (see model_check.issues): "
+                        + ", ".join(f"{i['where'].split(' ')[1]} configured {i['expected']}, CAD {i['actual']}" for i in suggested))
+    return {"errors": errors, "warnings": warnings}
+
+
+def ntpath_basename(path):
+    return ntpath.basename(path)

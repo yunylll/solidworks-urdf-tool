@@ -92,7 +92,7 @@ Usage: `.\.venv\Scripts\python.exe scripts\tool_cli.py <command> [options]`
 | `job <job_id> [--wait seconds]` | Show a job; `--wait` returns when it finishes or the time is up |
 | `cancel <job_id>` | Cancel a queued or running job |
 | `check-deps <model>` | List every saved reference of the model in seconds, without opening or copying it: missing files, paths of other computers or accounts, Toolbox/Design Library and external files, with fixes; see [Protecting the source model](#protecting-the-source-model) |
-| `validate-config <config> [--model model]` | Check a configuration without SolidWorks; with `--model`, also whether it was made for the model's current CAD version |
+| `validate-config <config> [--model model]` | Check a configuration without SolidWorks, listing every problem at once; with `--model`, also check component names, unassigned parts and joint types against the component list earlier jobs recorded, and whether it was made for the model's current CAD version; see [Configuration checks](#configuration-checks) |
 | `validate-urdf <urdf> [--reference ref] [--previews]` | Validate a URDF package anywhere; `--reference` compares two exports strictly; `--previews` renders the three views |
 | `cleanup-jobs …` | List (and with `--delete`, remove) the CAD snapshots of old jobs, see [Publishing and cleanup](#publishing-and-cleanup) |
 
@@ -184,6 +184,11 @@ The tool adds these two after the exporter has written the URDF. The exporter's 
 
 - When the model has no saved configuration (or the saved one names components that no longer exist), inspect returns a skeleton configuration (`configuration_source=template`) with every top-level component in one `base_link`. It passes the checks and exports as one rigid body; split moving Links out of it.
 - The checker rejects cyclic or disconnected Link trees, duplicate component ownership, wrong axis lengths, invalid limits and non-finite values, naming the Link or joint, the expected and the actual value.
+- **Checks against the model.** `validate-config --model` (MCP: `model_path` of `validate_configuration`) and every check and export with a configuration first compare the configuration, before SolidWorks starts, with the component list the newest earlier job (inspect, check or export) of the same model and CAD version recorded. Every problem is listed at once in `model_check.issues`, each with the Link or joint, the expected value (`expected`), the actual value (`actual`) and, for names, similar names (`similar`):
+  - Errors: a component name that is not in the assembly (e.g. `3_DOF_ARM_SEGMNT-1`, similar `3_DOF_ARM_SEGMENT-1`); a component suppressed in the active configuration; a part with solid bodies in no Link; a component assigned both directly and through its parent sub-assembly; an `exclude_hidden_bodies` file no component uses; with `recompute_kinematics=true`, a configured joint type that differs from the type inferred from the CAD before (compared only when the inference used the same first component).
+  - With errors, check and export create no job: they are rejected with `INVALID_INPUT`, listing all problems, within seconds. These problems used to show only after the assembly was opened (the typo of jobs a0000001 and a0000004 failed in the CAD stage seven times; the unassigned part of a0000002; the eight joint types of a0000003).
+  - Warnings: with `recompute_kinematics=false`, joint types that differ from the CAD inference (the configured types are exported; all differences in one warning); unassigned parts when an old job's component list does not record whether parts have solid bodies. The tool never changes a configured joint type.
+  - If part or sub-assembly files of the model changed since that component list (compared with the file hashes the job recorded), all errors become warnings saying so. Without any job of that CAD version the check is skipped (`model_check.checked=false`) and the SolidWorks stage checks as before; one inspect enables it.
 - `unassigned_components` in the inspect result lists solid parts assigned to no Link, and `overlapping_components` lists components assigned both directly and through a parent sub-assembly; when either is non-empty, `configuration_ready=false` and an export fails before any mesh, naming the components.
 - A sub-assembly may be listed whole in a Link; the tool exports and weighs all its parts that are not suppressed or envelopes, hidden ones included as in the mass. The result lists such components in `subassembly_components` with a warning, and `expanded_config_path` is the configuration with their parts named instead. With `recompute_kinematics=true`, a sub-assembly listed first in a child Link stays whole, because the joint is detected from it.
 - The JSON configuration covers the Link/Joint fields above; appearance settings of the legacy configuration are not exposed yet.
@@ -324,7 +329,7 @@ The server is `scripts\mcp_server.py`, started with the workspace Python. Other 
 | `inspect_model_configuration` | Inspect a model; returns components, an editable configuration and unassigned components |
 | `check_dependencies` | List all references of a model and their problems in seconds, without opening it |
 | `prepare_model` | Create a self-contained CAD copy |
-| `validate_configuration` | Check a configuration without SolidWorks; optional `model_path` for the CAD version |
+| `validate_configuration` | Check a configuration without SolidWorks; optional `model_path`: against the model's component list and CAD version |
 | `export_urdf` | Export (or check with `check_only=true`) and wait for the result |
 | `start_urdf_export` | Start an export in the background and return its `job_id` at once |
 | `get_export_job` | Show a job; `wait_seconds` returns as soon as it finishes |
@@ -345,7 +350,7 @@ For large models, use `start_urdf_export` and then `get_export_job` with `wait_s
 | Test | Needs SolidWorks | Covers |
 |---|---|---|
 | `test_dependencies.py` | no | Dependency check classification: Toolbox, other computers' paths, import caches, virtual components, active/suppressed/unused, paths too long |
-| `test_configuration.py` | no | Configuration checks, post-processing fields, sub-assembly expansion, `exclude_hidden_bodies` |
+| `test_configuration.py` | no | Configuration checks, post-processing fields, sub-assembly expansion, `exclude_hidden_bodies`; checks against a component list (replaying the configurations of jobs a0000001, a0000002 and a0000003 when they are on this computer) |
 | `test_validation.py` | no | That the validator catches broken exports: missing meshes, unit errors, joint directions, zero-pose placement, mesh against CAD, hidden bodies |
 | `test_postprocess.py` | no | mimic and world post-processing |
 | `test_jobs.py` | no | Queue, worker liveness, stalls and pauses, cancellation, progress, JSON files held by readers, mesh reuse candidates, durations |

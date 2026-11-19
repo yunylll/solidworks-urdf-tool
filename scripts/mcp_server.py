@@ -6,7 +6,7 @@ import json
 import os
 import time
 from export_service import inspect_environment as inspect_sw
-from tool_service import cleanup_jobs as cleanup_job_files, start_job, get_job, cancel_job, source_status, TERMINAL, DEFAULT_TIMEOUT_SECONDS, DEFAULT_STALL_SECONDS
+from tool_service import validate_configuration as validate_config_file, cleanup_jobs as cleanup_job_files, start_job, get_job, cancel_job, source_status, TERMINAL, DEFAULT_TIMEOUT_SECONDS, DEFAULT_STALL_SECONDS
 from configuration import validate_config
 from provenance import DEFAULT_TOLERANCE_DEG, DEFAULT_TOLERANCE_MM
 from validate_export import validate
@@ -159,15 +159,15 @@ async def cleanup_jobs(older_than_days: float | None = None, keep_latest: int | 
 def validate_configuration(config_path: str, model_path: str | None = None) -> dict[str, Any]:
     """Check JSON Link tree, component ownership, axes, joint limits, mimic, world and source settings before running SolidWorks.
 
-    With model_path, also reports in source_status whether the configuration was made for the model's current CAD
-    version (from its source block or earlier jobs); this reads files only and never opens SolidWorks.
+    Lists every problem at once. With model_path, also checks the configuration against what earlier jobs (inspect,
+    check, export) recorded about the model's current CAD version, in model_check: component names not in the
+    assembly (with similar names), suppressed components, solid parts no Link owns, components assigned twice,
+    unknown exclude_hidden_bodies files, and joint types that differ from those detected from the CAD (reported only,
+    never changed). Each issue gives the Link or joint, expected and actual value. source_status says whether the
+    configuration was made for the current CAD version. Reads files only and never opens SolidWorks.
+    check_only and exports run the same check first and do not start when it finds errors.
     """
-    config = json.loads(Path(config_path).read_text(encoding="utf-8-sig"))
-    result = validate_config(config)
-    if model_path and result["passed"]:
-        result["source_status"] = source_status(config, Path(model_path).resolve())
-        result["warnings"] = [result["source_status"]["message"]] if result["source_status"]["stale"] else []
-    return result
+    return validate_config_file(config_path, model_path)
 
 
 @server.tool(structured_output=True)

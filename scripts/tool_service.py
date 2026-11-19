@@ -16,7 +16,7 @@ import sys
 import time
 import uuid
 
-from configuration import AUTOMATIC, expand_subassemblies, load_config, native_config, needs_postprocess, skeleton_config, validate_config
+from configuration import AUTOMATIC, check_against_model, summarize, expand_subassemblies, load_config, native_config, needs_postprocess, skeleton_config, validate_config
 from validate_export import validate
 import dependencies
 import provenance
@@ -240,13 +240,9 @@ def source_status(config, model_path, before=None, original=None):
     return status
 
 
-def known_components(original_path, cad_version, before=None):
-    """Components (name, path, suppressed) of the newest earlier job of the same model and CAD version, or None.
-
-    The dependency check uses them to tell a missing file that an active component uses (fails) from one only
-    suppressed components or no component use (warns), without opening the model.
-    """
-    best = None
+def _model_jobs(original_path, cad_version, before=None):
+    """Records of earlier jobs of the same model and CAD version, newest first."""
+    found = []
     for path in JOBS.glob("*/result.json"):
         try:
             if path.stat().st_size > 200_000_000:
@@ -256,14 +252,100 @@ def known_components(original_path, cad_version, before=None):
         record = read_json(path)
         if not isinstance(record, dict) or record.get("cad_version_sha256") != cad_version or (before and (record.get("created_at") or "") >= before):
             continue
-        if not provenance.same_path(record.get("original_model_path") or record.get("model_path"), original_path):
-            continue
+        if provenance.same_path(record.get("original_model_path") or record.get("model_path"), original_path):
+            found.append(record)
+    return sorted(found, key=lambda r: r.get("created_at") or "", reverse=True)
+
+
+def known_components(original_path, cad_version, before=None, jobs=None):
+    """Components (name, path, suppressed, solid, envelope) of the newest earlier job of the same model and CAD version, or None.
+
+    The dependency check uses them to tell a missing file that an active component uses (fails) from one only
+    suppressed components or no component use (warns), and the configuration check to find wrong or unassigned
+    component names, without opening the model.
+    """
+    for record in jobs if jobs is not None else _model_jobs(original_path, cad_version, before):
         components = (record.get("bridge") or {}).get("components")
-        if components and (best is None or record.get("created_at", "") > best[0]):
-            best = (record.get("created_at", ""), record["job_id"], components)
-    if best is None:
-        return None
-    return {"source": f"job {best[1]}", "components": [{"name": c.get("name"), "path": c.get("path"), "suppressed": bool(c.get("suppressed"))} for c in best[2]]}
+        if components:
+            # Components were listed in the Pack and Go copy, whose file names may carry a _dep_<n> suffix: name the originals.
+            original = {str(copy).lower(): source for source, copy in ((record.get("bridge") or {}).get("dependencyMapping") or {}).items() if copy}
+            rows = [{k: c[k] for k in ("name", "path", "suppressed", "solid", "envelope") if k in c} for c in components]
+            # Parts the native coverage check found unassigned were checked to have solid bodies.
+            solid = {n.casefold() for n in (record.get("bridge") or {}).get("unassignedComponents") or []}
+            for row in rows:
+                row["path"] = original.get(str(row.get("path") or "").lower(), row.get("path"))
+                if row["name"].casefold() in solid:
+                    row["solid"] = True
+            return {"source": f"job {record['job_id']}", "job_id": record["job_id"], "components": rows, "source_hashes": record.get("source_hashes_before") or {}}
+    return None
+
+
+def model_facts(model_path):
+    """What earlier jobs of this model's CAD version recorded: components, and joint types detected from the CAD. Reads files only.
+
+    The files of the model are hashed and compared with that job's, since the assembly file alone does not change
+    when a part or sub-assembly does; facts from changed files are marked unverified.
+    """
+    original_path, digest = original_model(Path(model_path).resolve())
+    jobs = _model_jobs(original_path, digest)
+    facts = {"model_sha256": digest, "components": None, "detected_joint_types": None}
+    known = known_components(original_path, digest, jobs=jobs)
+    if known:
+        changed = [p for p, h in known["source_hashes"].items() if not Path(p).is_file() or sha256(p) != h]
+        facts.update(components=known["components"], components_from=known["source"], components_verified=bool(known["source_hashes"]) and not changed)
+        if changed:
+            facts["changed_files"] = changed[:20]
+    for record in jobs:
+        detected = (record.get("bridge") or {}).get("detectedJointTypes")
+        if detected:
+            used = read_json(Path(record["job"]) / "robot-config.json") or {}
+            first = {l["joint"]["name"]: (l.get("components") or [None])[0] for l in used.get("links", []) if isinstance(l.get("joint"), dict) and l["joint"].get("name")}
+            facts.update(detected_joint_types=detected, detected_from={k: v for k, v in first.items() if k in detected and v}, detected_by=f"job {record['job_id']}")
+            break
+    return facts
+
+
+def check_config_against_model(config, model_path):
+    """configuration.check_against_model with the facts earlier jobs recorded about model_path."""
+    facts = model_facts(model_path)
+    if not facts["components"] and not facts["detected_joint_types"]:
+        return {"checked": False, "errors": [], "warnings": [], "issues": [], "message": "No earlier job recorded this CAD version's components; run inspect once (or check_only) so that component names are checked before SolidWorks opens the model."}
+    result = check_against_model(config, facts["components"] or [], facts["detected_joint_types"], facts.get("detected_from"))
+    if not facts["components"]:
+        result["issues"] = [i for i in result["issues"] if i["kind"] == "joint_type_mismatch"]
+    result.update(checked=True, components_from=facts.get("components_from"), detected_by=facts.get("detected_by"))
+    if facts["components"] and not facts.get("components_verified"):
+        # A part or sub-assembly changed since: names may have changed with it, so nothing here is certain.
+        changed = ", ".join(Path(p).name for p in facts.get("changed_files", [])[:5]) or "not recorded"
+        for i in result["issues"]:
+            if i["severity"] == "error":
+                i["severity"] = "warning"
+                i["message"] += f" (component list from {facts['components_from']}; files changed since: {changed}, so this is not certain)"
+    result.update(summarize(result["issues"]))
+    return result
+
+
+def validate_configuration(config_path, model_path=None):
+    """Every problem of a configuration at once; with model_path also against the model's components and CAD version. Reads files only."""
+    config = json.loads(Path(config_path).read_text(encoding="utf-8-sig"))
+    result = validate_config(config)
+    result["warnings"] = []
+    if model_path:
+        model = Path(model_path).resolve()
+        if isinstance(config, dict) and isinstance(config.get("links"), list) and all(isinstance(l, dict) and isinstance(l.get("name"), str) for l in config["links"]):
+            try:
+                checked = check_config_against_model(config, model)
+            except (KeyError, TypeError, AttributeError) as exc:
+                checked = {"checked": False, "errors": [], "warnings": [], "issues": [], "message": f"The model check was skipped: {exc}"}
+            result["model_check"] = checked
+            result["errors"] = result["errors"] + checked["errors"]
+            result["warnings"] += checked["warnings"]
+        if result["passed"]:
+            result["source_status"] = source_status(config, model)
+            if result["source_status"]["stale"]:
+                result["warnings"].append(result["source_status"]["message"])
+        result["passed"] = not result["errors"]
+    return result
 
 
 def _dependency_check(record, bridge):
@@ -309,7 +391,15 @@ def create_job(operation, model_path, package_name="robot_description", *, confi
     publish_to = check_publish_to(publish_to)
     if not NATIVE.is_file():
         raise RuntimeError("Build the native tool with scripts/build-tool.ps1 first.")
-    config = load_config(config_path) if config_path else None
+    config, config_warnings = None, []
+    if config_path:
+        # Every problem at once, before any CAD: the structure, and component names, unassigned parts and joint types
+        # against what earlier jobs recorded about this CAD version.
+        checked = validate_configuration(config_path, source)
+        if not checked["passed"]:
+            raise ValueError(f"Invalid robot configuration {config_path}: {len(checked['errors'])} problem(s); nothing was started.\n" + "\n".join(f"{i}. {e}" for i, e in enumerate(checked["errors"], 1)))
+        config = load_config(config_path)
+        config_warnings = (checked.get("model_check") or {}).get("warnings", [])
     reference = Path(reference_urdf).resolve() if reference_urdf else None
     if reference and not reference.is_file():
         raise ValueError(f"reference_urdf must be an existing URDF file, got {str(reference)!r}.")
@@ -337,6 +427,7 @@ def create_job(operation, model_path, package_name="robot_description", *, confi
     if original_path != str(source):
         record["original_model_path"] = original_path
     if config:
+        record["warnings"] += config_warnings
         record["config_input_path"] = str(Path(config_path).resolve())
         record["write_config_source"] = bool(write_config_source)
         status = source_status(config, source, created, (original_path, cad_version))

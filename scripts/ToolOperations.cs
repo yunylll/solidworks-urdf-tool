@@ -367,7 +367,17 @@ public static partial class LegacyExportBridge
         foreach (object item in components)
         {
             var component = (Component2)item;
-            list.Add(new Dictionary<string, object> { { "name", component.Name2 }, { "path", component.GetPathName() }, { "suppressed", component.IsSuppressed() }, { "fixed", component.IsFixed() } });
+            var row = new Dictionary<string, object> { { "name", component.Name2 }, { "path", component.GetPathName() }, { "suppressed", component.IsSuppressed() }, { "fixed", component.IsFixed() } };
+            // Whether the part has solid bodies and is not an envelope: the configuration check (validate_configuration
+            // with model_path) then names the solid parts no Link owns without opening the model again.
+            if (!component.IsSuppressed() && (component.GetPathName() ?? "").EndsWith(".sldprt", StringComparison.OrdinalIgnoreCase))
+            {
+                object info;
+                var bodies = component.GetBodies3((int)swBodyType_e.swSolidBody, out info) as object[];
+                row["solid"] = bodies != null && bodies.Length != 0;
+                row["envelope"] = component.IsEnvelope();
+            }
+            list.Add(row);
             Marshal.ReleaseComObject(component);
         }
         return list;

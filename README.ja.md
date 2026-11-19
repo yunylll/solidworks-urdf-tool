@@ -92,7 +92,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-tool.ps1
 | `job <job_id> [--wait 秒]` | ジョブを表示。`--wait` は終了または時間切れで戻る |
 | `cancel <job_id>` | 待機中または実行中のジョブをキャンセル |
 | `check-deps <モデル>` | モデルを開かずコピーもせずに、保存された参照をすべて数秒で一覧：見つからないファイル、他のコンピューターやアカウントのパス、Toolbox/デザインライブラリ、外部ファイルと修正方法。[ソースモデルの保護](#ソースモデルの保護)を参照 |
-| `validate-config <設定> [--model モデル]` | SolidWorks を起動せずに設定を検査。`--model` を付けると、モデルの現在の CAD バージョン用の設定かも判定 |
+| `validate-config <設定> [--model モデル]` | SolidWorks を起動せずに設定を検査し、すべての問題を一度に示す。`--model` を付けると、以前のジョブが記録したコンポーネント一覧に照らしてコンポーネント名、未割り当ての部品、関節の種類を検査し、モデルの現在の CAD バージョン用の設定かも判定。[設定の検査](#設定の検査)を参照 |
 | `validate-urdf <urdf> [--reference 参照] [--previews]` | 任意の場所の URDF パッケージを検証。`--reference` は 2 つのエクスポートを厳密に比較、`--previews` は 3 方向の画像を作成 |
 | `cleanup-jobs …` | 古いジョブの CAD スナップショットを一覧（`--delete` で削除）。[公開とクリーンアップ](#公開とクリーンアップ)を参照 |
 
@@ -184,6 +184,11 @@ Link のフィールド：`name`、`parent`、`components`（inspect が示す�
 
 - モデルに保存された設定がない（または保存された設定が存在しないコンポーネントを参照している）場合、inspect はすべてのトップレベルコンポーネントを 1 つの `base_link` にまとめたスケルトン設定（`configuration_source=template`）を返します。検査に合格し、1 つの剛体としてエクスポートできるので、ここから可動 Link を分けていきます。
 - 検査では、循環または切断された Link ツリー、コンポーネントの重複割り当て、誤った軸の長さ、無効なリミット、有限でない数値を拒否し、Link または関節、期待値、実際の値を示します。
+- **モデルに照らした検査。** `validate-config --model`（MCP：`validate_configuration` の `model_path`）と、設定付きのすべての check とエクスポートは、SolidWorks を起動する前に、同じモデル・同じ CAD バージョンの直近のジョブ（inspect、check、エクスポート）が記録したコンポーネント一覧と設定を照合します。すべての問題を一度に `model_check.issues` に示し、それぞれ Link または関節、期待値（`expected`）、実際の値（`actual`）、名前の問題には似た名前（`similar`）を付けます：
+  - エラー：アセンブリにないコンポーネント名（例 `3_DOF_ARM_SEGMNT-1`、似た名前 `3_DOF_ARM_SEGMENT-1`）、アクティブな構成で抑制されたコンポーネント、どの Link にもないソリッドボディのある部品、直接と親サブアセンブリ経由の両方で割り当てたコンポーネント、どのコンポーネントも使わない `exclude_hidden_bodies` のファイル、`recompute_kinematics=true` のとき以前 CAD から推定した種類と異なる関節の種類（推定に使った最初のコンポーネントが同じ場合だけ比較）。
+  - エラーがあると check とエクスポートはジョブを作らず、すべての問題を示して `INVALID_INPUT` で数秒のうちに拒否します。以前はアセンブリを開いた後にしか分かりませんでした（ジョブ a0000001、a0000004 の綴りの誤りは CAD 段階で 7 回失敗、a0000002 の未割り当ての部品、a0000003 の 8 つの関節の種類）。
+  - 警告：`recompute_kinematics=false` で CAD の推定と異なる関節の種類（設定の種類で出力し、違いはまとめて 1 つの警告）、古いジョブのコンポーネント一覧に部品のソリッドボディの有無が記録されていない場合の未割り当ての部品。ツールが設定の関節の種類を変えることはありません。
+  - そのコンポーネント一覧の後にモデルの部品やサブアセンブリのファイルが変わっていれば（ジョブが記録したファイルハッシュと比較）、エラーはすべてその旨を付けた警告になります。その CAD バージョンのジョブがなければ検査を省き（`model_check.checked=false`）、SolidWorks の段階でこれまでどおり検査します。一度 inspect を実行すれば有効になります。
 - inspect 結果の `unassigned_components` はどの Link にも割り当てられていないソリッド部品、`overlapping_components` は直接と親サブアセンブリ経由の両方で割り当てられたコンポーネントです。どちらかが空でなければ `configuration_ready=false` となり、エクスポートはメッシュを作る前に、コンポーネント名を示して失敗します。
 - サブアセンブリを丸ごと Link に列挙することもできます。その場合、抑制とエンベロープ以外の全部品を（質量と同じく非表示部品も含めて）出力・計量します。結果の `subassembly_components` にこうしたコンポーネントを警告付きで示し、`expanded_config_path` はその部品を個別に列挙した設定です。`recompute_kinematics=true` のとき、子 Link の先頭にあるサブアセンブリは関節の検出に使うため、そのまま残します。
 - JSON 設定は上記の Link/Joint フィールドを扱います。旧設定の外観設定はまだ JSON から編集できません。
@@ -324,7 +329,7 @@ print(result["bridge"]["urdf"])
 | `inspect_model_configuration` | モデルを調べ、コンポーネント、編集可能な設定、未割り当てのコンポーネントを返す |
 | `check_dependencies` | モデルを開かずに、すべての参照とその問題を数秒で一覧 |
 | `prepare_model` | 自己完結した CAD コピーを作る |
-| `validate_configuration` | SolidWorks なしで設定を検査。CAD バージョンの確認用に任意の `model_path` |
+| `validate_configuration` | SolidWorks なしで設定を検査。任意の `model_path`：モデルのコンポーネント一覧と CAD バージョンに照らす |
 | `export_urdf` | エクスポート（`check_only=true` ならチェックのみ）して結果を待つ |
 | `start_urdf_export` | バックグラウンドでエクスポートを始め、すぐに `job_id` を返す |
 | `get_export_job` | ジョブを表示。`wait_seconds` は終了すると直ちに戻る |
@@ -345,7 +350,7 @@ print(result["bridge"]["urdf"])
 | テスト | SolidWorks | 内容 |
 |---|---|---|
 | `test_dependencies.py` | 不要 | 依存関係チェックの分類：Toolbox、他のコンピューターのパス、インポートキャッシュ、仮想コンポーネント、有効/抑制/未使用、長すぎるパス |
-| `test_configuration.py` | 不要 | 設定の検査、後処理のフィールド、サブアセンブリの展開、`exclude_hidden_bodies` |
+| `test_configuration.py` | 不要 | 設定の検査、後処理のフィールド、サブアセンブリの展開、`exclude_hidden_bodies`、コンポーネント一覧に照らした検査（ジョブ a0000001、a0000002、a0000003 がこのコンピューターにあればその設定で再現） |
 | `test_validation.py` | 不要 | 検証が壊れたエクスポートを見つけること：メッシュの欠落、単位の誤り、関節の向き、ゼロ姿勢での配置、メッシュと CAD、非表示ボディ |
 | `test_postprocess.py` | 不要 | mimic と world の後処理 |
 | `test_jobs.py` | 不要 | キュー、ワーカーの生存確認、停滞と一時停止、キャンセル、進捗、読み取り中の JSON ファイル、メッシュ再利用の候補、所要時間 |

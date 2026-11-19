@@ -3,7 +3,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from tool_service import cleanup_jobs, DEFAULT_STALL_SECONDS, DEFAULT_TIMEOUT_SECONDS, TERMINAL, cancel_job, operation, run_job, source_status, start_job, wait_job
+from tool_service import cleanup_jobs, DEFAULT_STALL_SECONDS, DEFAULT_TIMEOUT_SECONDS, TERMINAL, cancel_job, operation, validate_configuration, run_job, source_status, start_job, wait_job
 from configuration import validate_config
 from provenance import DEFAULT_TOLERANCE_DEG, DEFAULT_TOLERANCE_MM
 from validate_export import validate
@@ -50,7 +50,7 @@ def main():
     clean.add_argument("--delete", action="store_true", help="delete; without it this is a dry run")
     config = commands.add_parser("validate-config")
     config.add_argument("config")
-    config.add_argument("--model", help="also report whether the configuration was made for this model's current CAD version (reads files only)")
+    config.add_argument("--model", help="also check component names, unassigned parts and joint types against what earlier jobs recorded about this model, and whether the configuration was made for its current CAD version (reads files only)")
     urdf = commands.add_parser("validate-urdf")
     urdf.add_argument("urdf")
     urdf.add_argument("--reference")
@@ -83,11 +83,7 @@ def main():
                 target = Path(arguments.urdf).resolve()
                 result["previews"] = render_preview.render(target, target.parent.parent / "previews")
         else:
-            config = json.loads(Path(arguments.config).read_text(encoding="utf-8-sig"))
-            result = validate_config(config)
-            if arguments.model and result["passed"]:
-                result["source_status"] = source_status(config, Path(arguments.model).resolve())
-                result["warnings"] = [result["source_status"]["message"]] if result["source_status"]["stale"] else []
+            result = validate_configuration(arguments.config, arguments.model)
     except Exception as exc:
         result = {"passed": False, "status": "rejected", "error": {"code": "INVALID_INPUT", "message": str(exc)}}
     print(json.dumps(result, indent=2, ensure_ascii=False))
