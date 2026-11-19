@@ -23,6 +23,7 @@ The export core is built from the source of [ros/solidworks_urdf_exporter](https
 - [MCP](#mcp)
 - [Tests](#tests)
 - [Limitations](#limitations)
+- [Downstream: twin-pipeline](#downstream-twin-pipeline)
 - [Provenance and license](#provenance-and-license)
 
 ## Features
@@ -42,6 +43,7 @@ Validation records are in the [tool report](validation/TOOL_REPORT.md); the feas
 ## Requirements and installation
 
 - Windows x64, SolidWorks 2026, .NET Framework 4.7.2 or later (needed by the Roslyn compiler).
+- **You need your own licensed SolidWorks 2026 installation.** SolidWorks and its API DLLs (`SolidWorks.Interop.*`) belong to Dassault Systèmes; this repository does not include or redistribute them. The build copies them from your installation into `build\bin`, which is not tracked; do not commit or publish that folder.
 - The installation script creates the Python environment inside the workspace (`.venv`).
 
 First installation (creates the Python environment, installs pinned dependencies, downloads Microsoft's Roslyn compiler and builds the tool):
@@ -156,7 +158,7 @@ Top-level fields:
 | `exclude_hidden_bodies` | Optional part file names whose hidden bodies are not weighed (see below) |
 | `source` | Written by the tool: the CAD version the configuration was verified for, see [CAD versions and the previous export](#cad-versions-and-the-previous-export) |
 
-Link fields: `name`, `parent`, `components` (full instance names as inspect lists them, e.g. `gantry_asm-1/gantry_x1_asm-1/gantry_x1_p03-2`), `coordinate_system`, `mesh_quality` (`coarse` or `fine`), `frame_only`, `joint`. Joint fields: `name`, `type`, `axis_name`, `axis`, `xyz`, `rpy`, `lower`, `upper`, `effort`, `velocity`, `damping`, `friction` and the optional `mimic`.
+Link fields: `name`, `parent`, `components` (full instance names as inspect lists them, e.g. `frame_asm-1/axis_x_asm-1/carriage-2`), `coordinate_system`, `mesh_quality` (`coarse` or `fine`), `frame_only`, `joint`. Joint fields: `name`, `type`, `axis_name`, `axis`, `xyz`, `rpy`, `lower`, `upper`, `effort`, `velocity`, `damping`, `friction` and the optional `mimic`.
 
 ### Joints and coordinate systems
 
@@ -171,7 +173,7 @@ Link fields: `name`, `parent`, `components` (full instance names as inspect list
 
 - Mass, center of mass and inertia come from SolidWorks component mass properties. The original exporter adds up the inertia of individual bodies, which for Links of several parts came out 3–5 times smaller than the inertia of the exported meshes, and it computes mass from geometry and density, losing masses overridden in SolidWorks. Component mass properties agree with the meshes and include overrides.
 - The tool replaces the exporter's values only after confirming that mass and center of mass agree on every Link without an override and that the Links sum to the assembly mass; otherwise it keeps the exporter's values and says so in `warnings`. Links and components with overridden mass are listed in `warnings` and `bridge.massOverrides`; the exporter's inertia is kept in `bridge.exporterInertia`.
-- **`exclude_hidden_bodies`** (top level): part file names such as `["gantry_z1_p05.SLDPRT"]` whose hidden solid bodies are left out of mass, inertia and the CAD volume of the mesh check. Use it for hidden bodies the CAD still needs, such as the source body of a mirror that a mate references, where deleting the body would break the mate. SolidWorks counts hidden bodies in the assembly mass, so the mass checks subtract what was left out; `warnings` and `bridge.excludedHiddenBodies` list it per Link. A name that no component uses fails at once, with similar names. Instances that SolidWorks must weigh in the assembly (see `bridge.partMassCheck`) keep their hidden bodies and are listed as not applied.
+- **`exclude_hidden_bodies`** (top level): part file names such as `["bracket_left.SLDPRT"]` whose hidden solid bodies are left out of mass, inertia and the CAD volume of the mesh check. Use it for hidden bodies the CAD still needs, such as the source body of a mirror that a mate references, where deleting the body would break the mate. SolidWorks counts hidden bodies in the assembly mass, so the mass checks subtract what was left out; `warnings` and `bridge.excludedHiddenBodies` list it per Link. A name that no component uses fails at once, with similar names. Instances that SolidWorks must weigh in the assembly (see `bridge.partMassCheck`) keep their hidden bodies and are listed as not applied.
 
 ### After the export
 
@@ -186,7 +188,7 @@ The tool adds these two after the exporter has written the URDF. The exporter's 
 - The checker rejects cyclic or disconnected Link trees, duplicate component ownership, wrong axis lengths, invalid limits and non-finite values, naming the Link or joint, the expected and the actual value.
 - **Checks against the model.** `validate-config --model` (MCP: `model_path` of `validate_configuration`) and every check and export with a configuration first compare the configuration, before SolidWorks starts, with the component list the newest earlier job (inspect, check or export) of the same model and CAD version recorded. Every problem is listed at once in `model_check.issues`, each with the Link or joint, the expected value (`expected`), the actual value (`actual`) and, for names, similar names (`similar`):
   - Errors: a component name that is not in the assembly (e.g. `3_DOF_ARM_SEGMNT-1`, similar `3_DOF_ARM_SEGMENT-1`); a component suppressed in the active configuration; a part with solid bodies in no Link; a component assigned both directly and through its parent sub-assembly; an `exclude_hidden_bodies` file no component uses; with `recompute_kinematics=true`, a configured joint type that differs from the type inferred from the CAD before (compared only when the inference used the same first component).
-  - With errors, check and export create no job: they are rejected with `INVALID_INPUT`, listing all problems, within seconds. These problems used to show only after the assembly was opened (the typo of jobs a0000001 and a0000004 failed in the CAD stage seven times; the unassigned part of a0000002; the eight joint types of a0000003).
+  - With errors, check and export create no job: they are rejected with `INVALID_INPUT`, listing all problems, within seconds. These problems used to show only after the assembly was opened: a misspelled component name failed in the CAD stage seven times in a row before this check existed.
   - Warnings: with `recompute_kinematics=false`, joint types that differ from the CAD inference (the configured types are exported; all differences in one warning); unassigned parts when an old job's component list does not record whether parts have solid bodies. The tool never changes a configured joint type.
   - If part or sub-assembly files of the model changed since that component list (compared with the file hashes the job recorded), all errors become warnings saying so. Without any job of that CAD version the check is skipped (`model_check.checked=false`) and the SolidWorks stage checks as before; one inspect enables it.
 - `unassigned_components` in the inspect result lists solid parts assigned to no Link, and `overlapping_components` lists components assigned both directly and through a parent sub-assembly; when either is non-empty, `configuration_ready=false` and an export fails before any mesh, naming the components.
@@ -241,7 +243,7 @@ A configuration with `recompute_kinematics=false` holds absolute joint origins c
 
 ## Large assemblies
 
-Reference figures from the lab_workstation workstation (3250 components, 19 Links):
+Reference figures from a lab workstation assembly (3250 components, 19 Links):
 
 | Operation | Time |
 |---|---|
@@ -295,12 +297,12 @@ A failed publication does not change `passed`; the reason is in `publish.error`.
 
 - **Read-only sources.** Source files are only read and hashed. The tool copies the source model and its dependencies first and rewrites references, runs Pack and Go and exports on the snapshot only; if the API saves the model while packing, it saves the snapshot. All source hashes are checked again at the end (`source_unchanged`).
 - **Missing references.** When saved references point to files that are not on this computer (old configurations, imported source files, library parts), the model need not be opened in SolidWorks first: the snapshot skips those paths, and after opening it the tool checks that every unsuppressed component loaded. Only an active component with a missing file fails the job, naming the component and path; skipped references and suppressed components without files are listed in `warnings`.
-- **Dependency check.** Before any file is copied or opened, export, start-export, check (`check_only`), inspect and prepare read the saved references of the model and of each of its files with `GetDocumentDependencies2` (stage `dependency_check`; seconds for the roughly 200 references of lab_workstation). The result, in `dependency_check`, lists every problem at once with a fix for each. It also runs on its own: command line `check-deps`, MCP `check_dependencies`, Python `check_dependencies`. It decides as the snapshot logic above does:
+- **Dependency check.** Before any file is copied or opened, export, start-export, check (`check_only`), inspect and prepare read the saved references of the model and of each of its files with `GetDocumentDependencies2` (stage `dependency_check`; seconds for the roughly 200 references of that workstation). The result, in `dependency_check`, lists every problem at once with a fix for each. It also runs on its own: command line `check-deps`, MCP `check_dependencies`, Python `check_dependencies`. It decides as the snapshot logic above does:
   - **Errors (the job fails at once with `DEPENDENCY_CHECK_FAILED`, nothing copied)**: a file that an active component uses is missing; a snapshot or Pack and Go copy would be longer than 259 characters.
   - **Warnings**: missing files that only suppressed components or no component use; Toolbox / Design Library files (e.g. `C:\SOLIDWORKS Data\...`) and paths of other computers or accounts (`C:\Users\<someone else>\...`) as long as it is not known which components use them; 3D Interconnect import caches (`...\Temp\swx*\IC~~\`) and the STEP, IGES, ... files parts were imported from, whose bodies the parts keep.
   - **Info**: existing files outside the model folder (copied into the snapshot); files with the same name (renamed by Pack and Go); temporary paths of virtual components (`VC~~`, stored inside the assembly, fine even from another computer).
   - Which components use a file comes from the model open in SolidWorks, or from the component list of the newest earlier job of the same model and CAD version (`usage_source`). Without either, missing files are warnings only: the job still fails when the snapshot opens if an active component lacks its file. Run inspect once and the check can tell.
-  - The old failures where Pack and Go rejected the destination file names (jobs a0000005 and a0000006, the old lab_workstation bench) had nothing to do with Chinese file names or path length: the assembly holds 10 virtual components, which were given new destinations, and SolidWorks accepts only their own default destinations. Virtual components now keep them (see 4bee8a6); the same model later inspected and exported fine, with 72 Chinese file names and paths of up to 202 characters.
+  - The old failures where Pack and Go rejected the destination file names (an earlier version of that workstation) had nothing to do with Chinese file names or path length: the assembly holds 10 virtual components, which were given new destinations, and SolidWorks accepts only their own default destinations. Virtual components now keep them (see 4bee8a6); the same model later inspected and exported fine, with 72 Chinese file names and paths of up to 202 characters.
 - **Models open in SolidWorks.** When the assembly is open in SolidWorks, the tool reads a read-only manifest of the active model and requires the snapshot's configuration name, component count and mass to match it. If the open model has unsaved changes, the job fails with `UNSAVED_CHANGES`: save it, or close it without saving, and run again; or use `--use-saved-files` to export the files saved on disk, which `warnings` then mention.
 
 ## Python
@@ -350,25 +352,32 @@ For large models, use `start_urdf_export` and then `get_export_job` with `wait_s
 | Test | Needs SolidWorks | Covers |
 |---|---|---|
 | `test_dependencies.py` | no | Dependency check classification: Toolbox, other computers' paths, import caches, virtual components, active/suppressed/unused, paths too long |
-| `test_configuration.py` | no | Configuration checks, post-processing fields, sub-assembly expansion, `exclude_hidden_bodies`; checks against a component list (replaying the configurations of jobs a0000001, a0000002 and a0000003 when they are on this computer) |
+| `test_configuration.py` | no | Configuration checks, post-processing fields, sub-assembly expansion, `exclude_hidden_bodies`; checks against a component list (replaying the configurations of earlier failed jobs named in `private-fixture.json` when they are on this computer) |
 | `test_validation.py` | no | That the validator catches broken exports: missing meshes, unit errors, joint directions, zero-pose placement, mesh against CAD, hidden bodies |
 | `test_postprocess.py` | no | mimic and world post-processing |
 | `test_jobs.py` | no | Queue, worker liveness, stalls and pauses, cancellation, progress, JSON files held by readers, mesh reuse candidates, durations |
 | `test_provenance.py` | no | Configuration provenance and CAD versions, on synthetic jobs in `scripts\testdata\provenance-jobs`, and on real jobs named in `private-fixture.json` where present |
 | `test_maintenance.py` | no | Publishing and cleanup |
 | `test_cad_regressions.py` | yes | Pack and Go with virtual components, joints sharing an origin, check-only runs, reuse of a prepared copy, progress, mimic/world, errors that name the wrong component, the dependency check failing before any copy when a part file is missing |
-| `test_nested_subassemblies.py` | yes | Complete meshes for sub-assemblies listed whole two levels down, chunked and whole mass properties agreeing, mesh reuse and moved meshes; with the workstation CAD present, also the vial rack and `exclude_hidden_bodies` (`SW_URDF_VIAL_RACK` sets its path) |
+| `test_nested_subassemblies.py` | yes | Complete meshes for sub-assemblies listed whole two levels down, chunked and whole mass properties agreeing, mesh reuse and moved meshes; with private CAD named in `private-fixture.json`, also a rack of nested sub-assemblies and `exclude_hidden_bodies` |
 | `test_tool_mcp.py`, `test_mcp.py` | yes | The MCP tools end to end |
 | `test_registered_mcp.py`, `test_mcp_smoke.py` | yes | The registered MCP server; `test_mcp_smoke.py` needs an open SolidWorks session |
 
+The tests marked "no" need neither SolidWorks nor a build; GitHub Actions runs them on every push and pull request ([offline-tests.yml](.github/workflows/offline-tests.yml)). Tests that replay the maintainer's own models read their paths, job ids and names from the untracked `validation\private-fixture.json` (see `scripts\private_fixture.py`) and are skipped without it.
+
 ## Limitations
 
-- The output is a classic ROS URDF package. ROS 2 launch files, MJCF/USD, automatic modelling and fully automatic joint inference are out of scope. Exported models should still be validated in the target simulator.
+- The output is a classic ROS URDF package. ROS 2 launch files, MJCF/USD, automatic modelling and fully automatic joint inference are out of scope (for MuJoCo, see [twin-pipeline](#downstream-twin-pipeline)). Exported models should still be validated in the target simulator.
 - Automatic joint inference looks only at each child Link's first component (see [Joints and coordinate systems](#joints-and-coordinate-systems)).
 - Appearance settings of the legacy configuration are not exposed in JSON yet.
+
+## Downstream: twin-pipeline
+
+[twin-pipeline](https://github.com/yunylll/twin-pipeline) (to be published) is the downstream half of the workflow: it takes the URDF package this tool exports, converts it to a MuJoCo model, runs smoke checks and writes a report. It drives this tool through the Python API in `scripts\tool_service.py` (`check_configuration`, `export_urdf`, `start_export`, `wait_job`) and the command line `validate-config --model`. This repository stays the CAD half: SolidWorks to a validated URDF.
 
 ## Provenance and license
 
 - Upstream source snapshot: ros/solidworks_urdf_exporter `882169e28952f0d17c87d7eab98826454421aabf` (MIT). `build\core-source-manifest.json` records the hash of every upstream file and whether it was adapted; the generated source can be reviewed in `build\core-source`, and the adaptation rules are in `scripts\prepare-core.py`.
 - solidworks_urdf_exporter2 in `vendor` is kept for reference only and is not used for exports. The upstream license is kept in `vendor` and copied as `SW2URDF-LICENSE.txt` with every local build.
 - This tool is MIT licensed, see [LICENSE](LICENSE); the upstream license is in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+- SolidWorks is a trademark of Dassault Systèmes. Running and building the tool requires a licensed SolidWorks 2026 installation; its API DLLs are not redistributed here.

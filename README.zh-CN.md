@@ -23,6 +23,7 @@
 - [MCP](#mcp)
 - [测试](#测试)
 - [当前限制](#当前限制)
+- [下游：twin-pipeline](#下游twin-pipeline)
 - [来源与许可证](#来源与许可证)
 
 ## 主要特性
@@ -42,6 +43,7 @@
 ## 系统要求与安装
 
 - Windows x64、SolidWorks 2026、.NET Framework 4.7.2 或更高版本（编译器 Roslyn 需要）。
+- **需要自己持有许可的 SolidWorks 2026。** SolidWorks 及其 API DLL（`SolidWorks.Interop.*`）属于达索系统（Dassault Systèmes），本仓库不包含也不再分发它们。构建时从本机安装目录复制到不受版本管理的 `build\bin`；请勿提交或发布该目录。
 - Python 环境由安装脚本在工作区内创建（`.venv`）。
 
 首次安装（创建 Python 环境、安装固定版本的依赖、下载微软 Roslyn 编译器并编译工具）：
@@ -156,7 +158,7 @@ export、start-export 另有：
 | `exclude_hidden_bodies` | 可选，零件文件名列表，这些零件的隐藏实体不计入质量（见下文） |
 | `source` | 由工具写入：配置验证过的 CAD 版本，见 [CAD 版本与上一次导出](#cad-版本与上一次导出) |
 
-Link 字段：`name`、`parent`、`components`（检查返回的完整实例名，例如 `gantry_asm-1/gantry_x1_asm-1/gantry_x1_p03-2`）、`coordinate_system`、`mesh_quality`（`coarse` 或 `fine`）、`frame_only`、`joint`。关节字段：`name`、`type`、`axis_name`、`axis`、`xyz`、`rpy`、`lower`、`upper`、`effort`、`velocity`、`damping`、`friction`，以及可选的 `mimic`。
+Link 字段：`name`、`parent`、`components`（检查返回的完整实例名，例如 `frame_asm-1/axis_x_asm-1/carriage-2`）、`coordinate_system`、`mesh_quality`（`coarse` 或 `fine`）、`frame_only`、`joint`。关节字段：`name`、`type`、`axis_name`、`axis`、`xyz`、`rpy`、`lower`、`upper`、`effort`、`velocity`、`damping`、`friction`，以及可选的 `mimic`。
 
 ### 关节与坐标系
 
@@ -171,7 +173,7 @@ Link 字段：`name`、`parent`、`components`（检查返回的完整实例名�
 
 - 质量、质心和惯量取自 SolidWorks 的组件质量属性。原导出器把各实体的惯量直接相加，对由多个零件组成的 Link，结果比按导出网格算得的小 3–5 倍；它还按几何和密度计算质量，会丢掉 SolidWorks 中覆盖的质量。组件质量属性与网格一致，也包含覆盖值。
 - 工具先确认：没有覆盖的 Link，两种算法的质量和质心一致；各 Link 质量之和等于装配体质量。两项都满足才替换原导出器的值，否则保留原值并在 `warnings` 中说明。用到覆盖值的 Link 和组件列在 `warnings` 和 `bridge.massOverrides` 中，原导出器的惯量保留在 `bridge.exporterInertia`。
-- **`exclude_hidden_bodies`**（顶层）：零件文件名列表，例如 `["gantry_z1_p05.SLDPRT"]`。这些零件里的隐藏实体不计入质量和惯量，也不计入网格检查使用的 CAD 体积。适用于 CAD 仍需要的隐藏实体，例如被配合引用的镜像源实体，删掉它会使配合失效。SolidWorks 计算装配体质量时包含隐藏实体，因此各项质量检查会减去被排除的部分；`warnings` 和 `bridge.excludedHiddenBodies` 按 Link 列出排除的质量。文件名不属于任何组件时立即报错，并给出相近的文件名。必须由 SolidWorks 在装配体中称重的实例（见 `bridge.partMassCheck`）仍包含隐藏实体，并列为“未生效”。
+- **`exclude_hidden_bodies`**（顶层）：零件文件名列表，例如 `["bracket_left.SLDPRT"]`。这些零件里的隐藏实体不计入质量和惯量，也不计入网格检查使用的 CAD 体积。适用于 CAD 仍需要的隐藏实体，例如被配合引用的镜像源实体，删掉它会使配合失效。SolidWorks 计算装配体质量时包含隐藏实体，因此各项质量检查会减去被排除的部分；`warnings` 和 `bridge.excludedHiddenBodies` 按 Link 列出排除的质量。文件名不属于任何组件时立即报错，并给出相近的文件名。必须由 SolidWorks 在装配体中称重的实例（见 `bridge.partMassCheck`）仍包含隐藏实体，并列为“未生效”。
 
 ### 导出后的处理
 
@@ -186,7 +188,7 @@ Link 字段：`name`、`parent`、`components`（检查返回的完整实例名�
 - 检查器会拒绝循环或断开的 Link 树、重复的组件归属、错误的轴长度、无效的限位和非有限数值，每条错误都写明 Link 或关节、期望值和实际值。
 - **对照模型检查。** `validate-config --model`（MCP：`validate_configuration` 的 `model_path`）以及每次带配置的 check 和导出在启动 SolidWorks 之前，先把配置与同一模型、同一 CAD 版本最近一次任务（inspect、check 或导出）记录的组件清单对照，一次列出所有问题，结果在 `model_check.issues`，每条写明 Link 或关节、期望值（`expected`）、实际值（`actual`），名称类问题附相近名称（`similar`）：
   - 错误：组件名不在装配体中（如 `3_DOF_ARM_SEGMNT-1`，相近名称 `3_DOF_ARM_SEGMENT-1`）；组件在当前配置中被压缩；有实体的零件没有归属任何 Link；组件既直接分配、又随父子装配体分配；`exclude_hidden_bodies` 中的文件不属于任何组件；`recompute_kinematics=true` 时，配置的关节类型与之前从 CAD 推断出的类型不同（只在推断所用的第一个组件与配置相同时比较）。
-  - 有错误时 check 和导出不会创建任务，直接以 `INVALID_INPUT` 拒绝并列出全部问题，几秒内返回。以前这些问题要到打开装配体后才暴露（任务 a0000001、a0000004 的拼写错误在 CAD 阶段失败了 7 次；a0000002 的未归属零件；a0000003 的 8 个关节类型不符）。
+  - 有错误时 check 和导出不会创建任务，直接以 `INVALID_INPUT` 拒绝并列出全部问题，几秒内返回。以前这些问题要到打开装配体后才暴露：在有这项检查之前，一个拼错的组件名曾在 CAD 阶段连续失败 7 次。
   - 警告：`recompute_kinematics=false` 时关节类型与 CAD 推断不同（工具使用配置中的类型，所有不同之处合并为一条警告）；旧任务的组件清单没有记录零件是否有实体时，未归属的零件只给警告。工具从不修改配置中的关节类型。
   - 组件清单之后装配体的零件或子装配体文件有改动（对照该任务记录的文件哈希）时，所有错误降为警告并注明。没有任何任务记录过该 CAD 版本时跳过（`model_check.checked=false`），由 SolidWorks 阶段照常检查；先运行一次 inspect 即可启用。
 - inspect 结果中的 `unassigned_components` 列出未归属任何 Link 的实体零件，`overlapping_components` 列出既直接分配、又随父子装配体分配的组件；两者非空时 `configuration_ready=false`，导出会在生成网格前失败并列出组件名。
@@ -241,7 +243,7 @@ Link 字段：`name`、`parent`、`components`（检查返回的完整实例名�
 
 ## 大型装配体
 
-以 lab_workstation 工作站（3250 个组件，19 个 Link）为例：
+以一台实验室工作站装配体（3250 个组件，19 个 Link）为例：
 
 | 操作 | 耗时 |
 |---|---|
@@ -295,12 +297,12 @@ Link 字段：`name`、`parent`、`components`（检查返回的完整实例名�
 
 - **只读源文件。** 源文件只被读取和计算哈希。工具先复制源模型和依赖，只对快照做引用改写、Pack and Go 和导出；即使 API 在打包时保存模型，保存的也只是快照。结束后再次核对全部源文件的哈希（`source_unchanged`）。
 - **缺失的引用。** 模型保存的引用指向本机不存在的文件时（旧配置、导入源文件、库零件等），无需先在 SolidWorks 中打开模型：工具跳过这些路径建立快照，打开快照后检查每个未压缩组件都已加载。只有活动组件缺少文件时才失败，并列出组件名和路径；被跳过的引用和缺少文件的压缩组件写入 `warnings`。
-- **依赖预检。** export、start-export、check（`check_only`）以及 inspect、prepare 在复制或打开任何文件之前，先用 `GetDocumentDependencies2` 读出模型及其每个文件保存的引用（`dependency_check` 阶段；lab_workstation 约 200 个引用只需几秒），结果在 `dependency_check` 中，一次列出所有问题，每条带修复建议。也可单独运行：命令行 `check-deps`，MCP `check_dependencies`，Python `check_dependencies`。判断与上一条快照逻辑一致：
+- **依赖预检。** export、start-export、check（`check_only`）以及 inspect、prepare 在复制或打开任何文件之前，先用 `GetDocumentDependencies2` 读出模型及其每个文件保存的引用（`dependency_check` 阶段；该工作站约 200 个引用只需几秒），结果在 `dependency_check` 中，一次列出所有问题，每条带修复建议。也可单独运行：命令行 `check-deps`，MCP `check_dependencies`，Python `check_dependencies`。判断与上一条快照逻辑一致：
   - **错误（任务立即以 `DEPENDENCY_CHECK_FAILED` 失败，不复制任何文件）**：活动组件使用的文件不存在；快照或 Pack and Go 副本的路径超过 259 个字符。
   - **警告**：只有已压缩组件使用、或没有任何组件使用的缺失文件；Toolbox / 设计库文件（如 `C:\SOLIDWORKS Data\...`）和其他电脑或账户的路径（`C:\Users\<他人>\...`），在还不知道哪些组件使用它们时也只是警告；3D Interconnect 导入缓存（`...\Temp\swx*\IC~~\`）和零件的导入源文件（STEP、IGES 等），零件本身保留了导入的实体。
   - **信息**：模型文件夹以外、但存在的文件（会复制到快照中）；同名文件（Pack and Go 会改名）；虚拟组件的临时路径（`VC~~`，保存在装配体内部，即使来自其他电脑也没问题）。
   - 组件的使用情况来自 SolidWorks 中已打开的该模型，或同一模型、同一 CAD 版本最近一次任务记录的组件列表（`usage_source`）。两者都没有时，缺失文件只给警告：之后快照打开时，如果活动组件确实缺少文件，任务仍会失败。先运行一次 inspect，预检就能区分。
-  - 历史上 Pack and Go 拒绝目标文件名的失败（任务 a0000005、a0000006，lab_workstation 旧工作台）与中文文件名或路径长度无关：该装配体含 10 个虚拟组件，当时为它们指定了新目标名，而 SolidWorks 只接受它们自己的默认目标。现在虚拟组件保留默认目标（见 4bee8a6），同一模型后来能正常 inspect 和导出，其中 72 个中文文件名、最长 202 个字符的路径都没有问题。
+  - 历史上 Pack and Go 拒绝目标文件名的失败（该工作站的早期版本）与中文文件名或路径长度无关：该装配体含 10 个虚拟组件，当时为它们指定了新目标名，而 SolidWorks 只接受它们自己的默认目标。现在虚拟组件保留默认目标（见 4bee8a6），同一模型后来能正常 inspect 和导出，其中 72 个中文文件名、最长 202 个字符的路径都没有问题。
 - **已打开的模型。** 该装配体正在 SolidWorks 中打开时，工具读取只读的活动模型清单，要求快照的配置名、组件数和质量与之一致。打开的模型有未保存修改时，任务以 `UNSAVED_CHANGES` 失败：请保存，或关闭且不保存，然后重新运行；也可以使用 `--use-saved-files`，按磁盘上已保存的文件导出，`warnings` 会注明这一点。
 
 ## Python
@@ -350,25 +352,32 @@ print(result["bridge"]["urdf"])
 | 测试 | 需要 SolidWorks | 覆盖内容 |
 |---|---|---|
 | `test_dependencies.py` | 否 | 依赖预检的分类：Toolbox、其他电脑的路径、导入缓存、虚拟组件、活动/压缩/未使用、路径过长 |
-| `test_configuration.py` | 否 | 配置校验、导出后处理字段、子装配体展开、`exclude_hidden_bodies`；对照组件清单的检查（本机有历史任务 a0000001、a0000002、a0000003 时用它们的配置复现） |
+| `test_configuration.py` | 否 | 配置校验、导出后处理字段、子装配体展开、`exclude_hidden_bodies`；对照组件清单的检查（本机有 `private-fixture.json` 指定的历史失败任务时用它们的配置复现） |
 | `test_validation.py` | 否 | 校验器能否发现损坏的导出：缺失网格、单位错误、关节方向、零位位置、网格与 CAD 不一致、隐藏实体 |
 | `test_postprocess.py` | 否 | mimic 和 world 后处理 |
 | `test_jobs.py` | 否 | 排队、工作进程存活检测、卡住与暂停、取消、进度、读写 JSON 时的文件占用、网格复用候选、耗时记录 |
 | `test_provenance.py` | 否 | 配置来源与 CAD 版本判断；在 `scripts\testdata\provenance-jobs` 的合成任务上运行，另可在 `private-fixture.json` 指定的真实任务上运行 |
 | `test_maintenance.py` | 否 | 发布与清理 |
 | `test_cad_regressions.py` | 是 | 含虚拟零件的 Pack and Go、共用原点的关节、只检查模式、复用副本、进度、mimic/world、写明错误组件名的报错、缺少零件文件时依赖预检在复制前失败 |
-| `test_nested_subassemblies.py` | 是 | 两层深的整体子装配体导出完整、分块与整体质量属性一致、网格复用与移动；本机有工作站 CAD 时还测试料架和 `exclude_hidden_bodies`（路径可用 `SW_URDF_VIAL_RACK` 指定） |
+| `test_nested_subassemblies.py` | 是 | 两层深的整体子装配体导出完整、分块与整体质量属性一致、网格复用与移动；有 `private-fixture.json` 指定的私有 CAD 时，还测试嵌套子装配体的料架和 `exclude_hidden_bodies` |
 | `test_tool_mcp.py`、`test_mcp.py` | 是 | MCP 工具端到端 |
 | `test_registered_mcp.py`、`test_mcp_smoke.py` | 是 | 已注册的 MCP 服务；`test_mcp_smoke.py` 需要已打开的 SolidWorks 会话 |
 
+标为“否”的测试既不需要 SolidWorks 也不需要构建，GitHub Actions 会在每次 push 和 pull request 时运行它们（[offline-tests.yml](.github/workflows/offline-tests.yml)）。复现维护者自有模型的测试从不受版本管理的 `validation\private-fixture.json` 读取路径、任务编号和名称（见 `scripts\private_fixture.py`），没有该文件时跳过。
+
 ## 当前限制
 
-- 输出为传统 ROS URDF 包。ROS 2 启动文件、MJCF/USD、自动建模和全自动关节推断不在本版本范围内。导出的模型仍应在目标仿真环境中验证。
+- 输出为传统 ROS URDF 包。ROS 2 启动文件、MJCF/USD、自动建模和全自动关节推断不在本版本范围内（MuJoCo 见 [twin-pipeline](#下游twin-pipeline)）。导出的模型仍应在目标仿真环境中验证。
 - 关节自动推断只看每个子 Link 的第一个组件（见[关节与坐标系](#关节与坐标系)）。
 - 旧配置中的外观设置尚未开放到 JSON。
+
+## 下游：twin-pipeline
+
+[twin-pipeline](https://github.com/yunylll/twin-pipeline)（即将公开）是这套流程的下游部分：读取本工具导出的 URDF 包，转换为 MuJoCo 模型，运行冒烟检查并生成报告。它通过 `scripts\tool_service.py` 的 Python API（`check_configuration`、`export_urdf`、`start_export`、`wait_job`）和命令行 `validate-config --model` 调用本工具。本仓库只负责 CAD 部分：从 SolidWorks 到经过校验的 URDF。
 
 ## 来源与许可证
 
 - 上游源码快照：ros/solidworks_urdf_exporter `882169e28952f0d17c87d7eab98826454421aabf`（MIT）。`build\core-source-manifest.json` 记录每个上游文件的哈希和是否经过适配，`build\core-source` 中可以审查生成后的源码，适配规则在 `scripts\prepare-core.py`。
 - `vendor` 中保留的 solidworks_urdf_exporter2 仅供参考，本工具不用它导出。上游许可证保留在 `vendor` 中，并随本地构建复制为 `SW2URDF-LICENSE.txt`。
 - 本工具使用 MIT 许可证，见 [LICENSE](LICENSE)；上游许可证见 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)。
+- SolidWorks 是达索系统的商标。运行和构建本工具需要已获许可的 SolidWorks 2026；本仓库不再分发其 API DLL。

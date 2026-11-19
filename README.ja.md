@@ -23,6 +23,7 @@ SolidWorks 2026 をバックグラウンドで操作し、アセンブリや部�
 - [MCP](#mcp)
 - [テスト](#テスト)
 - [制限事項](#制限事項)
+- [下流：twin-pipeline](#下流twin-pipeline)
 - [出典とライセンス](#出典とライセンス)
 
 ## 主な機能
@@ -42,6 +43,7 @@ SolidWorks 2026 をバックグラウンドで操作し、アセンブリや部�
 ## 動作環境とインストール
 
 - Windows x64、SolidWorks 2026、.NET Framework 4.7.2 以降（Roslyn コンパイラーが必要とします）。
+- **ご自身でライセンスを持つ SolidWorks 2026 が必要です。** SolidWorks とその API DLL（`SolidWorks.Interop.*`）は Dassault Systèmes のもので、このリポジトリには含まれず、再配布もしていません。ビルドはインストール先からバージョン管理外の `build\bin` にコピーします。このフォルダーはコミットも公開もしないでください。
 - Python 環境はインストールスクリプトがワークスペース内（`.venv`）に作成します。
 
 初回インストール（Python 環境の作成、固定バージョンの依存パッケージのインストール、Microsoft Roslyn コンパイラーのダウンロード、ツールのビルド）：
@@ -156,7 +158,7 @@ export、start-export の追加オプション：
 | `exclude_hidden_bodies` | 任意。非表示ボディを質量に含めない部品ファイル名（後述） |
 | `source` | ツールが書き込む：設定を検証した CAD バージョン。[CAD バージョンと前回のエクスポート](#cad-バージョンと前回のエクスポート)を参照 |
 
-Link のフィールド：`name`、`parent`、`components`（inspect が示す完全なインスタンス名。例 `gantry_asm-1/gantry_x1_asm-1/gantry_x1_p03-2`）、`coordinate_system`、`mesh_quality`（`coarse` または `fine`）、`frame_only`、`joint`。関節のフィールド：`name`、`type`、`axis_name`、`axis`、`xyz`、`rpy`、`lower`、`upper`、`effort`、`velocity`、`damping`、`friction`、任意の `mimic`。
+Link のフィールド：`name`、`parent`、`components`（inspect が示す完全なインスタンス名。例 `frame_asm-1/axis_x_asm-1/carriage-2`）、`coordinate_system`、`mesh_quality`（`coarse` または `fine`）、`frame_only`、`joint`。関節のフィールド：`name`、`type`、`axis_name`、`axis`、`xyz`、`rpy`、`lower`、`upper`、`effort`、`velocity`、`damping`、`friction`、任意の `mimic`。
 
 ### 関節と座標系
 
@@ -171,7 +173,7 @@ Link のフィールド：`name`、`parent`、`components`（inspect が示す�
 
 - 質量、重心、慣性は SolidWorks のコンポーネント質量特性から取ります。元のエクスポーターは各ボディの慣性を単純に足すため、複数部品からなる Link では出力メッシュから計算した慣性より 3〜5 倍小さくなり、質量も形状と密度から計算するため SolidWorks でのオーバーライドが失われます。コンポーネント質量特性はメッシュと一致し、オーバーライドも含みます。
 - ツールは、オーバーライドのない Link で両方の計算の質量と重心が一致し、Link の質量の合計がアセンブリ質量に等しいことを確認してから、エクスポーターの値を置き換えます。そうでなければエクスポーターの値を残し、`warnings` で知らせます。オーバーライドした質量を使った Link とコンポーネントは `warnings` と `bridge.massOverrides` に、エクスポーター自身の慣性は `bridge.exporterInertia` に残ります。
-- **`exclude_hidden_bodies`**（トップレベル）：部品ファイル名のリスト（例 `["gantry_z1_p05.SLDPRT"]`）。これらの部品の非表示ソリッドボディを質量・慣性とメッシュ検査の CAD 体積から除きます。合致が参照するミラー元ボディなど、CAD に必要な非表示ボディに使います（削除すると合致が壊れます）。SolidWorks はアセンブリ質量に非表示ボディを含めるため、質量の検査では除いた分を差し引きます。`warnings` と `bridge.excludedHiddenBodies` に Link ごとの除外質量を示します。どのコンポーネントのファイルでもない名前は直ちにエラーとなり、似た名前を示します。SolidWorks がアセンブリ内で計量するインスタンス（`bridge.partMassCheck` を参照）は非表示ボディを含んだままで、未適用として示します。
+- **`exclude_hidden_bodies`**（トップレベル）：部品ファイル名のリスト（例 `["bracket_left.SLDPRT"]`）。これらの部品の非表示ソリッドボディを質量・慣性とメッシュ検査の CAD 体積から除きます。合致が参照するミラー元ボディなど、CAD に必要な非表示ボディに使います（削除すると合致が壊れます）。SolidWorks はアセンブリ質量に非表示ボディを含めるため、質量の検査では除いた分を差し引きます。`warnings` と `bridge.excludedHiddenBodies` に Link ごとの除外質量を示します。どのコンポーネントのファイルでもない名前は直ちにエラーとなり、似た名前を示します。SolidWorks がアセンブリ内で計量するインスタンス（`bridge.partMassCheck` を参照）は非表示ボディを含んだままで、未適用として示します。
 
 ### エクスポート後の処理
 
@@ -186,7 +188,7 @@ Link のフィールド：`name`、`parent`、`components`（inspect が示す�
 - 検査では、循環または切断された Link ツリー、コンポーネントの重複割り当て、誤った軸の長さ、無効なリミット、有限でない数値を拒否し、Link または関節、期待値、実際の値を示します。
 - **モデルに照らした検査。** `validate-config --model`（MCP：`validate_configuration` の `model_path`）と、設定付きのすべての check とエクスポートは、SolidWorks を起動する前に、同じモデル・同じ CAD バージョンの直近のジョブ（inspect、check、エクスポート）が記録したコンポーネント一覧と設定を照合します。すべての問題を一度に `model_check.issues` に示し、それぞれ Link または関節、期待値（`expected`）、実際の値（`actual`）、名前の問題には似た名前（`similar`）を付けます：
   - エラー：アセンブリにないコンポーネント名（例 `3_DOF_ARM_SEGMNT-1`、似た名前 `3_DOF_ARM_SEGMENT-1`）、アクティブな構成で抑制されたコンポーネント、どの Link にもないソリッドボディのある部品、直接と親サブアセンブリ経由の両方で割り当てたコンポーネント、どのコンポーネントも使わない `exclude_hidden_bodies` のファイル、`recompute_kinematics=true` のとき以前 CAD から推定した種類と異なる関節の種類（推定に使った最初のコンポーネントが同じ場合だけ比較）。
-  - エラーがあると check とエクスポートはジョブを作らず、すべての問題を示して `INVALID_INPUT` で数秒のうちに拒否します。以前はアセンブリを開いた後にしか分かりませんでした（ジョブ a0000001、a0000004 の綴りの誤りは CAD 段階で 7 回失敗、a0000002 の未割り当ての部品、a0000003 の 8 つの関節の種類）。
+  - エラーがあると check とエクスポートはジョブを作らず、すべての問題を示して `INVALID_INPUT` で数秒のうちに拒否します。以前はアセンブリを開いた後にしか分かりませんでした。このチェックができる前は、コンポーネント名の綴りの誤り一つで CAD 段階が 7 回続けて失敗しました。
   - 警告：`recompute_kinematics=false` で CAD の推定と異なる関節の種類（設定の種類で出力し、違いはまとめて 1 つの警告）、古いジョブのコンポーネント一覧に部品のソリッドボディの有無が記録されていない場合の未割り当ての部品。ツールが設定の関節の種類を変えることはありません。
   - そのコンポーネント一覧の後にモデルの部品やサブアセンブリのファイルが変わっていれば（ジョブが記録したファイルハッシュと比較）、エラーはすべてその旨を付けた警告になります。その CAD バージョンのジョブがなければ検査を省き（`model_check.checked=false`）、SolidWorks の段階でこれまでどおり検査します。一度 inspect を実行すれば有効になります。
 - inspect 結果の `unassigned_components` はどの Link にも割り当てられていないソリッド部品、`overlapping_components` は直接と親サブアセンブリ経由の両方で割り当てられたコンポーネントです。どちらかが空でなければ `configuration_ready=false` となり、エクスポートはメッシュを作る前に、コンポーネント名を示して失敗します。
@@ -241,7 +243,7 @@ Link のフィールド：`name`、`parent`、`components`（inspect が示す�
 
 ## 大規模アセンブリ
 
-lab_workstation ワークステーション（3250 コンポーネント、19 Link）での参考値：
+研究室のワークステーションのアセンブリ（3250 コンポーネント、19 Link）での参考値：
 
 | 操作 | 所要時間 |
 |---|---|
@@ -295,12 +297,12 @@ lab_workstation ワークステーション（3250 コンポーネント、19 Li
 
 - **ソースは読み取りのみ。** ソースファイルは読み取りとハッシュ計算だけを行います。ツールはまずソースモデルと依存ファイルをコピーし、参照の書き換え、Pack and Go、エクスポートはスナップショットに対してだけ行います。API がパック時にモデルを保存しても、保存されるのはスナップショットです。最後にすべてのソースのハッシュを再確認します（`source_unchanged`）。
 - **見つからない参照。** 保存された参照がこのコンピューターにないファイル（古い構成、インポート元ファイル、ライブラリ部品など）を指していても、先に SolidWorks でモデルを開く必要はありません。スナップショットはそれらのパスを飛ばして作り、開いた後で抑制されていないすべてのコンポーネントが読み込まれたかを確認します。ファイルがないのが有効なコンポーネントの場合だけ、コンポーネント名とパスを示して失敗します。飛ばした参照とファイルのない抑制コンポーネントは `warnings` に記録します。
-- **依存関係の事前チェック。** export、start-export、check（`check_only`）、inspect、prepare は、ファイルをコピーしたり開いたりする前に、モデルとその各ファイルに保存された参照を `GetDocumentDependencies2` で読みます（段階 `dependency_check`。lab_workstation の約 200 の参照で数秒）。結果は `dependency_check` にあり、すべての問題を一度に、それぞれの修正方法とともに示します。単独でも実行できます：コマンドライン `check-deps`、MCP `check_dependencies`、Python `check_dependencies`。判定は上のスナップショットの扱いと同じです：
+- **依存関係の事前チェック。** export、start-export、check（`check_only`）、inspect、prepare は、ファイルをコピーしたり開いたりする前に、モデルとその各ファイルに保存された参照を `GetDocumentDependencies2` で読みます（段階 `dependency_check`。そのワークステーションの約 200 の参照で数秒）。結果は `dependency_check` にあり、すべての問題を一度に、それぞれの修正方法とともに示します。単独でも実行できます：コマンドライン `check-deps`、MCP `check_dependencies`、Python `check_dependencies`。判定は上のスナップショットの扱いと同じです：
   - **エラー（ジョブは直ちに `DEPENDENCY_CHECK_FAILED` で失敗し、何もコピーしない）**：有効なコンポーネントが使うファイルがない。スナップショットまたは Pack and Go のコピーのパスが 259 文字を超える。
   - **警告**：抑制されたコンポーネントだけが使う、またはどのコンポーネントも使わない見つからないファイル。Toolbox / デザインライブラリのファイル（`C:\SOLIDWORKS Data\...` など）と他のコンピューターやアカウントのパス（`C:\Users\<他の人>\...`）は、どのコンポーネントが使うか分からない間は警告。3D Interconnect のインポートキャッシュ（`...\Temp\swx*\IC~~\`）と部品のインポート元ファイル（STEP、IGES など。部品はインポートしたボディを保持しています）。
   - **情報**：モデルフォルダーの外にある既存ファイル（スナップショットにコピーします）、同名のファイル（Pack and Go で名前を変えます）、仮想コンポーネントの一時パス（`VC~~`。アセンブリ内に保存されており、他のコンピューターのものでも問題ありません）。
   - どのコンポーネントがファイルを使うかは、SolidWorks で開いている同じモデル、または同じモデル・同じ CAD バージョンの直近のジョブが記録したコンポーネント一覧（`usage_source`）から判断します。どちらもない場合、見つからないファイルは警告だけです。有効なコンポーネントに本当にファイルがなければ、スナップショットを開いたときに失敗します。一度 inspect を実行すれば区別できます。
-  - 以前 Pack and Go が保存先のファイル名を拒否した失敗（ジョブ a0000005、a0000006、旧 lab_workstation 作業台）は、中国語のファイル名やパスの長さとは無関係でした。このアセンブリには仮想コンポーネントが 10 個あり、それらに新しい保存先を指定していましたが、SolidWorks は仮想コンポーネント自身の既定の保存先しか受け付けません。現在は既定の保存先を保ち（4bee8a6 を参照）、同じモデルは後に inspect もエクスポートも成功しています。中国語のファイル名 72 個、最長 202 文字のパスも問題ありませんでした。
+  - 以前 Pack and Go が保存先のファイル名を拒否した失敗（そのワークステーションの以前の版）は、中国語のファイル名やパスの長さとは無関係でした。このアセンブリには仮想コンポーネントが 10 個あり、それらに新しい保存先を指定していましたが、SolidWorks は仮想コンポーネント自身の既定の保存先しか受け付けません。現在は既定の保存先を保ち（4bee8a6 を参照）、同じモデルは後に inspect もエクスポートも成功しています。中国語のファイル名 72 個、最長 202 文字のパスも問題ありませんでした。
 - **SolidWorks で開いているモデル。** アセンブリが SolidWorks で開かれている場合、アクティブなモデルの読み取り専用の一覧を読み、スナップショットの構成名、コンポーネント数、質量が一致することを確認します。開いているモデルに未保存の変更があるとジョブは `UNSAVED_CHANGES` で失敗します。保存するか保存せずに閉じてから再実行するか、`--use-saved-files` でディスク上の保存済みファイルをエクスポートしてください（`warnings` にその旨が記録されます）。
 
 ## Python
@@ -350,25 +352,32 @@ print(result["bridge"]["urdf"])
 | テスト | SolidWorks | 内容 |
 |---|---|---|
 | `test_dependencies.py` | 不要 | 依存関係チェックの分類：Toolbox、他のコンピューターのパス、インポートキャッシュ、仮想コンポーネント、有効/抑制/未使用、長すぎるパス |
-| `test_configuration.py` | 不要 | 設定の検査、後処理のフィールド、サブアセンブリの展開、`exclude_hidden_bodies`、コンポーネント一覧に照らした検査（ジョブ a0000001、a0000002、a0000003 がこのコンピューターにあればその設定で再現） |
+| `test_configuration.py` | 不要 | 設定の検査、後処理のフィールド、サブアセンブリの展開、`exclude_hidden_bodies`、コンポーネント一覧に照らした検査（`private-fixture.json` が示す過去の失敗ジョブがこのコンピューターにあればその設定で再現） |
 | `test_validation.py` | 不要 | 検証が壊れたエクスポートを見つけること：メッシュの欠落、単位の誤り、関節の向き、ゼロ姿勢での配置、メッシュと CAD、非表示ボディ |
 | `test_postprocess.py` | 不要 | mimic と world の後処理 |
 | `test_jobs.py` | 不要 | キュー、ワーカーの生存確認、停滞と一時停止、キャンセル、進捗、読み取り中の JSON ファイル、メッシュ再利用の候補、所要時間 |
 | `test_provenance.py` | 不要 | 設定の由来と CAD バージョン。`scripts\testdata\provenance-jobs` の合成ジョブで実行し、`private-fixture.json` があれば実際のジョブでも実行 |
 | `test_maintenance.py` | 不要 | 公開とクリーンアップ |
 | `test_cad_regressions.py` | 必要 | 仮想部品を含む Pack and Go、原点を共有する関節、チェック専用モード、準備済みコピーの再利用、進捗、mimic/world、誤ったコンポーネント名を示すエラー、部品ファイルがないときにコピー前に失敗する依存関係チェック |
-| `test_nested_subassemblies.py` | 必要 | 2 階層下のサブアセンブリを丸ごと列挙したときのメッシュの完全性、分割と一括の質量特性の一致、メッシュの再利用と移動。ワークステーションの CAD があればラックと `exclude_hidden_bodies` も（パスは `SW_URDF_VIAL_RACK` で指定） |
+| `test_nested_subassemblies.py` | 必要 | 2 階層下のサブアセンブリを丸ごと列挙したときのメッシュの完全性、分割と一括の質量特性の一致、メッシュの再利用と移動。`private-fixture.json` が示す非公開の CAD があれば、入れ子のサブアセンブリを持つラックと `exclude_hidden_bodies` も |
 | `test_tool_mcp.py`、`test_mcp.py` | 必要 | MCP ツールのエンドツーエンド |
 | `test_registered_mcp.py`、`test_mcp_smoke.py` | 必要 | 登録済みの MCP サーバー。`test_mcp_smoke.py` は開いている SolidWorks セッションが必要 |
 
+「不要」のテストは SolidWorks もビルドも必要とせず、GitHub Actions が push と pull request のたびに実行します（[offline-tests.yml](.github/workflows/offline-tests.yml)）。メンテナー自身のモデルを再現するテストは、バージョン管理外の `validation\private-fixture.json` からパス、ジョブ ID、名前を読み（`scripts\private_fixture.py` を参照）、このファイルがなければスキップします。
+
 ## 制限事項
 
-- 出力は従来の ROS URDF パッケージです。ROS 2 の起動ファイル、MJCF/USD、自動モデリング、完全自動の関節推定は対象外です。エクスポートしたモデルは対象のシミュレーターでも検証してください。
+- 出力は従来の ROS URDF パッケージです。ROS 2 の起動ファイル、MJCF/USD、自動モデリング、完全自動の関節推定は対象外です（MuJoCo は [twin-pipeline](#下流twin-pipeline) を参照）。エクスポートしたモデルは対象のシミュレーターでも検証してください。
 - 関節の自動推定は各子 Link の最初のコンポーネントだけを見ます（[関節と座標系](#関節と座標系)を参照）。
 - 旧設定の外観設定はまだ JSON から編集できません。
+
+## 下流：twin-pipeline
+
+[twin-pipeline](https://github.com/yunylll/twin-pipeline)（公開予定）はこのワークフローの下流部分です。本ツールがエクスポートした URDF パッケージを MuJoCo モデルに変換し、スモークチェックを実行してレポートを作成します。本ツールは `scripts\tool_service.py` の Python API（`check_configuration`、`export_urdf`、`start_export`、`wait_job`）とコマンドライン `validate-config --model` から呼び出されます。このリポジトリは CAD 側、つまり SolidWorks から検証済みの URDF までを担当します。
 
 ## 出典とライセンス
 
 - 上流ソースのスナップショット：ros/solidworks_urdf_exporter `882169e28952f0d17c87d7eab98826454421aabf`（MIT）。`build\core-source-manifest.json` に各上流ファイルのハッシュと改修の有無を記録し、生成したソースは `build\core-source` で確認できます。改修の規則は `scripts\prepare-core.py` にあります。
 - `vendor` の solidworks_urdf_exporter2 は参考用に残しているだけで、エクスポートには使いません。上流のライセンスは `vendor` に保持し、ローカルビルドごとに `SW2URDF-LICENSE.txt` としてコピーします。
 - 本ツールは MIT ライセンスです（[LICENSE](LICENSE)）。上流のライセンスは [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) を参照してください。
+- SolidWorks は Dassault Systèmes の商標です。本ツールの実行とビルドにはライセンスを持つ SolidWorks 2026 が必要です。その API DLL はここでは再配布していません。
