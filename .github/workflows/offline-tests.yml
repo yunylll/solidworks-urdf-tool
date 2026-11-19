@@ -1,0 +1,38 @@
+name: Offline tests
+
+# Only the tests that need neither SolidWorks nor the compiled tool (build\bin): SolidWorks is
+# proprietary and not available on hosted runners, and its API DLLs are not redistributed here.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true  # ros/solidworks_urdf_exporter: the 3_DOF_ARM sample package the tests read
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-validation.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements-validation.txt
+      - name: Run offline tests
+        shell: pwsh
+        run: |
+          $failed = @()
+          foreach ($test in 'test_dependencies', 'test_configuration', 'test_validation', 'test_postprocess', 'test_jobs', 'test_provenance', 'test_maintenance') {
+            Write-Output "::group::$test"
+            python "scripts\$test.py"
+            if ($LASTEXITCODE -ne 0) { $failed += $test }
+            Write-Output "::endgroup::"
+          }
+          if ($failed) { throw "Failed: $($failed -join ', ')" }
