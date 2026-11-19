@@ -279,7 +279,7 @@ lab_workstation ワークステーション（3250 コンポーネント、19 Li
 .\.venv\Scripts\python.exe scripts\tool_cli.py cleanup-jobs --keep-latest 3 --delete
 ```
 
-- `--older-than-days`、`--keep-latest`、`--job` のいずれかでジョブを選ぶ必要があります。どれもないとコマンドは `INVALID_INPUT` で拒否されます。
+- `--older-than-days`、`--keep-latest`、`--job` でジョブを選びます。どれもない場合は dry run だけが可能で、終了したすべてのジョブを一覧します。`--delete` で削除するにはいずれかが必要で、ないとコマンドは `INVALID_INPUT` で拒否されます。
 - `--delete`（MCP / Python：`dry_run=false`）がなければ、削除するスナップショット（`output\cad`、`preflight\output\cad`、`--include-logs` ならログ）と解放できるバイト数を一覧するだけです。
 - 常に残すもの：`result.json`、`request.json`、各設定、`native*.json`、`mesh-keys.json`、URDF パッケージ（以後のエクスポートがメッシュを再利用します）。
 - 対象外：待機中または実行中のジョブ。残すジョブが `model_path`、`reusable_model`、ソースの一覧として使っているスナップショット。各モデルの最新の成功したエクスポートのスナップショット（`--no-keep-latest-success` を除く）。
