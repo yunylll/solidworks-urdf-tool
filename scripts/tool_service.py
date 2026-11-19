@@ -221,7 +221,7 @@ def _needs_preflight(config):
 
 
 def create_job(operation, model_path, package_name="robot_description", *, config_path=None, reference_urdf=None, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds=DEFAULT_STALL_SECONDS, use_saved_files=False,
-               accept_source_change=False, kinematics_tolerance_mm=provenance.DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg=provenance.DEFAULT_TOLERANCE_DEG, compare_previous=True, write_config_source=False, recompute_preflight=False, reuse_meshes=True):
+               accept_source_change=False, kinematics_tolerance_mm=provenance.DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg=provenance.DEFAULT_TOLERANCE_DEG, compare_previous=True, write_config_source=False, recompute_preflight=False, reuse_meshes=True, publish_to=None):
     source = Path(model_path).expanduser().resolve()
     if not source.is_file() or source.suffix.lower() not in {".sldasm", ".sldprt"}:
         raise ValueError(f"model_path must be an existing .SLDASM or .SLDPRT, got {str(source)!r}" + (" (file not found)." if not source.is_file() else "."))
@@ -237,6 +237,9 @@ def create_job(operation, model_path, package_name="robot_description", *, confi
         raise ValueError("write_config_source needs config_path: it records the CAD version in that configuration file.")
     if operation == "check" and not config_path:
         raise ValueError("A check needs config_path: it verifies a JSON configuration's Link frames and joints.")
+    if publish_to is not None and operation != "export":
+        raise ValueError("publish_to applies to an export only.")
+    publish_to = check_publish_to(publish_to)
     if not NATIVE.is_file():
         raise RuntimeError("Build the native tool with scripts/build-tool.ps1 first.")
     config = load_config(config_path) if config_path else None
@@ -262,6 +265,8 @@ def create_job(operation, model_path, package_name="robot_description", *, confi
               "cad_version_sha256": cad_version, "accept_source_change": bool(accept_source_change), "kinematics_tolerance": {"mm": kinematics_tolerance_mm, "deg": kinematics_tolerance_deg}, "recompute_preflight": bool(recompute_preflight), "warnings": []}
     if operation == "export":
         record["reuse_meshes"] = bool(reuse_meshes)
+        if publish_to:
+            record["publish_to"] = publish_to
     if original_path != str(source):
         record["original_model_path"] = original_path
     if config:
@@ -884,6 +889,11 @@ def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
         record.pop("phase", None)
         record["finished_at"] = stamp()
         write_json(directory / "result.json", record)
+        if record.get("publish_to"):
+            record["publish"] = publish_job(directory, record)
+            if record["publish"].get("error"):
+                record["warnings"] = record.get("warnings", []) + ["Publishing to " + record["publish_to"] + " failed (the export itself is unaffected): " + record["publish"]["error"]["message"]]
+            write_json(directory / "result.json", record)
     return record
 
 
@@ -983,9 +993,9 @@ def operation(operation_name, model_path, package_name="robot_description", **op
 
 
 def export_urdf(model_path, package_name="robot_description", *, config_path=None, reference_urdf=None, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds=DEFAULT_STALL_SECONDS, use_saved_files=False,
-                accept_source_change=False, kinematics_tolerance_mm=provenance.DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg=provenance.DEFAULT_TOLERANCE_DEG, compare_previous=True, write_config_source=False, recompute_preflight=False, reuse_meshes=True):
+                accept_source_change=False, kinematics_tolerance_mm=provenance.DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg=provenance.DEFAULT_TOLERANCE_DEG, compare_previous=True, write_config_source=False, recompute_preflight=False, reuse_meshes=True, publish_to=None):
     return operation("export", model_path, package_name, config_path=config_path, reference_urdf=reference_urdf, timeout_seconds=timeout_seconds, stall_timeout_seconds=stall_timeout_seconds, use_saved_files=use_saved_files,
-                     accept_source_change=accept_source_change, kinematics_tolerance_mm=kinematics_tolerance_mm, kinematics_tolerance_deg=kinematics_tolerance_deg, compare_previous=compare_previous, write_config_source=write_config_source, recompute_preflight=recompute_preflight, reuse_meshes=reuse_meshes)
+                     accept_source_change=accept_source_change, kinematics_tolerance_mm=kinematics_tolerance_mm, kinematics_tolerance_deg=kinematics_tolerance_deg, compare_previous=compare_previous, write_config_source=write_config_source, recompute_preflight=recompute_preflight, reuse_meshes=reuse_meshes, publish_to=publish_to)
 
 
 def check_configuration(model_path, config_path, *, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds=DEFAULT_STALL_SECONDS, use_saved_files=False,
@@ -1004,9 +1014,9 @@ def prepare_model(model_path, *, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_
 
 
 def start_export(model_path, package_name="robot_description", *, config_path=None, reference_urdf=None, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds=DEFAULT_STALL_SECONDS, use_saved_files=False,
-                 accept_source_change=False, kinematics_tolerance_mm=provenance.DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg=provenance.DEFAULT_TOLERANCE_DEG, compare_previous=True, write_config_source=False, recompute_preflight=False, reuse_meshes=True):
+                 accept_source_change=False, kinematics_tolerance_mm=provenance.DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg=provenance.DEFAULT_TOLERANCE_DEG, compare_previous=True, write_config_source=False, recompute_preflight=False, reuse_meshes=True, publish_to=None):
     return start_job("export", model_path, package_name, config_path=config_path, reference_urdf=reference_urdf, timeout_seconds=timeout_seconds, stall_timeout_seconds=stall_timeout_seconds, use_saved_files=use_saved_files,
-                     accept_source_change=accept_source_change, kinematics_tolerance_mm=kinematics_tolerance_mm, kinematics_tolerance_deg=kinematics_tolerance_deg, compare_previous=compare_previous, write_config_source=write_config_source, recompute_preflight=recompute_preflight, reuse_meshes=reuse_meshes)
+                     accept_source_change=accept_source_change, kinematics_tolerance_mm=kinematics_tolerance_mm, kinematics_tolerance_deg=kinematics_tolerance_deg, compare_previous=compare_previous, write_config_source=write_config_source, recompute_preflight=recompute_preflight, reuse_meshes=reuse_meshes, publish_to=publish_to)
 
 
 def start_job(operation_name, model_path, package_name="robot_description", **options):
@@ -1018,5 +1028,226 @@ def start_job(operation_name, model_path, package_name="robot_description", **op
         write_json(job_directory(identifier) / "worker.json", identity)
     record = read_json(job_directory(identifier) / "result.json") or {}
     started = {"job_id": identifier, "job": str(job_directory(identifier)), "status": "queued", "worker_pid": process.pid, "next_step": "Poll get_export_job with this job_id and wait_seconds (for example 300) until status is terminal; only status=succeeded with passed=true is a success."}
-    started.update({key: record[key] for key in ("warnings", "config_stale", "previous_export") if record.get(key) is not None})
+    started.update({key: record[key] for key in ("warnings", "config_stale", "previous_export", "publish_to") if record.get(key) is not None})
     return started
+
+
+# ---- Publishing a passed export into a robot twin directory ----
+
+PUBLISH_FILES = (("export-config.json", ("robot-config.json", "configuration.json")), ("export-request.json", ("request.json",)), ("export-result.json", ("result.json",)))
+
+
+def _tree_hashes(root):
+    root = Path(root)
+    return {p.relative_to(root).as_posix(): sha256(p) for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def check_publish_to(publish_to):
+    """The resolved publish directory, or None; refuses a file or a place inside the job directory."""
+    if publish_to is None:
+        return None
+    target = Path(publish_to).expanduser().resolve()
+    if target.exists() and not target.is_dir():
+        raise ValueError(f"publish_to must be a directory, got the file {str(target)!r}.")
+    jobs = JOBS.resolve()
+    if target == jobs or jobs in target.parents or target in jobs.parents:
+        raise ValueError(f"publish_to must lie outside the job directory {jobs}, got {str(target)!r}.")
+    return str(target)
+
+
+def publish_job(directory, record):
+    """Copy a passed export's URDF package and its configuration/request/result into record['publish_to'].
+
+    Layout: <publish_to>/urdf/<package>/ and <publish_to>/export/export-{config,request,result}.json. Anything
+    already there is moved to <publish_to>/export/history/<timestamp>_job-<id12>/ first, never overwritten.
+    Returns the publish record; a failure is reported in its error and never changes the export's passed.
+    """
+    import shutil
+    directory = Path(directory)
+    target = Path(record["publish_to"])
+    publish = {"target": str(target), "started_at": stamp(), "passed": False}
+    if record.get("status") != "succeeded" or record.get("passed") is not True:
+        publish.update(skipped=True, message=f"Not published: only a succeeded and passed export is published (status={record.get('status')}, passed={record.get('passed')}).")
+        return publish
+    try:
+        request = read_json(directory / "request.json") or {}
+        package = request.get("package_name") or "robot_description"
+        source_package = directory / "output" / package
+        if not (source_package / "urdf").is_dir():
+            raise FileNotFoundError(f"The job has no URDF package at {source_package}.")
+        destination_package = target / "urdf" / package
+        export = target / "export"
+        files = []
+        for name, candidates in PUBLISH_FILES:
+            source = next((directory / c for c in candidates if (directory / c).is_file()), None)
+            if source is None:
+                if name == "export-config.json":
+                    continue  # an export from the CAD's saved configuration has no JSON configuration
+                raise FileNotFoundError(f"The job has no {candidates[0]}.")
+            files.append((source, export / name))
+        history = export / "history" / (datetime.now().strftime("%Y-%m-%d_%H%M%S") + f"_job-{record['job_id'][:12]}")
+        moved = []
+        for old in [destination_package] + [d for _, d in files]:
+            if old.exists():
+                place = history / "urdf" / package if old == destination_package else history / old.name
+                if place.exists():
+                    raise FileExistsError(f"{place} already exists.")
+                place.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(old), str(place))
+                moved.append({"from": str(old), "to": str(place)})
+        publish["moved_to_history"] = moved
+        if moved:
+            publish["history"] = str(history)
+        destination_package.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source_package, destination_package)
+        expected, copied = _tree_hashes(source_package), _tree_hashes(destination_package)
+        if expected != copied:
+            different = sorted(set(expected) ^ set(copied)) or [k for k in expected if expected[k] != copied.get(k)]
+            raise OSError(f"The copied package {destination_package} differs from the job's package: " + ", ".join(different[:10]))
+        publish["package"] = {"path": str(destination_package), "source": str(source_package), "files": len(copied), "sha256": hashlib.sha256(json.dumps(copied, sort_keys=True).encode()).hexdigest()}
+        # export-result.json is the record as published, with this publish block still in progress.
+        record["publish"] = dict(publish, running=True)
+        write_json(directory / "result.json", record)
+        publish["files"] = {}
+        export.mkdir(parents=True, exist_ok=True)
+        for source, destination in files:
+            shutil.copy2(source, destination)
+            digest = sha256(source)
+            if sha256(destination) != digest:
+                raise OSError(f"The copy {destination} does not match {source}.")
+            publish["files"][destination.name] = {"path": str(destination), "source": str(source), "sha256": digest}
+        publish["passed"] = True
+    except Exception as exc:
+        publish["error"] = {"code": "PUBLISH_FAILED", "message": f"{type(exc).__name__}: {exc}"}
+    publish["finished_at"] = stamp()
+    return publish
+
+
+# ---- Removing the large files of old jobs ----
+
+def _size(path):
+    path = Path(path)
+    if path.is_file():
+        return path.stat().st_size
+    return sum(p.stat().st_size for p in path.rglob("*") if p.is_file()) if path.is_dir() else 0
+
+
+def _inside(path, folder):
+    try:
+        Path(path).resolve().relative_to(Path(folder).resolve())
+        return True
+    except (ValueError, OSError, TypeError):
+        return False
+
+
+def cleanup_jobs(older_than_days=None, keep_latest=None, dry_run=True, include_logs=False, keep_latest_success=True, job_ids=None, jobs_root=None):
+    """Delete the CAD snapshots (output/cad, preflight/output/cad and, optionally, logs) of old finished jobs.
+
+    A job is selected when it finished more than older_than_days ago, or when it is not among the keep_latest newest
+    jobs of its model and package (both given: either selects it), or when job_ids lists it. Always kept: result.json,
+    request.json, the configurations, native*.json, mesh-keys.json and the URDF package output/<package>, whose meshes
+    later exports reuse. Skipped: queued or running jobs; snapshots a kept job still uses (its model_path,
+    reusable_model or source manifest); and, with keep_latest_success, the newest succeeded export of each model and
+    package. dry_run (default true) only lists what would be deleted and how many bytes that frees.
+    """
+    import shutil
+    if older_than_days is None and keep_latest is None and not job_ids:
+        raise ValueError("Give older_than_days, keep_latest or job_ids to choose the jobs to clean up.")
+    if older_than_days is not None and (isinstance(older_than_days, bool) or not isinstance(older_than_days, (int, float)) or older_than_days < 0):
+        raise ValueError(f"older_than_days must be a number of days >= 0, got {older_than_days!r}.")
+    if keep_latest is not None:
+        _check_int("keep_latest", keep_latest, 0, 1000000)
+    root = Path(jobs_root) if jobs_root else JOBS
+    jobs = []
+    for result_path in root.glob("*/result.json"):
+        record = read_json(result_path)
+        if not isinstance(record, dict):
+            continue
+        request = read_json(result_path.parent / "request.json") or {}
+        manifest = read_json(result_path.parent / "source-manifest.json") or {}
+        group = (str(record.get("original_model_path") or record.get("model_path") or "").lower(), request.get("package_name") or "")
+        jobs.append({"id": result_path.parent.name, "dir": result_path.parent, "record": record, "when": record.get("finished_at") or record.get("created_at") or "", "group": group,
+                     "uses": [p for p in (record.get("model_path"), record.get("reusable_model"), manifest.get("source_path"), request.get("model_path")) if p]})
+    jobs.sort(key=lambda j: j["when"], reverse=True)
+    now = datetime.now(timezone.utc)
+    rank, counts, newest_success = {}, {}, {}
+    for job in jobs:
+        rank[job["id"]] = counts.get(job["group"], 0)
+        counts[job["group"]] = rank[job["id"]] + 1
+        r = job["record"]
+        if r.get("operation") == "export" and r.get("status") == "succeeded" and r.get("passed") and job["group"] not in newest_success:
+            newest_success[job["group"]] = job["id"]
+
+    def selected(job):
+        if job_ids:
+            return job["id"] in job_ids
+        old = False
+        if older_than_days is not None and job["when"]:
+            try:
+                old = (now - datetime.fromisoformat(job["when"])).total_seconds() > older_than_days * 86400
+            except ValueError:
+                pass
+        return old or (keep_latest is not None and rank[job["id"]] >= keep_latest)
+
+    chosen = {j["id"] for j in jobs if selected(j)}
+    report = {"dry_run": bool(dry_run), "jobs_root": str(root), "jobs_seen": len(jobs), "cleaned": [], "skipped": [], "bytes_freed": 0}
+    snapshots_of = {j["id"]: [d for d in (j["dir"] / "output" / "cad", j["dir"] / "preflight" / "output" / "cad") if d.is_dir()] for j in jobs}
+    protected = set()
+    for job in jobs:
+        if job["id"] not in chosen:
+            continue
+        r = job["record"]
+        if r.get("status") not in TERMINAL:
+            reason = f"status {r.get('status')} is not terminal"
+        elif keep_latest_success and newest_success.get(job["group"]) == job["id"] and snapshots_of[job["id"]]:
+            reason = "newest succeeded export of its model and package (keep_latest_success)"
+        else:
+            continue
+        protected.add(job["id"])
+        report["skipped"].append({"job_id": job["id"], "reason": reason})
+    # A snapshot stays while any job that is not cleaned uses it; skipping one job can protect another's snapshot.
+    kept = [j for j in jobs if j["id"] not in chosen or j["id"] in protected]
+    for job in jobs:
+        if job["id"] not in chosen or job["id"] in protected:
+            continue
+        r, directory, snapshots = job["record"], job["dir"], snapshots_of[job["id"]]
+        users = sorted({k["id"] for k in kept for p in k["uses"] for s in snapshots if _inside(p, s)})
+        if users:
+            report["skipped"].append({"job_id": job["id"], "reason": "its snapshot is used by kept job(s) " + ", ".join(users)})
+            continue
+        logs = [directory / n for n in ("stdout.log", "stderr.log", "preflight/stdout.log", "preflight/stderr.log")] if include_logs else []
+        targets = snapshots + [p for p in logs if p.is_file()]
+        if not targets:
+            continue
+        sizes = {str(t): _size(t) for t in targets}
+        entry = {"job_id": job["id"], "model_path": r.get("model_path"), "finished_at": r.get("finished_at"), "remove": sizes, "bytes": sum(sizes.values())}
+        # Another kept job may hold a snapshot of the same CAD version of the same model.
+        twin = next((k for k in kept if snapshots and k["group"][0] == job["group"][0] and r.get("cad_version_sha256") and k["record"].get("cad_version_sha256") == r.get("cad_version_sha256")
+                     and k["record"].get("reusable_model") and Path(k["record"]["reusable_model"]).is_file()), None)
+        if twin:
+            entry["equivalent_snapshot"] = {"job_id": twin["id"], "reusable_model": twin["record"]["reusable_model"]}
+        report["cleaned"].append(entry)
+        report["bytes_freed"] += entry["bytes"]
+        if dry_run:
+            continue
+        errors = []
+        for t in targets:
+            try:
+                shutil.rmtree(t) if t.is_dir() else t.unlink()
+            except OSError as exc:
+                errors.append(f"{t}: {exc}")
+        if errors:
+            entry["errors"] = errors
+        removed = [p for p in sizes if not Path(p).exists()]
+        current = read_json(directory / "result.json") or r
+        current["cleaned_at"] = stamp()
+        current.setdefault("cleanup", []).append({"cleaned_at": current["cleaned_at"], "removed": removed, "bytes": sum(sizes[p] for p in removed), **({"errors": errors} if errors else {}), **({"equivalent_snapshot": entry["equivalent_snapshot"]} if twin else {})})
+        if current.get("reusable_model") and not Path(current["reusable_model"]).is_file():
+            current["reusable_model_removed"] = current.pop("reusable_model")
+            current.pop("reusable_model_hint", None)
+            if twin:
+                current["reusable_model_hint"] = f"This job's snapshot was cleaned up; job {twin['id']} keeps a copy of the same CAD version: {twin['record']['reusable_model']}"
+        write_json(directory / "result.json", current)
+    report["gigabytes_freed"] = round(report["bytes_freed"] / 1e9, 3)
+    report["message"] = ("Would free" if dry_run else "Freed") + f" {report['gigabytes_freed']} GB from {len(report['cleaned'])} job(s); {len(report['skipped'])} selected job(s) skipped." + (" Pass dry_run=false to delete." if dry_run else "")
+    return report

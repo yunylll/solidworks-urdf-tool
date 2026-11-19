@@ -81,7 +81,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-tool.ps1
 .\.venv\Scripts\python.exe scripts\tool_cli.py validate-urdf "C:\new\urdf\robot.urdf" --reference "C:\old\urdf\robot.urdf"
 ```
 
-CAD コマンドはいずれも `--timeout`（総時間の上限、既定 14400 秒）、`--stall-timeout`（既定 900 秒、後述）、`--use-saved-files` を受け付けます。`check`、`export`、`start-export` はさらに `--accept-source-change`、`--kinematics-tolerance-mm`、`--kinematics-tolerance-deg`、`--write-config-source`、`--recompute-preflight` を、`export`/`start-export` は `--no-compare-previous`（後述の「CAD バージョンと前回のエクスポート」を参照）と `--no-reuse-meshes`（後述）を受け付けます。
+CAD コマンドはいずれも `--timeout`（総時間の上限、既定 14400 秒）、`--stall-timeout`（既定 900 秒、後述）、`--use-saved-files` を受け付けます。`check`、`export`、`start-export` はさらに `--accept-source-change`、`--kinematics-tolerance-mm`、`--kinematics-tolerance-deg`、`--write-config-source`、`--recompute-preflight` を、`export`/`start-export` は `--no-compare-previous`（後述の「CAD バージョンと前回のエクスポート」を参照）、`--no-reuse-meshes`、`--publish-to`（後述）を受け付けます。
 
 操作のたびに `validation/jobs/<job_id>/` が作られます。`result.json` には、ステータス、元ファイルの SHA-256、設定の復元、物理検証、エラーが記録され、`stdout.log`/`stderr.log` にはネイティブのログが残ります。操作のすべてのチェックに合格したことを示すのは、`status=succeeded` かつ `passed=true` の場合だけです。`queued`/`running` や「一部のファイルが生成された」状態を成功とみなしてはいけません。
 
@@ -100,6 +100,9 @@ CAD コマンドはいずれも `--timeout`（総時間の上限、既定 14400 
 - **メッシュの再利用。** 合格したエクスポートはジョブフォルダーに `mesh-keys.json` を書き出します。各 Link メッシュの指紋で、表示される各部品ファイルのハッシュと構成、アセンブリ内での位置、メッシュ品質、ドキュメント全体の大きさ（SolidWorks は粗・細の公差をここから決めます）、Link の CAD 体積（アセンブリでのカット形状でも変わります）から作ります。以後のエクスポートでは指紋が同じ Link の STL をそのまま使い、コンポーネントの表示と再メッシュ化を省きます。関節原点だけを変えた場合は STL を新しい Link 座標系へ剛体移動します。再利用したメッシュも CAD との比較を同じように通り、`reused_meshes` に示されます。`--no-reuse-meshes`（`reuse_meshes=false`）で無効にできます。
 - **大規模アセンブリの所要時間。** SolidWorks ではコンポーネントを 1 つずつ選択に追加すると、既に選択した数に比例して時間がかかります（800 部品で 194 秒）。メッシュ出力と関節再計算での表示・非表示・固定・固定解除は、一度の呼び出しで選択するようにしました（0.9 秒）。コンポーネントの質量特性の読み取りも部品数とともに急に増える（800 部品で 106 秒、同じピペットチップ 1434 個は 100 個ごとに 25 秒）ため、各部品ファイルを自身のドキュメントで 1 回だけ計量し（部品内のオーバーライドと非表示ボディを含む）、各インスタンスの Link 座標系での姿勢へ回転・移動して平行軸の定理で正確に合成します。各ファイルはまず 1 つのインスタンスでアセンブリ内の SolidWorks の計量結果と照合し（アセンブリでコンポーネントに材料を割り当てた場合などは一致しません）、一致しないファイル、オーバーライドのあるサブアセンブリ、非アクティブ構成のコンポーネントは引き続き SolidWorks が計量します（`bridge.partMassCheck`）。質量のオーバーライドは各ドキュメントのオーバーライド設定を 1 回ずつ読んで見つけ、該当するコンポーネントだけを計量します。
 
+### 公開と古いジョブの整理\n
+- **ロボットツインへの公開。** `--publish-to <dir>`（`publish_to`）は、`status=succeeded` かつ `passed=true` で終わったエクスポートの URDF パッケージを `<dir>\urdf\<package>\` に、ジョブの `robot-config.json`（なければ `configuration.json`）、`request.json`、`result.json` を `<dir>\export\export-config.json`、`export-request.json`、`export-result.json` にコピーします。既にあるファイルやパッケージは上書きせず、先に `<dir>\export\history\<タイムスタンプ>_job-<job_id の先頭 12 文字>\` へ移します。コピーはすべてハッシュで確認し、`result.json` の `publish` にパス、ハッシュ、履歴へ移したファイルを記録します。公開に失敗しても `passed` は変わらず、理由は `publish.error` に示されます。
+- **古いジョブの整理。** ロボット全体のジョブは約 650 MB を占め、そのほとんどが `output\cad` の CAD スナップショットです。`cleanup-jobs --older-than-days 30` または `--keep-latest 3`（モデルとパッケージごと。MCP `cleanup_jobs`、Python `cleanup_jobs`）は、終了した古いジョブのスナップショット（`output\cad`、`preflight\output\cad`、`--include-logs` ではログも）と解放されるバイト数を一覧にします。`--delete`（`dry_run=false`）を付けない限り何も削除しません。`result.json`、`request.json`、各設定、`native*.json`、`mesh-keys.json`、URDF パッケージ（以後のエクスポートがメッシュを再利用します）は常に残します。待機中・実行中のジョブ、残すジョブが `model_path`、`reusable_model`、ソースマニフェストとして使うスナップショット、各モデルで最新の成功したエクスポート（`--no-keep-latest-success` を除く）は対象外です。整理したジョブは `cleaned_at` と `cleanup` を記録し、`reusable_model` は `reusable_model_removed` になります。同じモデルの同じ CAD バージョン（`cad_version_sha256`）のスナップショットを残すジョブがあれば、`equivalent_snapshot` と `reusable_model_hint` がそれを指します。\n
 ### CAD バージョンと前回のエクスポート
 
 `recompute_kinematics=false` の設定は、ある版の CAD から写した絶対的な関節原点を持っています。その後アセンブリが原点に対してモデルを動かした状態で保存されると、メッシュは CAD に追従しますが関節原点は追従せず、新しい URDF は単体ではすべての検査に合格してしまいます。これを次の 2 つの検査で検出します。
@@ -142,7 +145,7 @@ from tool_service import inspect_model, check_configuration, export_urdf, start_
 
 result = export_urdf(r"C:\path\robot.SLDASM", "robot_description")
 # config_path / reference_urdf / timeout_seconds / stall_timeout_seconds / use_saved_files と
-# accept_source_change / kinematics_tolerance_mm / kinematics_tolerance_deg / compare_previous / write_config_source / recompute_preflight / reuse_meshes はキーワード引数のみ
+# accept_source_change / kinematics_tolerance_mm / kinematics_tolerance_deg / compare_previous / write_config_source / recompute_preflight / reuse_meshes / publish_to はキーワード引数のみ
 check = check_configuration(r"C:\path\robot.SLDASM", r"C:\path\robot-config.json")
 result = export_urdf(check.get("reusable_model") or r"C:\path\robot.SLDASM", "robot_description", config_path=r"C:\path\robot-config.json")
 assert result["passed"], result.get("error")
@@ -153,7 +156,7 @@ print(result["bridge"]["urdf"])
 
 サーバーは `scripts/mcp_server.py` で、ワークスペースの Python で起動します。ほかの stdio クライアントは [mcp-connection.example.json](mcp-connection.example.json) をテンプレートとして使い、`<REPO_ROOT>` をこのリポジトリのパスに置き換えてください。開発時の Codex 設定では、起動タイムアウトは 60 秒、ツールのタイムアウトは 1200 秒で、登録で追加されるのはこのサーバーだけです（ほかのサーバーやセキュリティ設定は変更しません）。
 
-9 つのツール：`inspect_solidworks`、`inspect_model_configuration`、`prepare_model`、`validate_configuration`、`export_urdf`、`start_urdf_export`、`get_export_job`、`cancel_export_job`、`validate_urdf`。`export_urdf` と `start_urdf_export` は `check_only`、`use_saved_files`、`timeout_seconds`、`stall_timeout_seconds`、`compare_previous`（既定 true）、`accept_source_change`、`kinematics_tolerance_mm`、`kinematics_tolerance_deg`（既定はいずれも 0.1）、`write_config_source`、`recompute_preflight`、`reuse_meshes`（既定 true）を受け付けます。`validate_configuration` は CAD バージョンの確認用に任意の `model_path` を受け付けます。大きなモデルでは `start_urdf_export` を使い、`wait_seconds`（例 300）付きで `get_export_job` を呼んでください。呼び出しはジョブの完了を待ち、終了状態になった時点ですぐ戻るので、クライアントはシェルの `sleep` も頻繁なポーリングも不要です。`validate_urdf` はこのコンピューター上の任意の URDF と、任意の `reference_urdf` を受け付けます。
+10 のツール：`inspect_solidworks`、`inspect_model_configuration`、`prepare_model`、`validate_configuration`、`export_urdf`、`start_urdf_export`、`get_export_job`、`cancel_export_job`、`validate_urdf`、`cleanup_jobs`。`export_urdf` と `start_urdf_export` は `check_only`、`use_saved_files`、`timeout_seconds`、`stall_timeout_seconds`、`compare_previous`（既定 true）、`accept_source_change`、`kinematics_tolerance_mm`、`kinematics_tolerance_deg`（既定はいずれも 0.1）、`write_config_source`、`recompute_preflight`、`reuse_meshes`（既定 true）、`publish_to` を受け付けます。`validate_configuration` は CAD バージョンの確認用に任意の `model_path` を受け付けます。大きなモデルでは `start_urdf_export` を使い、`wait_seconds`（例 300）付きで `get_export_job` を呼んでください。呼び出しはジョブの完了を待ち、終了状態になった時点ですぐ戻るので、クライアントはシェルの `sleep` も頻繁なポーリングも不要です。`validate_urdf` はこのコンピューター上の任意の URDF と、任意の `reference_urdf` を受け付けます。
 
 ブロッキング型のツール（`export_urdf`、`inspect_model_configuration`、`prepare_model`）もバックグラウンドジョブとして実行され、最大 1000 秒待機します（環境変数 `SW_URDF_SYNC_WAIT_SECONDS` で調整できます。クライアントのツールタイムアウトより小さくしてください）。その時点で完了していなければ `still_running=true` と `job_id` が返り、ジョブは実行を続けるので、`get_export_job` で問い合わせます。
 
@@ -179,6 +182,7 @@ print(result["bridge"]["urdf"])
 .\.venv\Scripts\python.exe scripts\test_configuration.py
 .\.venv\Scripts\python.exe scripts\test_validation.py
 .\.venv\Scripts\python.exe scripts\test_jobs.py
+.\.venv\Scripts\python.exe scripts\test_maintenance.py
 .\.venv\Scripts\python.exe scripts\test_postprocess.py
 .\.venv\Scripts\python.exe scripts\test_provenance.py
 .\.venv\Scripts\python.exe scripts\test_cad_regressions.py

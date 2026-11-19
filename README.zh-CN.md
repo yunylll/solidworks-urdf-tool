@@ -81,7 +81,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-tool.ps1
 .\.venv\Scripts\python.exe scripts\tool_cli.py validate-urdf "C:\new\urdf\robot.urdf" --reference "C:\old\urdf\robot.urdf"
 ```
 
-CAD 命令都接受 --timeout（总时长上限，默认 14400 秒）、--stall-timeout（默认 900 秒，见下文）和 --use-saved-files。check、export 和 start-export 还接受 --accept-source-change、--kinematics-tolerance-mm、--kinematics-tolerance-deg、--write-config-source 和 --recompute-preflight，export/start-export 另接受 --no-compare-previous（见下文“CAD 版本与上一次导出”）和 --no-reuse-meshes（见下文“复用网格”）。
+CAD 命令都接受 --timeout（总时长上限，默认 14400 秒）、--stall-timeout（默认 900 秒，见下文）和 --use-saved-files。check、export 和 start-export 还接受 --accept-source-change、--kinematics-tolerance-mm、--kinematics-tolerance-deg、--write-config-source 和 --recompute-preflight，export/start-export 另接受 --no-compare-previous（见下文“CAD 版本与上一次导出”）、--no-reuse-meshes（见下文“复用网格”）和 --publish-to（见下文“发布与清理任务”）。
 
 每次操作生成 validation/jobs/<job_id>/。result.json 记录状态、原文件 SHA-256、设置恢复、物理校验和错误；stdout.log/stderr.log 保留原生日志。status=succeeded 且 passed=true 才表示该操作所有检查通过。queued/running 和“已生成部分文件”均不能视为成功。
 
@@ -100,6 +100,9 @@ CAD 命令都接受 --timeout（总时长上限，默认 14400 秒）、--stall-
 - **复用网格。** 导出通过后，任务目录里的 mesh-keys.json 记下每个 Link 网格的几何指纹：显示出的每个零件文件的哈希和配置、它在装配体中的位姿、网格质量、整个文档的尺寸（SolidWorks 据此决定粗/细网格的公差）以及该 Link 的 CAD 体积（装配体特征切除也会改变它）。以后的导出中指纹相同的 Link 直接复用那个 STL，只改了关节原点时把它刚性移到新的 Link 坐标系，不再显示组件、重新网格化；复用的网格同样经过与 CAD 的几何一致性检查，列在 reused_meshes 中。--no-reuse-meshes（reuse_meshes=false）关闭复用。
 - **大装配体的耗时。** SolidWorks 逐个追加选择组件的耗时与已选数量成正比（800 个零件 194 秒），导出、关节重算的固定/解除固定和显示/隐藏现在一次性选择（0.9 秒）。读取组件质量属性的耗时同样随组件数增长很快（800 个零件 106 秒，1434 个相同吸头每 100 个 25 秒），现在每个零件文件只在它自己的文档里读一次质量属性（含零件中的覆盖值和隐藏实体），按每个实例在 Link 坐标系中的位姿转动、平移后用平行轴定理精确合并；每个文件先用一个实例与 SolidWorks 在装配体中称得的结果比对（例如在装配体中给组件指定了材料时两者不同），不一致的文件、装配体级覆盖和未激活配置的组件仍由 SolidWorks 称重（结果中的 bridge.partMassCheck）。质量覆盖改为每个文档读一次覆盖标志，只对有覆盖的组件再称重。
 
+### 发布与清理任务\n
+- **发布到机器人孪生目录。** --publish-to <目录>（publish_to）只在导出 status=succeeded 且 passed=true 时，把 URDF 包复制到 <目录>\urdf\<package>\，把任务的 robot-config.json（没有则用 configuration.json）、request.json、result.json 复制为 <目录>\export\export-config.json、export-request.json、export-result.json。目标已有的文件或包目录先移到 <目录>\export\history\<时间戳>_job-<job_id 前 12 位>\，绝不覆盖。复制后逐个校验哈希，result.json 的 publish 字段记录路径、哈希和移入历史的旧文件。发布失败不改变 passed，原因写在 publish.error。
+- **清理旧任务。** 一个整机任务约占 650 MB，几乎都是 output\cad 里的 CAD 快照。cleanup-jobs --older-than-days 30 或 --keep-latest 3（按模型和包分组；MCP 工具 cleanup_jobs，Python cleanup_jobs）列出已结束旧任务的快照（output\cad、preflight\output\cad，加 --include-logs 时还有日志）及可释放的字节数；不加 --delete（dry_run=false）什么都不删。result.json、request.json、各配置、native*.json、mesh-keys.json 和 URDF 包（以后的导出会复用其中的网格）始终保留。排队或运行中的任务、仍被保留任务用作 model_path、reusable_model 或源清单的快照，以及每个模型最近一次成功导出的快照（除非 --no-keep-latest-success）会跳过。清理后的任务在 result.json 记录 cleaned_at 和 cleanup，reusable_model 改为 reusable_model_removed；若保留任务中有同一模型、同一 CAD 版本（cad_version_sha256）的快照，equivalent_snapshot 和 reusable_model_hint 指向它。\n
 ### CAD 版本与上一次导出
 
 recompute_kinematics=false 的配置保存的是从某一版 CAD 抄来的绝对关节原点。如果之后装配体被重新保存、模型相对装配体原点发生了移动，网格会跟着 CAD 走，关节原点却不会，而新 URDF 单独看仍能通过所有检查。下面两项检查用来发现这种情况：
@@ -142,7 +145,7 @@ from tool_service import inspect_model, check_configuration, export_urdf, start_
 
 result = export_urdf(r"C:\path\robot.SLDASM", "robot_description")
 # config_path / reference_urdf / timeout_seconds / stall_timeout_seconds / use_saved_files 以及
-# accept_source_change / kinematics_tolerance_mm / kinematics_tolerance_deg / compare_previous / write_config_source / recompute_preflight / reuse_meshes 只能按关键字传入
+# accept_source_change / kinematics_tolerance_mm / kinematics_tolerance_deg / compare_previous / write_config_source / recompute_preflight / reuse_meshes / publish_to 只能按关键字传入
 check = check_configuration(r"C:\path\robot.SLDASM", r"C:\path\robot-config.json")
 result = export_urdf(check.get("reusable_model") or r"C:\path\robot.SLDASM", "robot_description", config_path=r"C:\path\robot-config.json")
 assert result["passed"], result.get("error")
@@ -153,7 +156,7 @@ print(result["bridge"]["urdf"])
 
 本机已注册 solidworks_urdf_2026，启动程序为工作区 Python，服务脚本为 scripts/mcp_server.py；其他 stdio 客户端可参考 mcp-connection.example.json，把 <REPO_ROOT> 换成本仓库路径。启动超时 60 秒，工具超时 1200 秒。Codex 配置仅新增此服务；其他服务器和安全设置保留。
 
-9 个工具：inspect_solidworks、inspect_model_configuration、prepare_model、validate_configuration、export_urdf、start_urdf_export、get_export_job、cancel_export_job、validate_urdf。export_urdf 和 start_urdf_export 接受 check_only、use_saved_files、timeout_seconds、stall_timeout_seconds、compare_previous（默认 true）、accept_source_change、kinematics_tolerance_mm、kinematics_tolerance_deg（默认均为 0.1）、write_config_source、recompute_preflight 和 reuse_meshes（默认 true）；validate_configuration 可选 model_path，用于检查 CAD 版本。大型模型优先使用 start_urdf_export，再带 wait_seconds（例如 300）调用 get_export_job：调用会等任务结束，一到终态立即返回，客户端既不需要 shell sleep，也不用频繁轮询。validate_urdf 可校验本机任意位置的 URDF，并可选 reference_urdf。
+10 个工具：inspect_solidworks、inspect_model_configuration、prepare_model、validate_configuration、export_urdf、start_urdf_export、get_export_job、cancel_export_job、validate_urdf、cleanup_jobs。export_urdf 和 start_urdf_export 接受 check_only、use_saved_files、timeout_seconds、stall_timeout_seconds、compare_previous（默认 true）、accept_source_change、kinematics_tolerance_mm、kinematics_tolerance_deg（默认均为 0.1）、write_config_source、recompute_preflight、reuse_meshes（默认 true）和 publish_to；validate_configuration 可选 model_path，用于检查 CAD 版本。大型模型优先使用 start_urdf_export，再带 wait_seconds（例如 300）调用 get_export_job：调用会等任务结束，一到终态立即返回，客户端既不需要 shell sleep，也不用频繁轮询。validate_urdf 可校验本机任意位置的 URDF，并可选 reference_urdf。
 
 阻塞式工具（export_urdf、inspect_model_configuration、prepare_model）同样在后台任务中运行，最多等待 1000 秒（环境变量 SW_URDF_SYNC_WAIT_SECONDS 可调，应小于客户端工具超时）。届时未完成会返回 still_running=true 和 job_id，任务继续执行，用 get_export_job 查询即可。
 
@@ -179,6 +182,7 @@ Codex 客户端需要重新加载 MCP 配置后才会把新服务加入当前工
 .\.venv\Scripts\python.exe scripts\test_configuration.py
 .\.venv\Scripts\python.exe scripts\test_validation.py
 .\.venv\Scripts\python.exe scripts\test_jobs.py
+.\.venv\Scripts\python.exe scripts\test_maintenance.py
 .\.venv\Scripts\python.exe scripts\test_postprocess.py
 .\.venv\Scripts\python.exe scripts\test_provenance.py
 .\.venv\Scripts\python.exe scripts\test_cad_regressions.py

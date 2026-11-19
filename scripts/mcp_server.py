@@ -6,7 +6,7 @@ import json
 import os
 import time
 from export_service import inspect_environment as inspect_sw
-from tool_service import start_job, get_job, cancel_job, source_status, TERMINAL, DEFAULT_TIMEOUT_SECONDS, DEFAULT_STALL_SECONDS
+from tool_service import cleanup_jobs as cleanup_job_files, start_job, get_job, cancel_job, source_status, TERMINAL, DEFAULT_TIMEOUT_SECONDS, DEFAULT_STALL_SECONDS
 from configuration import validate_config
 from provenance import DEFAULT_TOLERANCE_DEG, DEFAULT_TOLERANCE_MM
 from validate_export import validate
@@ -48,7 +48,7 @@ async def inspect_solidworks() -> dict[str, Any]:
 
 @server.tool(structured_output=True)
 async def export_urdf(model_path: str, package_name: str = "robot_description", reference_urdf: str | None = None, config_path: str | None = None, check_only: bool = False, use_saved_files: bool = False, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds: int = DEFAULT_STALL_SECONDS,
-                      compare_previous: bool = True, accept_source_change: bool = False, kinematics_tolerance_mm: float = DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg: float = DEFAULT_TOLERANCE_DEG, write_config_source: bool = False, recompute_preflight: bool = False, reuse_meshes: bool = True) -> dict[str, Any]:
+                      compare_previous: bool = True, accept_source_change: bool = False, kinematics_tolerance_mm: float = DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg: float = DEFAULT_TOLERANCE_DEG, write_config_source: bool = False, recompute_preflight: bool = False, reuse_meshes: bool = True, publish_to: str | None = None) -> dict[str, Any]:
     """Export an assembly or part using the SolidWorks 2026 headless core.
 
     Snapshots all dependencies and only edits copies in a private session.
@@ -72,12 +72,17 @@ async def export_urdf(model_path: str, package_name: str = "robot_description", 
     reuse_meshes (default true): a Link whose parts, their placements in the assembly, mesh quality and CAD volume match
     a Link of an earlier passed export reuses that STL (moved into the new Link frame) instead of exporting it again;
     reused meshes are listed in reused_meshes and checked against the CAD like the others.
+    publish_to: a robot twin directory; only after status=succeeded and passed=true the URDF package is copied to
+    <publish_to>/urdf/<package>/ and the job's configuration, request and result to <publish_to>/export/export-config.json,
+    export-request.json and export-result.json. Existing files there are first moved to
+    <publish_to>/export/history/<timestamp>_job-<id12>/, never overwritten; copies are hash-checked and recorded in publish.
+    A failed publish is reported in publish.error and does not change passed.
     Returns validation, source hashes, settings recovery, a persistent job_id and reusable_model.
     If the job outlasts the tool call, returns still_running=true; continue with get_export_job.
     """
     options = dict(accept_source_change=accept_source_change, kinematics_tolerance_mm=kinematics_tolerance_mm, kinematics_tolerance_deg=kinematics_tolerance_deg, write_config_source=write_config_source, recompute_preflight=recompute_preflight)
     if not check_only:
-        options.update(reference_urdf=reference_urdf, compare_previous=compare_previous, reuse_meshes=reuse_meshes)
+        options.update(reference_urdf=reference_urdf, compare_previous=compare_previous, reuse_meshes=reuse_meshes, publish_to=publish_to)
     return await run_and_wait("check" if check_only else "export", model_path, package_name, config_path=config_path, timeout_seconds=timeout_seconds, stall_timeout_seconds=stall_timeout_seconds, use_saved_files=use_saved_files, **options)
 
 
@@ -95,15 +100,15 @@ async def prepare_model(model_path: str, use_saved_files: bool = False, timeout_
 
 @server.tool(structured_output=True)
 async def start_urdf_export(model_path: str, package_name: str = "robot_description", config_path: str | None = None, reference_urdf: str | None = None, check_only: bool = False, use_saved_files: bool = False, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds: int = DEFAULT_STALL_SECONDS,
-                            compare_previous: bool = True, accept_source_change: bool = False, kinematics_tolerance_mm: float = DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg: float = DEFAULT_TOLERANCE_DEG, write_config_source: bool = False, recompute_preflight: bool = False, reuse_meshes: bool = True) -> dict[str, Any]:
+                            compare_previous: bool = True, accept_source_change: bool = False, kinematics_tolerance_mm: float = DEFAULT_TOLERANCE_MM, kinematics_tolerance_deg: float = DEFAULT_TOLERANCE_DEG, write_config_source: bool = False, recompute_preflight: bool = False, reuse_meshes: bool = True, publish_to: str | None = None) -> dict[str, Any]:
     """Start a long export (or a check_only run) and return a job_id immediately. Follow it with get_export_job and wait_seconds.
 
     Takes the same options as export_urdf (compare_previous, accept_source_change, kinematics_tolerance_mm/deg,
-    write_config_source, recompute_preflight, reuse_meshes). A configuration made for another CAD version is reported at once in warnings and config_stale.
+    write_config_source, recompute_preflight, reuse_meshes, publish_to). A configuration made for another CAD version is reported at once in warnings and config_stale.
     """
     options = dict(accept_source_change=accept_source_change, kinematics_tolerance_mm=kinematics_tolerance_mm, kinematics_tolerance_deg=kinematics_tolerance_deg, write_config_source=write_config_source, recompute_preflight=recompute_preflight)
     if not check_only:
-        options.update(reference_urdf=reference_urdf, compare_previous=compare_previous, reuse_meshes=reuse_meshes)
+        options.update(reference_urdf=reference_urdf, compare_previous=compare_previous, reuse_meshes=reuse_meshes, publish_to=publish_to)
     return await asyncio.to_thread(functools.partial(start_job, "check" if check_only else "export", model_path, package_name, config_path=config_path, timeout_seconds=timeout_seconds, stall_timeout_seconds=stall_timeout_seconds, use_saved_files=use_saved_files, **options))
 
 
@@ -122,6 +127,19 @@ async def get_export_job(job_id: str, wait_seconds: int = 0) -> dict[str, Any]:
 async def cancel_export_job(job_id: str) -> dict[str, Any]:
     """Stop a queued or running job. The private SolidWorks session is closed and STL preferences are restored as for any failure."""
     return await asyncio.to_thread(cancel_job, job_id, min(120, SYNC_WAIT_SECONDS))
+
+
+@server.tool(structured_output=True)
+async def cleanup_jobs(older_than_days: float | None = None, keep_latest: int | None = None, dry_run: bool = True, include_logs: bool = False, keep_latest_success: bool = True, job_ids: list[str] | None = None) -> dict[str, Any]:
+    """Free disk space by deleting the CAD snapshots (output/cad, preflight/output/cad) of old finished jobs.
+
+    Selects jobs finished more than older_than_days ago and/or beyond the keep_latest newest of each model and package
+    (or exactly job_ids). dry_run (default true) only lists what would go and the bytes freed; pass dry_run=false to delete.
+    Keeps result.json, request.json, configurations, mesh-keys.json and the URDF package (its meshes are reused by later
+    exports). Skips queued/running jobs, snapshots a kept job still uses, and (keep_latest_success) the newest succeeded
+    export of each model. include_logs also deletes stdout/stderr logs. A cleaned job records cleaned_at and loses reusable_model.
+    """
+    return await asyncio.to_thread(functools.partial(cleanup_job_files, older_than_days, keep_latest, dry_run, include_logs, keep_latest_success, job_ids))
 
 
 @server.tool(structured_output=True)
