@@ -279,7 +279,8 @@ Link 字段：`name`、`parent`、`components`（检查返回的完整实例名�
 .\.venv\Scripts\python.exe scripts\tool_cli.py cleanup-jobs --keep-latest 3 --delete
 ```
 
-- 不加 `--delete`（MCP / Python：`dry_run=false`）时只列出将要删除的快照（`output\cad`、`preflight\output\cad`，加 `--include-logs` 时还有日志）和可释放的字节数，不删除任何文件。`--job` 可指定具体任务。
+- 必须给出 `--older-than-days`、`--keep-latest` 或 `--job` 之一来选择任务，否则命令以 `INVALID_INPUT` 拒绝执行。
+- 不加 `--delete`（MCP / Python：`dry_run=false`）时只列出将要删除的快照（`output\cad`、`preflight\output\cad`，加 `--include-logs` 时还有日志）和可释放的字节数，不删除任何文件。
 - 始终保留：`result.json`、`request.json`、各配置、`native*.json`、`mesh-keys.json` 和 URDF 包（后续导出会复用其中的网格）。
 - 跳过：排队或运行中的任务；仍被保留任务用作 `model_path`、`reusable_model` 或源清单的快照；每个模型最近一次成功导出的快照（除非 `--no-keep-latest-success`）。
 - 被清理的任务在 `result.json` 中记录 `cleaned_at` 和 `cleanup`，`reusable_model` 改为 `reusable_model_removed`；若保留的任务中有同一模型、同一 CAD 版本（`cad_version_sha256`）的快照，`equivalent_snapshot` 和 `reusable_model_hint` 会指向它。

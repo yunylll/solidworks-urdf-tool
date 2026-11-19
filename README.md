@@ -279,7 +279,8 @@ A failed publication does not change `passed`; the reason is in `publish.error`.
 .\.venv\Scripts\python.exe scripts\tool_cli.py cleanup-jobs --keep-latest 3 --delete
 ```
 
-- Without `--delete` (MCP / Python: `dry_run=false`), the command only lists the snapshots it would delete (`output\cad`, `preflight\output\cad` and, with `--include-logs`, the logs) and the bytes it would free. `--job` selects specific jobs.
+- One of `--older-than-days`, `--keep-latest` or `--job` must select the jobs; without any of them the command is rejected with `INVALID_INPUT`.
+- Without `--delete` (MCP / Python: `dry_run=false`), the command only lists the snapshots it would delete (`output\cad`, `preflight\output\cad` and, with `--include-logs`, the logs) and the bytes it would free.
 - Always kept: `result.json`, `request.json`, the configurations, `native*.json`, `mesh-keys.json` and the URDF package (later exports reuse its meshes).
 - Skipped: queued or running jobs; snapshots a kept job uses as `model_path`, `reusable_model` or source manifest; the snapshot of each model's newest successful export (unless `--no-keep-latest-success`).
 - A cleaned job records `cleaned_at` and `cleanup` in `result.json`, and `reusable_model` becomes `reusable_model_removed`; if a kept job holds a snapshot of the same model and CAD version (`cad_version_sha256`), `equivalent_snapshot` and `reusable_model_hint` point to it.
