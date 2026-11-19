@@ -1236,11 +1236,14 @@ def cleanup_jobs(older_than_days=None, keep_latest=None, dry_run=True, include_l
     request.json, the configurations, native*.json, mesh-keys.json and the URDF package output/<package>, whose meshes
     later exports reuse. Skipped: queued or running jobs; snapshots a kept job still uses (its model_path,
     reusable_model or source manifest); and, with keep_latest_success, the newest succeeded export of each model and
-    package. dry_run (default true) only lists what would be deleted and how many bytes that frees.
+    package. dry_run (default true) only lists what would be deleted and how many bytes that frees. Without
+    older_than_days, keep_latest or job_ids a dry run lists every finished job; deleting needs one of them.
     """
     import shutil
     if older_than_days is None and keep_latest is None and not job_ids:
-        raise ValueError("Give older_than_days, keep_latest or job_ids to choose the jobs to clean up.")
+        if not dry_run:
+            raise ValueError("Deleting needs older_than_days, keep_latest or job_ids to choose the jobs; without them only a dry run (listing every finished job) is allowed.")
+        older_than_days = 0
     if older_than_days is not None and (isinstance(older_than_days, bool) or not isinstance(older_than_days, (int, float)) or older_than_days < 0):
         raise ValueError(f"older_than_days must be a number of days >= 0, got {older_than_days!r}.")
     if keep_latest is not None:

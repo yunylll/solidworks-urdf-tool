@@ -117,9 +117,17 @@ class CleanupTests(Fixture):
         self.assertEqual(report["cleaned"][0]["equivalent_snapshot"]["job_id"], kept)
         self.assertIn(kept, read_json(self.jobs / old / "result.json")["reusable_model_hint"])
 
-    def test_needs_a_selection(self):
+    def test_without_selection_only_a_dry_run(self):
+        # Without a selection a dry run lists every finished job; deleting still needs one.
+        old, failed = self.job(40), self.job(1, status="failed", passed=False)
+        self.job(0)
+        report = cleanup_jobs(jobs_root=self.jobs)
+        self.assertTrue(report["dry_run"])
+        self.assertEqual(sorted(c["job_id"] for c in report["cleaned"]), sorted([old, failed]))
+        self.assertTrue(self.cad(old).is_dir())
         with self.assertRaises(ValueError):
-            cleanup_jobs(jobs_root=self.jobs)
+            cleanup_jobs(dry_run=False, jobs_root=self.jobs)
+        self.assertTrue(self.cad(old).is_dir())
 
 
 class PublishTests(Fixture):
