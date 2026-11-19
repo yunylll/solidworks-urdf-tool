@@ -164,9 +164,10 @@ class ExcludedHiddenBodies(unittest.TestCase):
         report["exclude_hidden_bodies"] = {name: r["job_id"] for name, r in results.items()} | {"hidden_mass_kg": hidden}
         typo = FIXTURES / "hidden_typo.json"
         write_json(typo, dict(config, exclude_hidden_bodies=[HIDDEN["typo"]]))
-        check = check_configuration(inspection["reusable_model"], typo)
-        self.assertFalse(check["passed"])
-        self.assertIn(HIDDEN["part"], check["error"]["message"], "similar names help fix the typo")
+        # Checked against the component list the exports recorded: rejected before any job starts.
+        with self.assertRaises(ValueError) as caught:
+            check_configuration(inspection["reusable_model"], typo)
+        self.assertIn(HIDDEN["part"], str(caught.exception), "similar names help fix the typo")
 
 
 if __name__ == "__main__":
