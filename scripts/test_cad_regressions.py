@@ -137,6 +137,30 @@ class CadRegressions(unittest.TestCase):
         self.assertIn("3_DOF_ARM_SEGMENT-1", message, "similar names help fix the typo")
         self.assertEqual(result["error"]["stage"], "loading_configuration")
 
+    def test_5_missing_dependency_fails_before_any_copy(self):
+        import shutil
+        folder = FIXTURES / "missing-part"
+        shutil.copytree(ARM.parent, folder, ignore=shutil.ignore_patterns("*.urdf", "*.STL", "*.stl"))
+        model = folder / ARM.name
+        clean = tool_service.check_dependencies(model)
+        self.assertTrue(clean["passed"], describe(clean))
+        self.assertEqual(clean["dependency_check"]["errors"], [])
+        inspection = inspect_model(model)  # the component list the next checks use
+        self.assertTrue(inspection["passed"], describe(inspection))
+        (folder / "3_DOF_ARM_END_EFFECTOR.SLDPRT").unlink()
+        started = time.monotonic()
+        deps = tool_service.check_dependencies(model)
+        report["missing_dependency_check"] = {"job": deps["job"], "seconds": round(time.monotonic() - started), "error": deps.get("error"), "summary": (deps.get("dependency_check") or {}).get("summary")}
+        self.assertFalse(deps["passed"])
+        self.assertEqual(deps["error"]["code"], "DEPENDENCY_CHECK_FAILED", describe(deps))
+        self.assertIn("3_DOF_ARM_END_EFFECTOR-1", deps["error"]["message"])
+        self.assertIn(inspection["job_id"], deps["dependency_check"]["usage_source"])
+        check = check_configuration(model, ROOT / "examples" / "arm-config.json")
+        report["missing_dependency_check_only"] = {"job": check["job"], "error": check.get("error")}
+        self.assertEqual(check["error"]["code"], "DEPENDENCY_CHECK_FAILED", describe(check))
+        self.assertEqual(check["error"]["stage"], "dependency_check")
+        self.assertFalse((Path(check["job"]) / "output" / "snapshot").exists(), "nothing is copied before the check passes")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

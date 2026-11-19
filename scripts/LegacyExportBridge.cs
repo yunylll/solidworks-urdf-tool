@@ -282,7 +282,7 @@ public static partial class LegacyExportBridge
             report["documentType"] = documentType;
             if (!System.Text.RegularExpressions.Regex.IsMatch(package, "^[a-z][a-z0-9_]*$"))
                 throw new ArgumentException("Package name must use lowercase letters, digits and underscores.");
-            if (operation != "export" && operation != "inspect" && operation != "prepare" && operation != "check") throw new ArgumentException("Unsupported operation: " + operation);
+            if (operation != "export" && operation != "inspect" && operation != "prepare" && operation != "check" && operation != "dependencies") throw new ArgumentException("Unsupported operation: " + operation);
             if (Directory.Exists(Path.Combine(output, package))) throw new IOException("Output package already exists: " + Path.Combine(output, package));
             ConfigureWorkspaceLog(output);
             URDFPackage.MessageBox = new HeadlessPackageMessages();
@@ -299,6 +299,25 @@ public static partial class LegacyExportBridge
                 if (currentSourceManifest.unsaved_changes || !string.Equals(Path.GetFullPath(currentSourceManifest.source_path), Path.GetFullPath(modelPath), StringComparison.OrdinalIgnoreCase))
                     throw new InvalidOperationException("Active source manifest does not match the requested saved model: manifest " + currentSourceManifest.source_path + " (unsaved changes: " + currentSourceManifest.unsaved_changes + "), requested " + modelPath + ".");
                 report["activeSourceManifestVerified"] = true;
+            }
+            // A prepared copy is self-contained (its files were checked when it was made); anything else is
+            // scanned for missing, foreign and external references before any file is copied or opened.
+            if (!reusePrepared)
+            {
+                List<SourceComponent> known = currentSourceManifest != null ? currentSourceManifest.components : null;
+                if (known == null && request.ContainsKey("known_components"))
+                    known = new JavaScriptSerializer().Deserialize<SourceManifest>(File.ReadAllText(Convert.ToString(request["known_components"]))).components;
+                CheckDependencies(app, modelPath, output, report, known);
+            }
+            if (operation == "dependencies")
+            {
+                // Read-only audit of the files the scan found; nothing is copied or opened.
+                var found = ((List<Dictionary<string, object>>)((Dictionary<string, object>)report["dependencyScan"])["references"])
+                    .Where(r => (bool)r["exists"] && !IsVirtualComponent(Convert.ToString(r["path"]))).Select(r => Convert.ToString(r["path"]));
+                report["sourceHashesBefore"] = found.Distinct(StringComparer.OrdinalIgnoreCase).ToDictionary(p => p, HashFile, StringComparer.OrdinalIgnoreCase);
+                report["status"] = "dependencies_checked";
+                code = 0;
+                goto OperationComplete;
             }
             if (pack)
             {

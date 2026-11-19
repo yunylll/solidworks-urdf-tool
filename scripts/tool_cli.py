@@ -14,10 +14,10 @@ def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(prog="sw-urdf", description="SolidWorks 2026 code/MCP export tool")
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("inspect", "prepare", "check", "export", "start-export"):
+    for name in ("inspect", "prepare", "check", "export", "start-export", "check-deps"):
         command = commands.add_parser(name)
         command.add_argument("model")
-        command.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS, help="hard limit in seconds")
+        command.add_argument("--timeout", type=int, default=600 if name == "check-deps" else DEFAULT_TIMEOUT_SECONDS, help="hard limit in seconds")
         command.add_argument("--stall-timeout", type=int, default=DEFAULT_STALL_SECONDS, help="stop after this many seconds without progress or SolidWorks CPU activity")
         command.add_argument("--use-saved-files", action="store_true", help="use the files saved on disk even if the open document has unsaved changes")
         if name in {"check", "export", "start-export"}:
@@ -57,7 +57,7 @@ def main():
     urdf.add_argument("--previews", action="store_true", help="also write front/side/top renders to previews/ in the package")
     arguments = parser.parse_args()
     try:
-        if arguments.command in {"inspect", "prepare", "check", "export", "start-export"}:
+        if arguments.command in {"inspect", "prepare", "check", "export", "start-export", "check-deps"}:
             options = {"timeout_seconds": arguments.timeout, "stall_timeout_seconds": arguments.stall_timeout, "use_saved_files": arguments.use_saved_files}
             if arguments.command in {"check", "export", "start-export"}:
                 options.update(config_path=arguments.config, accept_source_change=arguments.accept_source_change, kinematics_tolerance_mm=arguments.kinematics_tolerance_mm,
@@ -65,7 +65,7 @@ def main():
                                recompute_preflight=arguments.recompute_preflight)
             if arguments.command in {"export", "start-export"} and not getattr(arguments, "check_only", False):
                 options.update(reference_urdf=arguments.reference, compare_previous=not arguments.no_compare_previous, reuse_meshes=not arguments.no_reuse_meshes, publish_to=arguments.publish_to)
-            name = "check" if arguments.command == "check" or getattr(arguments, "check_only", False) else "export" if arguments.command == "start-export" else arguments.command
+            name = "check" if arguments.command == "check" or getattr(arguments, "check_only", False) else "export" if arguments.command == "start-export" else "dependencies" if arguments.command == "check-deps" else arguments.command
             package = getattr(arguments, "package", "robot_description")
             result = start_job(name, arguments.model, package, **options) if arguments.command == "start-export" else operation(name, arguments.model, package, **options)
         elif arguments.command == "job":

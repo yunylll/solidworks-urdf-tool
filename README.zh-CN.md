@@ -35,7 +35,7 @@
 | 源模型保护 | 源文件只读并计算哈希；跨目录依赖做快照、改写引用并 Pack and Go；导出结束后核对哈希；恢复 SolidWorks 的 STL 设置。 |
 | 任务 | 持久的任务记录、后台运行、分阶段进度、等待、取消、卡住检测、各阶段耗时、清理旧任务、发布到项目目录。 |
 | 大型装配体 | 一次性选择组件、按零件文件计算质量属性、几何未变时复用网格；3250 个组件的整机首次导出约 24 分钟。 |
-| 接口 | 命令行 `tool_cli.py`、Python `tool_service`、本地 stdio MCP 服务（10 个工具）。 |
+| 接口 | 命令行 `tool_cli.py`、Python `tool_service`、本地 stdio MCP 服务（11 个工具）。 |
 
 验证记录见[工具报告](validation/TOOL_REPORT.zh-CN.md)；早期桥接方案的可行性测试见[早期报告](validation/FEASIBILITY.zh-CN.md)。
 
@@ -91,11 +91,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-tool.ps1
 | `start-export …` | 与 `export` 相同，但在后台运行并立即返回 `job_id`；`--check-only` 改为只检查 |
 | `job <job_id> [--wait 秒]` | 查询任务；`--wait` 等到任务结束或超时即返回 |
 | `cancel <job_id>` | 取消排队中或运行中的任务 |
+| `check-deps <模型>` | 几秒内列出模型全部已保存引用（不打开、不复制模型）：缺失、其他电脑或账户的路径、Toolbox/设计库、外部文件，并给出修复建议，见[源模型保护](#源模型保护) |
 | `validate-config <配置> [--model 模型]` | 不启动 SolidWorks 检查配置；给出 `--model` 时还会判断配置是否对应模型当前的 CAD 版本 |
 | `validate-urdf <urdf> [--reference 参考] [--previews]` | 校验任意位置的 URDF 包；`--reference` 严格比较两次导出；`--previews` 生成三视图 |
 | `cleanup-jobs …` | 列出（加 `--delete` 才删除）旧任务的 CAD 快照，见[发布与清理](#发布与清理) |
 
-CAD 命令（inspect、prepare、check、export、start-export）的通用选项：
+CAD 命令（inspect、prepare、check、export、start-export、check-deps）的通用选项：
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
@@ -289,6 +290,12 @@ Link 字段：`name`、`parent`、`components`（检查返回的完整实例名�
 
 - **只读源文件。** 源文件只被读取和计算哈希。工具先复制源模型和依赖，只对快照做引用改写、Pack and Go 和导出；即使 API 在打包时保存模型，保存的也只是快照。结束后再次核对全部源文件的哈希（`source_unchanged`）。
 - **缺失的引用。** 模型保存的引用指向本机不存在的文件时（旧配置、导入源文件、库零件等），无需先在 SolidWorks 中打开模型：工具跳过这些路径建立快照，打开快照后检查每个未压缩组件都已加载。只有活动组件缺少文件时才失败，并列出组件名和路径；被跳过的引用和缺少文件的压缩组件写入 `warnings`。
+- **依赖预检。** export、start-export、check（`check_only`）以及 inspect、prepare 在复制或打开任何文件之前，先用 `GetDocumentDependencies2` 读出模型及其每个文件保存的引用（`dependency_check` 阶段；lab_workstation 约 200 个引用只需几秒），结果在 `dependency_check` 中，一次列出所有问题，每条带修复建议。也可单独运行：命令行 `check-deps`，MCP `check_dependencies`，Python `check_dependencies`。判断与上一条快照逻辑一致：
+  - **错误（任务立即以 `DEPENDENCY_CHECK_FAILED` 失败，不复制任何文件）**：活动组件使用的文件不存在；快照或 Pack and Go 副本的路径超过 259 个字符。
+  - **警告**：只有已压缩组件使用、或没有任何组件使用的缺失文件；Toolbox / 设计库文件（如 `C:\SOLIDWORKS Data\...`）和其他电脑或账户的路径（`C:\Users\<他人>\...`），在还不知道哪些组件使用它们时也只是警告；3D Interconnect 导入缓存（`...\Temp\swx*\IC~~\`）和零件的导入源文件（STEP、IGES 等），零件本身保留了导入的实体。
+  - **信息**：模型文件夹以外、但存在的文件（会复制到快照中）；同名文件（Pack and Go 会改名）；虚拟组件的临时路径（`VC~~`，保存在装配体内部，即使来自其他电脑也没问题）。
+  - 组件的使用情况来自 SolidWorks 中已打开的该模型，或同一模型、同一 CAD 版本最近一次任务记录的组件列表（`usage_source`）。两者都没有时，缺失文件只给警告：之后快照打开时，如果活动组件确实缺少文件，任务仍会失败。先运行一次 inspect，预检就能区分。
+  - 历史上 Pack and Go 拒绝目标文件名的失败（任务 a0000005、a0000006，lab_workstation 旧工作台）与中文文件名或路径长度无关：该装配体含 10 个虚拟组件，当时为它们指定了新目标名，而 SolidWorks 只接受它们自己的默认目标。现在虚拟组件保留默认目标（见 4bee8a6），同一模型后来能正常 inspect 和导出，其中 72 个中文文件名、最长 202 个字符的路径都没有问题。
 - **已打开的模型。** 该装配体正在 SolidWorks 中打开时，工具读取只读的活动模型清单，要求快照的配置名、组件数和质量与之一致。打开的模型有未保存修改时，任务以 `UNSAVED_CHANGES` 失败：请保存，或关闭且不保存，然后重新运行；也可以使用 `--use-saved-files`，按磁盘上已保存的文件导出，`warnings` 会注明这一点。
 
 ## Python
@@ -296,7 +303,7 @@ Link 字段：`name`、`parent`、`components`（检查返回的完整实例名�
 ```python
 import sys
 sys.path.insert(0, r"C:\path\to\solidworks-urdf-tool\scripts")
-from tool_service import inspect_model, check_configuration, export_urdf, start_export, wait_job, cancel_job, cleanup_jobs
+from tool_service import inspect_model, check_dependencies, check_configuration, export_urdf, start_export, wait_job, cancel_job, cleanup_jobs
 
 check = check_configuration(r"C:\path\robot.SLDASM", r"C:\path\robot-config.json")
 result = export_urdf(check.get("reusable_model") or r"C:\path\robot.SLDASM", "robot_description",
@@ -315,6 +322,7 @@ print(result["bridge"]["urdf"])
 |---|---|
 | `inspect_solidworks` | 读取 SolidWorks 版本和活动文档，不做修改 |
 | `inspect_model_configuration` | 检查模型，返回组件、可编辑配置和未归属组件 |
+| `check_dependencies` | 几秒内列出模型的全部引用和问题，不打开模型 |
 | `prepare_model` | 生成自包含的 CAD 副本 |
 | `validate_configuration` | 不启动 SolidWorks 检查配置；可选 `model_path` 用于判断 CAD 版本 |
 | `export_urdf` | 导出（或 `check_only=true` 只检查），等待结果 |
@@ -336,13 +344,14 @@ print(result["bridge"]["urdf"])
 
 | 测试 | 需要 SolidWorks | 覆盖内容 |
 |---|---|---|
+| `test_dependencies.py` | 否 | 依赖预检的分类：Toolbox、其他电脑的路径、导入缓存、虚拟组件、活动/压缩/未使用、路径过长 |
 | `test_configuration.py` | 否 | 配置校验、导出后处理字段、子装配体展开、`exclude_hidden_bodies` |
 | `test_validation.py` | 否 | 校验器能否发现损坏的导出：缺失网格、单位错误、关节方向、零位位置、网格与 CAD 不一致、隐藏实体 |
 | `test_postprocess.py` | 否 | mimic 和 world 后处理 |
 | `test_jobs.py` | 否 | 排队、工作进程存活检测、卡住与暂停、取消、进度、读写 JSON 时的文件占用、网格复用候选、耗时记录 |
 | `test_provenance.py` | 否 | 配置来源与 CAD 版本判断；在 `scripts\testdata\provenance-jobs` 的合成任务上运行，另可在 `private-fixture.json` 指定的真实任务上运行 |
 | `test_maintenance.py` | 否 | 发布与清理 |
-| `test_cad_regressions.py` | 是 | 含虚拟零件的 Pack and Go、共用原点的关节、只检查模式、复用副本、进度、mimic/world、写明错误组件名的报错 |
+| `test_cad_regressions.py` | 是 | 含虚拟零件的 Pack and Go、共用原点的关节、只检查模式、复用副本、进度、mimic/world、写明错误组件名的报错、缺少零件文件时依赖预检在复制前失败 |
 | `test_nested_subassemblies.py` | 是 | 两层深的整体子装配体导出完整、分块与整体质量属性一致、网格复用与移动；本机有工作站 CAD 时还测试料架和 `exclude_hidden_bodies`（路径可用 `SW_URDF_VIAL_RACK` 指定） |
 | `test_tool_mcp.py`、`test_mcp.py` | 是 | MCP 工具端到端 |
 | `test_registered_mcp.py`、`test_mcp_smoke.py` | 是 | 已注册的 MCP 服务；`test_mcp_smoke.py` 需要已打开的 SolidWorks 会话 |

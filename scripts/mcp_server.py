@@ -93,6 +93,19 @@ async def inspect_model_configuration(model_path: str, use_saved_files: bool = F
 
 
 @server.tool(structured_output=True)
+async def check_dependencies(model_path: str, use_saved_files: bool = False, timeout_seconds: int = 600, stall_timeout_seconds: int = DEFAULT_STALL_SECONDS) -> dict[str, Any]:
+    """List every saved reference of a model in seconds, without opening or copying it, and say how to fix each problem.
+
+    dependency_check.errors: missing files that active components use (the export would fail), and snapshot copies
+    longer than MAX_PATH. dependency_check.warnings: missing files only suppressed components or no component use,
+    Toolbox/Design Library files and paths of other computers or accounts when it is not known which components use
+    them, and 3D Interconnect caches. Component usage comes from the model open in SolidWorks or the newest earlier job
+    of the same CAD version (usage_source). Every export, start_urdf_export and check_only run does this check first.
+    """
+    return await run_and_wait("dependencies", model_path, timeout_seconds=timeout_seconds, stall_timeout_seconds=stall_timeout_seconds, use_saved_files=use_saved_files)
+
+
+@server.tool(structured_output=True)
 async def prepare_model(model_path: str, use_saved_files: bool = False, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds: int = DEFAULT_STALL_SECONDS) -> dict[str, Any]:
     """Create a protected, self-contained CAD copy including cross-directory dependencies; reuse it via reusable_model."""
     return await run_and_wait("prepare", model_path, timeout_seconds=timeout_seconds, stall_timeout_seconds=stall_timeout_seconds, use_saved_files=use_saved_files)

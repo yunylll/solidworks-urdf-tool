@@ -35,7 +35,7 @@ The export core is built from the source of [ros/solidworks_urdf_exporter](https
 | Source protection | Source files are only read and hashed; cross-folder dependencies are snapshotted, their references rewritten and packed with Pack and Go; hashes are checked again at the end; SolidWorks' STL settings are restored. |
 | Jobs | Persistent job records, background runs, staged progress, waiting, cancellation, stall detection, stage durations, cleanup of old jobs, publishing to a project folder. |
 | Large assemblies | One-call component selection, mass properties per part file, mesh reuse when the geometry is unchanged; a first full export of a 3250-component workstation takes about 24 minutes. |
-| Interfaces | Command line `tool_cli.py`, Python `tool_service`, local stdio MCP server (10 tools). |
+| Interfaces | Command line `tool_cli.py`, Python `tool_service`, local stdio MCP server (11 tools). |
 
 Validation records are in the [tool report](validation/TOOL_REPORT.md); the feasibility tests of the earlier bridge are in the [early report](validation/FEASIBILITY.md).
 
@@ -91,11 +91,12 @@ Usage: `.\.venv\Scripts\python.exe scripts\tool_cli.py <command> [options]`
 | `start-export …` | Like `export`, but runs in the background and returns a `job_id` at once; `--check-only` checks instead |
 | `job <job_id> [--wait seconds]` | Show a job; `--wait` returns when it finishes or the time is up |
 | `cancel <job_id>` | Cancel a queued or running job |
+| `check-deps <model>` | List every saved reference of the model in seconds, without opening or copying it: missing files, paths of other computers or accounts, Toolbox/Design Library and external files, with fixes; see [Protecting the source model](#protecting-the-source-model) |
 | `validate-config <config> [--model model]` | Check a configuration without SolidWorks; with `--model`, also whether it was made for the model's current CAD version |
 | `validate-urdf <urdf> [--reference ref] [--previews]` | Validate a URDF package anywhere; `--reference` compares two exports strictly; `--previews` renders the three views |
 | `cleanup-jobs …` | List (and with `--delete`, remove) the CAD snapshots of old jobs, see [Publishing and cleanup](#publishing-and-cleanup) |
 
-Options of every CAD command (inspect, prepare, check, export, start-export):
+Options of every CAD command (inspect, prepare, check, export, start-export, check-deps):
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -289,6 +290,12 @@ A failed publication does not change `passed`; the reason is in `publish.error`.
 
 - **Read-only sources.** Source files are only read and hashed. The tool copies the source model and its dependencies first and rewrites references, runs Pack and Go and exports on the snapshot only; if the API saves the model while packing, it saves the snapshot. All source hashes are checked again at the end (`source_unchanged`).
 - **Missing references.** When saved references point to files that are not on this computer (old configurations, imported source files, library parts), the model need not be opened in SolidWorks first: the snapshot skips those paths, and after opening it the tool checks that every unsuppressed component loaded. Only an active component with a missing file fails the job, naming the component and path; skipped references and suppressed components without files are listed in `warnings`.
+- **Dependency check.** Before any file is copied or opened, export, start-export, check (`check_only`), inspect and prepare read the saved references of the model and of each of its files with `GetDocumentDependencies2` (stage `dependency_check`; seconds for the roughly 200 references of lab_workstation). The result, in `dependency_check`, lists every problem at once with a fix for each. It also runs on its own: command line `check-deps`, MCP `check_dependencies`, Python `check_dependencies`. It decides as the snapshot logic above does:
+  - **Errors (the job fails at once with `DEPENDENCY_CHECK_FAILED`, nothing copied)**: a file that an active component uses is missing; a snapshot or Pack and Go copy would be longer than 259 characters.
+  - **Warnings**: missing files that only suppressed components or no component use; Toolbox / Design Library files (e.g. `C:\SOLIDWORKS Data\...`) and paths of other computers or accounts (`C:\Users\<someone else>\...`) as long as it is not known which components use them; 3D Interconnect import caches (`...\Temp\swx*\IC~~\`) and the STEP, IGES, ... files parts were imported from, whose bodies the parts keep.
+  - **Info**: existing files outside the model folder (copied into the snapshot); files with the same name (renamed by Pack and Go); temporary paths of virtual components (`VC~~`, stored inside the assembly, fine even from another computer).
+  - Which components use a file comes from the model open in SolidWorks, or from the component list of the newest earlier job of the same model and CAD version (`usage_source`). Without either, missing files are warnings only: the job still fails when the snapshot opens if an active component lacks its file. Run inspect once and the check can tell.
+  - The old failures where Pack and Go rejected the destination file names (jobs a0000005 and a0000006, the old lab_workstation bench) had nothing to do with Chinese file names or path length: the assembly holds 10 virtual components, which were given new destinations, and SolidWorks accepts only their own default destinations. Virtual components now keep them (see 4bee8a6); the same model later inspected and exported fine, with 72 Chinese file names and paths of up to 202 characters.
 - **Models open in SolidWorks.** When the assembly is open in SolidWorks, the tool reads a read-only manifest of the active model and requires the snapshot's configuration name, component count and mass to match it. If the open model has unsaved changes, the job fails with `UNSAVED_CHANGES`: save it, or close it without saving, and run again; or use `--use-saved-files` to export the files saved on disk, which `warnings` then mention.
 
 ## Python
@@ -296,7 +303,7 @@ A failed publication does not change `passed`; the reason is in `publish.error`.
 ```python
 import sys
 sys.path.insert(0, r"C:\path\to\solidworks-urdf-tool\scripts")
-from tool_service import inspect_model, check_configuration, export_urdf, start_export, wait_job, cancel_job, cleanup_jobs
+from tool_service import inspect_model, check_dependencies, check_configuration, export_urdf, start_export, wait_job, cancel_job, cleanup_jobs
 
 check = check_configuration(r"C:\path\robot.SLDASM", r"C:\path\robot-config.json")
 result = export_urdf(check.get("reusable_model") or r"C:\path\robot.SLDASM", "robot_description",
@@ -315,6 +322,7 @@ The server is `scripts\mcp_server.py`, started with the workspace Python. Other 
 |---|---|
 | `inspect_solidworks` | Read the SolidWorks version and the active document without changing it |
 | `inspect_model_configuration` | Inspect a model; returns components, an editable configuration and unassigned components |
+| `check_dependencies` | List all references of a model and their problems in seconds, without opening it |
 | `prepare_model` | Create a self-contained CAD copy |
 | `validate_configuration` | Check a configuration without SolidWorks; optional `model_path` for the CAD version |
 | `export_urdf` | Export (or check with `check_only=true`) and wait for the result |
@@ -336,13 +344,14 @@ For large models, use `start_urdf_export` and then `get_export_job` with `wait_s
 
 | Test | Needs SolidWorks | Covers |
 |---|---|---|
+| `test_dependencies.py` | no | Dependency check classification: Toolbox, other computers' paths, import caches, virtual components, active/suppressed/unused, paths too long |
 | `test_configuration.py` | no | Configuration checks, post-processing fields, sub-assembly expansion, `exclude_hidden_bodies` |
 | `test_validation.py` | no | That the validator catches broken exports: missing meshes, unit errors, joint directions, zero-pose placement, mesh against CAD, hidden bodies |
 | `test_postprocess.py` | no | mimic and world post-processing |
 | `test_jobs.py` | no | Queue, worker liveness, stalls and pauses, cancellation, progress, JSON files held by readers, mesh reuse candidates, durations |
 | `test_provenance.py` | no | Configuration provenance and CAD versions, on synthetic jobs in `scripts\testdata\provenance-jobs`, and on real jobs named in `private-fixture.json` where present |
 | `test_maintenance.py` | no | Publishing and cleanup |
-| `test_cad_regressions.py` | yes | Pack and Go with virtual components, joints sharing an origin, check-only runs, reuse of a prepared copy, progress, mimic/world, errors that name the wrong component |
+| `test_cad_regressions.py` | yes | Pack and Go with virtual components, joints sharing an origin, check-only runs, reuse of a prepared copy, progress, mimic/world, errors that name the wrong component, the dependency check failing before any copy when a part file is missing |
 | `test_nested_subassemblies.py` | yes | Complete meshes for sub-assemblies listed whole two levels down, chunked and whole mass properties agreeing, mesh reuse and moved meshes; with the workstation CAD present, also the vial rack and `exclude_hidden_bodies` (`SW_URDF_VIAL_RACK` sets its path) |
 | `test_tool_mcp.py`, `test_mcp.py` | yes | The MCP tools end to end |
 | `test_registered_mcp.py`, `test_mcp_smoke.py` | yes | The registered MCP server; `test_mcp_smoke.py` needs an open SolidWorks session |

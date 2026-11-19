@@ -35,7 +35,7 @@ SolidWorks 2026 をバックグラウンドで操作し、アセンブリや部�
 | ソースの保護 | ソースファイルは読み取りとハッシュ計算のみ。フォルダーをまたぐ依存ファイルをスナップショットし、参照を書き換えて Pack and Go。最後にハッシュを再確認し、SolidWorks の STL 設定を復元。 |
 | ジョブ | 永続的なジョブ記録、バックグラウンド実行、段階ごとの進捗、待機、キャンセル、停滞検出、段階ごとの所要時間、古いジョブのクリーンアップ、プロジェクトフォルダーへの公開。 |
 | 大規模アセンブリ | コンポーネントの一括選択、部品ファイルごとの質量特性、形状が変わらない場合のメッシュ再利用。3250 コンポーネントのワークステーションの初回エクスポートは約 24 分。 |
-| インターフェース | コマンドライン `tool_cli.py`、Python `tool_service`、ローカル stdio MCP サーバー（10 ツール）。 |
+| インターフェース | コマンドライン `tool_cli.py`、Python `tool_service`、ローカル stdio MCP サーバー（11 ツール）。 |
 
 検証記録は[ツールレポート](validation/TOOL_REPORT.ja.md)、初期のブリッジ方式の実現性テストは[初期レポート](validation/FEASIBILITY.ja.md)にあります。
 
@@ -91,11 +91,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-tool.ps1
 | `start-export …` | `export` と同じだがバックグラウンドで実行し、すぐに `job_id` を返す。`--check-only` でチェックのみ |
 | `job <job_id> [--wait 秒]` | ジョブを表示。`--wait` は終了または時間切れで戻る |
 | `cancel <job_id>` | 待機中または実行中のジョブをキャンセル |
+| `check-deps <モデル>` | モデルを開かずコピーもせずに、保存された参照をすべて数秒で一覧：見つからないファイル、他のコンピューターやアカウントのパス、Toolbox/デザインライブラリ、外部ファイルと修正方法。[ソースモデルの保護](#ソースモデルの保護)を参照 |
 | `validate-config <設定> [--model モデル]` | SolidWorks を起動せずに設定を検査。`--model` を付けると、モデルの現在の CAD バージョン用の設定かも判定 |
 | `validate-urdf <urdf> [--reference 参照] [--previews]` | 任意の場所の URDF パッケージを検証。`--reference` は 2 つのエクスポートを厳密に比較、`--previews` は 3 方向の画像を作成 |
 | `cleanup-jobs …` | 古いジョブの CAD スナップショットを一覧（`--delete` で削除）。[公開とクリーンアップ](#公開とクリーンアップ)を参照 |
 
-CAD コマンド（inspect、prepare、check、export、start-export）共通のオプション：
+CAD コマンド（inspect、prepare、check、export、start-export、check-deps）共通のオプション：
 
 | オプション | 既定値 | 内容 |
 |---|---|---|
@@ -289,6 +290,12 @@ lab_workstation ワークステーション（3250 コンポーネント、19 Li
 
 - **ソースは読み取りのみ。** ソースファイルは読み取りとハッシュ計算だけを行います。ツールはまずソースモデルと依存ファイルをコピーし、参照の書き換え、Pack and Go、エクスポートはスナップショットに対してだけ行います。API がパック時にモデルを保存しても、保存されるのはスナップショットです。最後にすべてのソースのハッシュを再確認します（`source_unchanged`）。
 - **見つからない参照。** 保存された参照がこのコンピューターにないファイル（古い構成、インポート元ファイル、ライブラリ部品など）を指していても、先に SolidWorks でモデルを開く必要はありません。スナップショットはそれらのパスを飛ばして作り、開いた後で抑制されていないすべてのコンポーネントが読み込まれたかを確認します。ファイルがないのが有効なコンポーネントの場合だけ、コンポーネント名とパスを示して失敗します。飛ばした参照とファイルのない抑制コンポーネントは `warnings` に記録します。
+- **依存関係の事前チェック。** export、start-export、check（`check_only`）、inspect、prepare は、ファイルをコピーしたり開いたりする前に、モデルとその各ファイルに保存された参照を `GetDocumentDependencies2` で読みます（段階 `dependency_check`。lab_workstation の約 200 の参照で数秒）。結果は `dependency_check` にあり、すべての問題を一度に、それぞれの修正方法とともに示します。単独でも実行できます：コマンドライン `check-deps`、MCP `check_dependencies`、Python `check_dependencies`。判定は上のスナップショットの扱いと同じです：
+  - **エラー（ジョブは直ちに `DEPENDENCY_CHECK_FAILED` で失敗し、何もコピーしない）**：有効なコンポーネントが使うファイルがない。スナップショットまたは Pack and Go のコピーのパスが 259 文字を超える。
+  - **警告**：抑制されたコンポーネントだけが使う、またはどのコンポーネントも使わない見つからないファイル。Toolbox / デザインライブラリのファイル（`C:\SOLIDWORKS Data\...` など）と他のコンピューターやアカウントのパス（`C:\Users\<他の人>\...`）は、どのコンポーネントが使うか分からない間は警告。3D Interconnect のインポートキャッシュ（`...\Temp\swx*\IC~~\`）と部品のインポート元ファイル（STEP、IGES など。部品はインポートしたボディを保持しています）。
+  - **情報**：モデルフォルダーの外にある既存ファイル（スナップショットにコピーします）、同名のファイル（Pack and Go で名前を変えます）、仮想コンポーネントの一時パス（`VC~~`。アセンブリ内に保存されており、他のコンピューターのものでも問題ありません）。
+  - どのコンポーネントがファイルを使うかは、SolidWorks で開いている同じモデル、または同じモデル・同じ CAD バージョンの直近のジョブが記録したコンポーネント一覧（`usage_source`）から判断します。どちらもない場合、見つからないファイルは警告だけです。有効なコンポーネントに本当にファイルがなければ、スナップショットを開いたときに失敗します。一度 inspect を実行すれば区別できます。
+  - 以前 Pack and Go が保存先のファイル名を拒否した失敗（ジョブ a0000005、a0000006、旧 lab_workstation 作業台）は、中国語のファイル名やパスの長さとは無関係でした。このアセンブリには仮想コンポーネントが 10 個あり、それらに新しい保存先を指定していましたが、SolidWorks は仮想コンポーネント自身の既定の保存先しか受け付けません。現在は既定の保存先を保ち（4bee8a6 を参照）、同じモデルは後に inspect もエクスポートも成功しています。中国語のファイル名 72 個、最長 202 文字のパスも問題ありませんでした。
 - **SolidWorks で開いているモデル。** アセンブリが SolidWorks で開かれている場合、アクティブなモデルの読み取り専用の一覧を読み、スナップショットの構成名、コンポーネント数、質量が一致することを確認します。開いているモデルに未保存の変更があるとジョブは `UNSAVED_CHANGES` で失敗します。保存するか保存せずに閉じてから再実行するか、`--use-saved-files` でディスク上の保存済みファイルをエクスポートしてください（`warnings` にその旨が記録されます）。
 
 ## Python
@@ -296,7 +303,7 @@ lab_workstation ワークステーション（3250 コンポーネント、19 Li
 ```python
 import sys
 sys.path.insert(0, r"C:\path\to\solidworks-urdf-tool\scripts")
-from tool_service import inspect_model, check_configuration, export_urdf, start_export, wait_job, cancel_job, cleanup_jobs
+from tool_service import inspect_model, check_dependencies, check_configuration, export_urdf, start_export, wait_job, cancel_job, cleanup_jobs
 
 check = check_configuration(r"C:\path\robot.SLDASM", r"C:\path\robot-config.json")
 result = export_urdf(check.get("reusable_model") or r"C:\path\robot.SLDASM", "robot_description",
@@ -315,6 +322,7 @@ print(result["bridge"]["urdf"])
 |---|---|
 | `inspect_solidworks` | SolidWorks のバージョンとアクティブなドキュメントを変更せずに読み取る |
 | `inspect_model_configuration` | モデルを調べ、コンポーネント、編集可能な設定、未割り当てのコンポーネントを返す |
+| `check_dependencies` | モデルを開かずに、すべての参照とその問題を数秒で一覧 |
 | `prepare_model` | 自己完結した CAD コピーを作る |
 | `validate_configuration` | SolidWorks なしで設定を検査。CAD バージョンの確認用に任意の `model_path` |
 | `export_urdf` | エクスポート（`check_only=true` ならチェックのみ）して結果を待つ |
@@ -336,13 +344,14 @@ print(result["bridge"]["urdf"])
 
 | テスト | SolidWorks | 内容 |
 |---|---|---|
+| `test_dependencies.py` | 不要 | 依存関係チェックの分類：Toolbox、他のコンピューターのパス、インポートキャッシュ、仮想コンポーネント、有効/抑制/未使用、長すぎるパス |
 | `test_configuration.py` | 不要 | 設定の検査、後処理のフィールド、サブアセンブリの展開、`exclude_hidden_bodies` |
 | `test_validation.py` | 不要 | 検証が壊れたエクスポートを見つけること：メッシュの欠落、単位の誤り、関節の向き、ゼロ姿勢での配置、メッシュと CAD、非表示ボディ |
 | `test_postprocess.py` | 不要 | mimic と world の後処理 |
 | `test_jobs.py` | 不要 | キュー、ワーカーの生存確認、停滞と一時停止、キャンセル、進捗、読み取り中の JSON ファイル、メッシュ再利用の候補、所要時間 |
 | `test_provenance.py` | 不要 | 設定の由来と CAD バージョン。`scripts\testdata\provenance-jobs` の合成ジョブで実行し、`private-fixture.json` があれば実際のジョブでも実行 |
 | `test_maintenance.py` | 不要 | 公開とクリーンアップ |
-| `test_cad_regressions.py` | 必要 | 仮想部品を含む Pack and Go、原点を共有する関節、チェック専用モード、準備済みコピーの再利用、進捗、mimic/world、誤ったコンポーネント名を示すエラー |
+| `test_cad_regressions.py` | 必要 | 仮想部品を含む Pack and Go、原点を共有する関節、チェック専用モード、準備済みコピーの再利用、進捗、mimic/world、誤ったコンポーネント名を示すエラー、部品ファイルがないときにコピー前に失敗する依存関係チェック |
 | `test_nested_subassemblies.py` | 必要 | 2 階層下のサブアセンブリを丸ごと列挙したときのメッシュの完全性、分割と一括の質量特性の一致、メッシュの再利用と移動。ワークステーションの CAD があればラックと `exclude_hidden_bodies` も（パスは `SW_URDF_VIAL_RACK` で指定） |
 | `test_tool_mcp.py`、`test_mcp.py` | 必要 | MCP ツールのエンドツーエンド |
 | `test_registered_mcp.py`、`test_mcp_smoke.py` | 必要 | 登録済みの MCP サーバー。`test_mcp_smoke.py` は開いている SolidWorks セッションが必要 |

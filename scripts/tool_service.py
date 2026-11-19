@@ -18,6 +18,7 @@ import uuid
 
 from configuration import AUTOMATIC, expand_subassemblies, load_config, native_config, needs_postprocess, skeleton_config, validate_config
 from validate_export import validate
+import dependencies
 import provenance
 import render_preview
 import urdf_postprocess
@@ -28,8 +29,8 @@ NATIVE = WORKSPACE / "build" / "bin" / "SolidWorksUrdf.exe"
 PROBE = WORKSPACE / "build" / "bin" / "SolidWorksProbe.exe"
 PENDING_RESTORES = WORKSPACE / "validation" / "pending-preference-restore"
 TERMINAL = {"succeeded", "failed", "timed_out", "interrupted", "rejected", "cancelled"}
-OPERATIONS = {"inspect", "prepare", "check", "export"}
-EXPECTED_STATUS = {"inspect": "inspected", "prepare": "prepared", "check": "checked", "export": "exported"}
+OPERATIONS = {"inspect", "prepare", "check", "export", "dependencies"}
+EXPECTED_STATUS = {"inspect": "inspected", "prepare": "prepared", "check": "checked", "export": "exported", "dependencies": "dependencies_checked"}
 # Jobs wait this long in "queued" for an earlier CAD operation to finish.
 QUEUE_WAIT_SECONDS = 3600
 # Hard limit of one CAD operation; large assemblies (about 700 parts) need 45-60 minutes.
@@ -49,6 +50,7 @@ STAGES = {
     "waiting_for_cad_lock": "Waiting for an earlier CAD job to finish",
     "probe": "Reading the active SolidWorks document",
     "starting_session": "Starting a private SolidWorks session",
+    "dependency_check": "Listing and checking the saved references of the model",
     "snapshot": "Copying source files into a protected snapshot",
     "opening": "Opening the model",
     "pack_and_go": "Copying the model through Pack and Go",
@@ -238,6 +240,49 @@ def source_status(config, model_path, before=None, original=None):
     return status
 
 
+def known_components(original_path, cad_version, before=None):
+    """Components (name, path, suppressed) of the newest earlier job of the same model and CAD version, or None.
+
+    The dependency check uses them to tell a missing file that an active component uses (fails) from one only
+    suppressed components or no component use (warns), without opening the model.
+    """
+    best = None
+    for path in JOBS.glob("*/result.json"):
+        try:
+            if path.stat().st_size > 200_000_000:
+                continue
+        except OSError:
+            continue
+        record = read_json(path)
+        if not isinstance(record, dict) or record.get("cad_version_sha256") != cad_version or (before and (record.get("created_at") or "") >= before):
+            continue
+        if not provenance.same_path(record.get("original_model_path") or record.get("model_path"), original_path):
+            continue
+        components = (record.get("bridge") or {}).get("components")
+        if components and (best is None or record.get("created_at", "") > best[0]):
+            best = (record.get("created_at", ""), record["job_id"], components)
+    if best is None:
+        return None
+    return {"source": f"job {best[1]}", "components": [{"name": c.get("name"), "path": c.get("path"), "suppressed": bool(c.get("suppressed"))} for c in best[2]]}
+
+
+def _dependency_check(record, bridge):
+    """Classify the native dependency scan into record['dependency_check']; returns it, or None without a scan."""
+    scan = bridge.get("dependencyScan")
+    if not scan:
+        return None
+    known, source = None, None
+    if bridge.get("activeSourceManifestVerified"):
+        manifest = read_json(Path(record["job"]) / "source-manifest.json") or {}
+        known, source = manifest.get("components"), "the model open in SolidWorks"
+    elif scan.get("known_components"):
+        saved = read_json(Path(record["job"]) / "known-components.json") or {}
+        known, source = saved.get("components"), record.get("dependency_usage_source")
+    check = dependencies.classify(scan, known, source)
+    record["dependency_check"] = check
+    return check
+
+
 def _needs_preflight(config):
     return config.get("recompute_kinematics") is False and any(l.get("parent") is not None and l.get("coordinate_system") == AUTOMATIC for l in config["links"])
 
@@ -314,6 +359,12 @@ def create_job(operation, model_path, package_name="robot_description", *, confi
                 action = ("No component placements were recorded for that CAD version, so they cannot be compared; the export is checked against the previous export instead "
                           "(all meshes moving while a rotation axis stays behind fails). recompute_preflight=true recomputes the joints first, which takes long on large assemblies.")
             record["warnings"].append(status["message"] + " " + action)
+    known = known_components(original_path, cad_version, created)
+    if known:
+        write_json(directory / "known-components.json", {"source_path": str(source), "unsaved_changes": False, "components": known["components"]})
+        request["known_components"] = str(directory / "known-components.json")
+        write_json(directory / "request.json", request)
+        record["dependency_usage_source"] = known["source"]
     if operation == "export" and compare_previous and not reference:
         record["previous_export"] = provenance.previous_export(original_path, package_name, JOBS, before=created, exclude=identifier)
     write_json(directory / "result.json", record)
@@ -885,6 +936,9 @@ def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
                 if not record["source_unchanged"]:
                     record["source_changed_files"] = [p for p in before if before[p] != after[p]] + ([] if model_unchanged else [request["model_path"]])
                 _finish_configuration(directory, record, bridge, request.get("package_name", "robot_description"))
+                dependency_check = _dependency_check(record, bridge)
+                if dependency_check and dependency_check["warnings"]:
+                    record.setdefault("notes", []).append(f"Dependency check: {len(dependency_check['warnings'])} warning(s) about saved references ({dependency_check['summary']}); see dependency_check.warnings.")
                 native_ok = return_code == 0 and bridge.get("status") == EXPECTED_STATUS[record["operation"]]
                 preferences_ok = bridge.get("preferencesRestored", record["operation"] in {"prepare", "check"} or "preferencesBefore" not in bridge)
                 config_path = directory / "robot-config.json"
@@ -901,6 +955,8 @@ def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
                     record["detected_joint_types"] = bridge.get("detectedJointTypes")
                 record["warnings"] = record.get("warnings", []) + bridge_warnings(bridge) + record.pop("notes", [])
                 validation_ok = record.get("validation", {"passed": True})["passed"]
+                if record["operation"] == "dependencies":
+                    validation_ok = bool(dependency_check and dependency_check["passed"])
                 record["passed"] = bool(native_ok and preferences_ok and cleanup["passed"] and record["source_unchanged"] and bool(before) and validation_ok)
                 if not record["passed"]:
                     # Only meshes of a fully passed export are offered to later ones.
@@ -926,13 +982,17 @@ def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
                             reasons.append("source file audit failed: " + str(bridge.get("sourceAuditError") or "files changed"))
                         message = f"The native operation ended with status {bridge.get('status')!r} and exit code {return_code}: " + ("; ".join(reasons) or "see stderr.log")
                     record["error"] = {"code": "CAD_OPERATION_FAILED", "message": message, "stage": stage, "native_exit_code": return_code}
+                    if stage == "dependency_check" and dependency_check and not dependency_check["passed"]:
+                        record["error"].update(code="DEPENDENCY_CHECK_FAILED", message=dependencies.describe(dependency_check) + "\nNo file was copied or opened.")
                     if (bridge.get("componentPoseCheck") or {}).get("exceeded"):
                         record["component_pose_check"] = bridge["componentPoseCheck"]
                         record["error"].update(code="CONFIG_OUTDATED", message=f"{record.get('config_source_message') or 'The configuration was made for another CAD version.'}\n{provenance.describe_pose_changes(bridge['componentPoseCheck'])}\n"
                                                "No Link frame or mesh was made. Correct the joint origins, or rerun with accept_source_change=true to export the configured joints unchanged.")
                 elif native_ok and not record["passed"] and not record.get("error"):
                     reasons = []
-                    if not validation_ok:
+                    if record["operation"] == "dependencies" and not validation_ok:
+                        reasons.append(dependencies.describe(dependency_check) if dependency_check else "the native tool recorded no dependency scan")
+                    elif not validation_ok:
                         reasons.append("validation: " + "; ".join(record["validation"]["errors"][:10]))
                     if not record["source_unchanged"]:
                         reasons.append("source files changed: " + ", ".join(record["source_changed_files"]))
@@ -941,6 +1001,8 @@ def run_job(identifier, queue_wait_seconds=QUEUE_WAIT_SECONDS):
                     if not cleanup["passed"]:
                         reasons.append("private session cleanup failed: " + str(cleanup.get("error")))
                     record["error"] = {"code": "CHECKS_FAILED", "message": "The CAD operation finished, but " + "; ".join(reasons or ["a check failed"])}
+                    if record["operation"] == "dependencies" and not validation_ok:
+                        record["error"]["code"] = "DEPENDENCY_CHECK_FAILED"
                 _record_reusable_copy(bridge, record)
             elif not stopped:
                 record.update(status="failed", error={"code": "NATIVE_NO_REPORT", "message": "Native tool produced no result; see stderr.log: " + " | ".join(describe_progress(directory, record).get("log_tail", []))})
@@ -1091,6 +1153,11 @@ def check_configuration(model_path, config_path, *, timeout_seconds=DEFAULT_TIME
     """Run an export up to the joints and Link frames, without inertia or meshes."""
     return operation("check", model_path, config_path=config_path, timeout_seconds=timeout_seconds, stall_timeout_seconds=stall_timeout_seconds, use_saved_files=use_saved_files,
                      accept_source_change=accept_source_change, kinematics_tolerance_mm=kinematics_tolerance_mm, kinematics_tolerance_deg=kinematics_tolerance_deg, write_config_source=write_config_source, recompute_preflight=recompute_preflight)
+
+
+def check_dependencies(model_path, *, timeout_seconds=600, stall_timeout_seconds=DEFAULT_STALL_SECONDS, use_saved_files=False):
+    """List every saved reference of the model without opening it: missing, foreign, Toolbox and external files, with fixes."""
+    return operation("dependencies", model_path, timeout_seconds=timeout_seconds, stall_timeout_seconds=stall_timeout_seconds, use_saved_files=use_saved_files)
 
 
 def inspect_model(model_path, *, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, stall_timeout_seconds=DEFAULT_STALL_SECONDS, use_saved_files=False):

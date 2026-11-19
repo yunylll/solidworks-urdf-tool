@@ -72,6 +72,57 @@ public static partial class LegacyExportBridge
     {
         return (path ?? "").Contains("^") && System.Text.RegularExpressions.Regex.IsMatch(path, @"\\Temp\\swx[^\\]+\\VC~~\\", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
     }
+    // Every saved reference of the model and of each referenced file, read without opening any document
+    // (GetDocumentDependencies2 reads the files' reference lists). Each row: path, exists, referenced_by.
+    // A missing file that a known active component uses fails at once, listing all of them; everything
+    // else is classified by the tool (dependencies.py) into errors, warnings and suggestions.
+    private static void CheckDependencies(SldWorks app, string source, string output, Dictionary<string, object> report, List<SourceComponent> known)
+    {
+        SW2URDF.Headless.Progress.Stage("dependency_check", "Listing the saved references of the model and its files...");
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        var rows = new Dictionary<string, Dictionary<string, object>>(StringComparer.OrdinalIgnoreCase);
+        var queue = new Queue<string>();
+        string root = Path.GetFullPath(source);
+        rows[root] = new Dictionary<string, object> { { "path", root }, { "exists", true }, { "referenced_by", new List<string>() } };
+        queue.Enqueue(root);
+        while (queue.Count != 0)
+        {
+            string file = queue.Dequeue();
+            app.SetCurrentWorkingDirectory(Path.GetDirectoryName(file));
+            object raw = app.GetDocumentDependencies2(file, false, true, false);
+            string[] pairs = raw == null ? new string[0] : ((IEnumerable)raw).Cast<object>().Select(Convert.ToString).ToArray();
+            for (int i = 1; i < pairs.Length; i += 2)
+            {
+                string reference = pairs[i];
+                if (string.IsNullOrEmpty(reference)) continue;
+                Dictionary<string, object> row;
+                if (!rows.TryGetValue(reference, out row))
+                {
+                    bool exists = File.Exists(reference);
+                    row = new Dictionary<string, object> { { "path", reference }, { "exists", exists }, { "referenced_by", new List<string>() } };
+                    rows[reference] = row;
+                    if (exists && !IsVirtualComponent(reference)) queue.Enqueue(reference);
+                }
+                var parents = (List<string>)row["referenced_by"];
+                if (!parents.Contains(file, StringComparer.OrdinalIgnoreCase)) parents.Add(file);
+            }
+        }
+        var fatal = new List<string>();
+        if (known != null)
+        {
+            foreach (var row in rows.Values)
+            {
+                string path = Convert.ToString(row["path"]);
+                if ((bool)row["exists"] || IsVirtualComponent(path) || IsInterconnectCache(path)) continue;
+                string name = Path.GetFileName(path);
+                var users = known.Where(c => !c.suppressed && string.Equals(Path.GetFileName(c.path ?? ""), name, StringComparison.OrdinalIgnoreCase)).Select(c => c.name).ToList();
+                if (users.Count != 0) fatal.Add(string.Join(", ", users.Take(5)) + (users.Count > 5 ? ", ..." : "") + " -> " + path);
+            }
+        }
+        report["dependencyScan"] = new Dictionary<string, object> { { "model", root }, { "output", output }, { "user", System.Environment.UserName }, { "seconds", Math.Round(watch.Elapsed.TotalSeconds, 2) }, { "known_components", known != null }, { "references", rows.Values.ToList() } };
+        if (fatal.Count != 0)
+            throw new FileNotFoundException("Dependency check: " + fatal.Count + " missing file(s) are used by active components: " + string.Join("; ", fatal.Take(20)) + (fatal.Count > 20 ? "; ..." : "") + ". See dependency_check for every reference and how to fix it.");
+    }
     private static string StageSourceSnapshot(SldWorks app, string source, string output, Dictionary<string, object> report)
     {
         app.SetCurrentWorkingDirectory(Path.GetDirectoryName(source));
