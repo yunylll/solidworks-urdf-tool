@@ -131,7 +131,7 @@ class CadRegressions(unittest.TestCase):
         config["links"][1]["components"] = ["3_DOF_ARM_SEGMNT-1"]
         path = self.write_config("misspelled", config)
         # The earlier tests recorded ARM's components: the typo and the part it leaves without a Link are both
-        # reported before SolidWorks starts (jobs a0000001 and a0000004 failed seven times in the CAD stage).
+        # reported before SolidWorks starts (such a typo used to fail only in the CAD stage).
         with self.assertRaises(ValueError) as caught:
             check_configuration(ARM, path)
         early = str(caught.exception)

@@ -1,16 +1,17 @@
 """SolidWorks regression: Links that list a nested sub-assembly as a whole.
 
 A workstation export listed vial sub-assemblies that sat inside rack sub-assemblies; their parts
-never reached the STL (144 vials) while the URDF passed, because the masses come from the CAD
-components. Two fixtures reproduce that nesting from workspace copies:
+never reached the STL while the URDF passed, because the masses come from the CAD components.
+Two fixtures reproduce that nesting from workspace copies:
 - the 3_DOF_ARM sample inside two new assemblies, the arm listed whole two levels down (always run);
-- the workstation's rack_x4_asm inside a new assembly with its 48 vial sub-assemblies listed whole,
-  as in the old configuration (run when the CAD is on this computer; SW_URDF_VIAL_RACK overrides the path).
+- a private rack assembly inside a new assembly with its consumable sub-assemblies listed whole, as in
+  the old configuration (run when the private fixture names it and the CAD is on this computer;
+  SW_URDF_VIAL_RACK overrides its path). See private_fixture.py.
 Before the fix these meshes were empty (0 triangles); now every part must be in its Link mesh.
-The vial rack also checks that mass properties read in chunks equal one whole reading, and that a
+The rack also checks that mass properties read in chunks equal one whole reading, and that a
 re-export reuses the meshes, moving them into a Link frame changed by a joint origin.
 
-Needs SolidWorks 2026. The vial rack source is only read: prepare_model makes the tool's own copy first.
+Needs SolidWorks 2026. Private sources are only read: prepare_model makes the tool's own copy first.
 """
 import json
 import os
@@ -20,11 +21,18 @@ import unittest
 import uuid
 import xml.etree.ElementTree as ET
 
+import private_fixture
 from tool_service import check_configuration, export_urdf, inspect_model, prepare_model, write_json
 
 ROOT = Path(__file__).resolve().parent.parent
 ARM = ROOT / "vendor" / "solidworks_urdf_exporter" / "examples" / "3_DOF_ARM" / "3_DOF_ARM.SLDASM"
-VIAL_RACK = Path(os.environ.get("SW_URDF_VIAL_RACK", r"C:\cad\workstation\rack\rack_x4_asm.SLDASM"))
+PRIVATE = private_fixture.load()
+# A rack whose consumables (sub-assemblies named with "consumable_marker") sit one level down.
+RACK = dict(PRIVATE.get("nested_rack") or {})
+if os.environ.get("SW_URDF_VIAL_RACK"):
+    RACK["assembly"] = os.environ["SW_URDF_VIAL_RACK"]
+# An assembly with a part that keeps a hidden body its mates need.
+HIDDEN = PRIVATE.get("hidden_bodies") or {}
 FIXTURES = ROOT / "validation" / "fixtures" / f"nested-{uuid.uuid4().hex[:8]}"
 REPORT = ROOT / "validation" / "nested-subassemblies.json"
 report = {}
@@ -91,21 +99,22 @@ class NestedSubassemblies(unittest.TestCase):
         self.assertEqual(len(expanded["links"][0]["components"]), 4)
         self.assertTrue(any("listed whole" in w for w in result["warnings"]))
 
-    def test_workstation_sample_rack(self):
-        if not VIAL_RACK.is_file():
-            self.skipTest(f"{VIAL_RACK} is not on this computer")
-        prepared = prepare_model(VIAL_RACK)
+    def test_private_rack(self):
+        if not RACK.get("assembly") or not Path(RACK["assembly"]).is_file():
+            self.skipTest("no private rack assembly on this computer")
+        marker = RACK["consumable_marker"]
+        prepared = prepare_model(Path(RACK["assembly"]))
         self.assertTrue(prepared["passed"], describe(prepared))
         model, names = wrap(prepared["reusable_model"], "vials", 1)
-        rack = [n for n in names if n.count("/") == 1 and "/consumable_cap-" not in n]
-        caps = [n for n in names if n.count("/") == 1 and "/consumable_cap-" in n]
-        self.assertEqual(len(caps), 48)
+        rack = [n for n in names if n.count("/") == 1 and marker not in n]
+        caps = [n for n in names if n.count("/") == 1 and marker in n]
+        self.assertEqual(len(caps), RACK["consumables"])
         config = {"schema_version": 1, "robot_name": "nested_vials", "recompute_kinematics": False, "links": [
             {"name": "base_link", "parent": None, "components": rack, "coordinate_system": "Assembly Origin", "mesh_quality": "coarse", "frame_only": False, "joint": None},
             {"name": "rack_consumables", "parent": "base_link", "components": caps, "coordinate_system": "Automatically Generate", "mesh_quality": "coarse", "frame_only": False,
              "joint": {"name": "rack_consumables_joint", "type": "fixed", "xyz": [0, 0, 0], "rpy": [0, 0, 0]}}]}
         result, geometry = self.export(model, "nested_vials", config, reuse_meshes=False)
-        self.assertEqual(geometry["rack_consumables"]["components_checked"], 96, "a vial and a cap in each of 48 sub-assemblies")
+        self.assertEqual(geometry["rack_consumables"]["components_checked"], 2 * RACK["consumables"], "a vial and a cap in each sub-assembly")
         self.assertAlmostEqual(geometry["rack_consumables"]["volume_ratio"], 1.0, delta=0.05)
         whole = inertials(result)
 
@@ -130,12 +139,12 @@ class NestedSubassemblies(unittest.TestCase):
 
 
 class ExcludedHiddenBodies(unittest.TestCase):
-    """gantry_z1_p05 keeps a hidden mirror body that a mate of gantry_z1_asm uses; exclude_hidden_bodies leaves it out of the mass."""
+    """A private part keeps a hidden mirror body that a mate of its assembly uses; exclude_hidden_bodies leaves it out of the mass."""
 
     def test_exclude_hidden_bodies(self):
-        source = VIAL_RACK.parent.parent / "gan" / "gantry_z1_asm.SLDASM"
-        if not source.is_file():
-            self.skipTest(f"{source} is not on this computer")
+        if not HIDDEN.get("assembly") or not Path(HIDDEN["assembly"]).is_file():
+            self.skipTest("no private hidden-body assembly on this computer")
+        source = Path(HIDDEN["assembly"])
         inspection = inspect_model(source)
         self.assertTrue(inspection["passed"], describe(inspection))
         config = json.loads(Path(inspection["configuration_path"]).read_text(encoding="utf-8"))
@@ -143,21 +152,21 @@ class ExcludedHiddenBodies(unittest.TestCase):
         config["recompute_kinematics"] = False
         FIXTURES.mkdir(parents=True, exist_ok=True)
         results = {}
-        for name, extra in (("plain", {}), ("excluded", {"exclude_hidden_bodies": ["gantry_z1_p05.SLDPRT"]})):
-            path = FIXTURES / f"gantry_{name}.json"
+        for name, extra in (("plain", {}), ("excluded", {"exclude_hidden_bodies": [HIDDEN["part"]]})):
+            path = FIXTURES / f"hidden_{name}.json"
             write_json(path, dict(config, **extra))
-            results[name] = export_urdf(inspection["reusable_model"], f"gantry_{name}", config_path=path, compare_previous=False, reuse_meshes=False)
+            results[name] = export_urdf(inspection["reusable_model"], f"hidden_{name}", config_path=path, compare_previous=False, reuse_meshes=False)
             self.assertTrue(results[name]["passed"], describe(results[name]))
         hidden = results["excluded"]["bridge"]["excludedHiddenBodyMassKg"]
         self.assertGreater(hidden, 0)
         self.assertAlmostEqual(results["plain"]["validation"]["total_mass_kg"] - results["excluded"]["validation"]["total_mass_kg"], hidden, delta=1e-9)
         self.assertAlmostEqual(results["excluded"]["validation"]["cad_geometry"]["base_link"]["volume_ratio"], 1.0, delta=0.03)
         report["exclude_hidden_bodies"] = {name: r["job_id"] for name, r in results.items()} | {"hidden_mass_kg": hidden}
-        typo = FIXTURES / "gantry_typo.json"
-        write_json(typo, dict(config, exclude_hidden_bodies=["gantry_z1_p5.SLDPRT"]))
+        typo = FIXTURES / "hidden_typo.json"
+        write_json(typo, dict(config, exclude_hidden_bodies=[HIDDEN["typo"]]))
         check = check_configuration(inspection["reusable_model"], typo)
         self.assertFalse(check["passed"])
-        self.assertIn("gantry_z1_p05.SLDPRT", check["error"]["message"], "similar names help fix the typo")
+        self.assertIn(HIDDEN["part"], check["error"]["message"], "similar names help fix the typo")
 
 
 if __name__ == "__main__":

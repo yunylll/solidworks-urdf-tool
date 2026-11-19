@@ -1,21 +1,21 @@
-"""Offline tests of the dependency check, on scans built from references that failed historical jobs."""
+"""Offline tests of the dependency check, on scans built from the kinds of references that failed earlier jobs."""
 import unittest
 import dependencies
 
 MODEL = r"D:\robots\demo\总装备\装配体.SLDASM"
 OUTPUT = r"C:\tools\solidworks-urdf-tool\validation\jobs\0123456789abcdef0123456789abcdef\output"
-# Job a00000e / a0000008 / a0000009: a Design Library part of another installation.
+# A Design Library part of another installation.
 TOOLBOX = r"C:\SOLIDWORKS Data\SolidWorks parts library\5-80 Bottles + parts\Screw cap GL45.SLDPRT"
-# Job a000000a: a 3D Interconnect cache saved on another user's computer.
-CACHE = r"C:\Users\someone\AppData\Local\Temp\swx31348\IC~~\connector-01_1.stp.SLDPRT"
-# Job a000000b: a virtual component's temporary path from another session (stored inside the assembly).
-VIRTUAL = r"C:\Users\someone\AppData\Local\Temp\swx11040\VC~~\______(2)_Controller_C400_C400\__^______(2)_Controller_C400_C400.SLDPRT"
-FOREIGN = r"C:\Users\someone\Desktop\parts\电机支架.SLDPRT"
+# A 3D Interconnect cache saved on another user's computer.
+CACHE = r"C:\Users\alice\AppData\Local\Temp\swx31348\IC~~\connector-01_1.stp.SLDPRT"
+# A virtual component's temporary path from another session (stored inside the assembly).
+VIRTUAL = r"C:\Users\bob\AppData\Local\Temp\swx11040\VC~~\______(2)_Vendor_Controller_Controller\__^______(2)_Vendor_Controller_Controller.SLDPRT"
+FOREIGN = r"C:\Users\alice\Desktop\parts\电机支架.SLDPRT"
 PART = r"D:\robots\demo\总装备\底座.SLDPRT"
 EXTERNAL = r"D:\vendor\common\bolt.SLDPRT"
 
 
-def scan(*rows, user="someone", output=OUTPUT):
+def scan(*rows, user="me", output=OUTPUT):
     references = [{"path": MODEL, "exists": True, "referenced_by": []}]
     references += [{"path": p, "exists": e, "referenced_by": [MODEL]} for p, e in rows]
     return {"model": MODEL, "output": output, "user": user, "seconds": 1.2, "references": references}
@@ -30,11 +30,11 @@ class DependencyChecks(unittest.TestCase):
         self.assertTrue(check["passed"], check["errors"])
         self.assertEqual(len(check["warnings"]), 3)
         self.assertTrue(any("Screw cap GL45" in w and "Toolbox" in w for w in check["warnings"]))
-        self.assertTrue(any("C:\\Users\\someone" in w and "another computer" in w for w in check["warnings"]))
+        self.assertTrue(any("C:\\Users\\alice" in w and "another computer" in w for w in check["warnings"]))
         self.assertIn("component usage unknown", check["summary"])
 
     def test_own_user_path_is_plain_missing(self):
-        check = dependencies.classify(scan((r"C:\Users\someone\Desktop\x.SLDPRT", False)))
+        check = dependencies.classify(scan((r"C:\Users\Me\Desktop\x.SLDPRT", False)))
         self.assertEqual(check["references"][0]["kind"], "missing")
 
     def test_active_missing_fails_all_listed(self):
@@ -56,7 +56,7 @@ class DependencyChecks(unittest.TestCase):
         self.assertEqual(usage, {TOOLBOX: "suppressed", FOREIGN: "unused"})
 
     def test_import_source_never_fails(self):
-        source = r"D:\建模\步进电机_3D模型\motor_3D.igs"  # referenced by stepper_57.SLDPRT of the second_lab_model model
+        source = r"D:\建模\步进电机_3D模型\motor_3D.igs"  # the IGES file a stepper-motor part was imported from
         check = dependencies.classify(scan((source, False)), [], "job abc")
         self.assertEqual((check["references"][0]["kind"], check["passed"], len(check["warnings"])), ("import_source", True, 1))
 
@@ -69,7 +69,7 @@ class DependencyChecks(unittest.TestCase):
         check = dependencies.classify(scan((r"D:\robots\demo\总装备" + "\\" + name, True)))
         self.assertFalse(check["passed"])
         self.assertIn("Path too long", check["errors"][0])
-        # Chinese file names of ordinary length are fine (lab_workstation's 72 of them packed once the virtual components kept their default destination).
+        # Chinese file names of ordinary length are fine (a model with 72 of them packed once the virtual components kept their default destination).
         self.assertTrue(dependencies.classify(scan((PART, True)))["passed"])
 
     def test_duplicate_names(self):

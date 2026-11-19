@@ -117,7 +117,7 @@ class ValidatorChecks(unittest.TestCase):
         self.assertTrue(any("tessellation" in w for w in result["warnings"]), result["warnings"])
 
     def test_hidden_bodies_explain_the_gap(self):
-        # A mirrored part that kept its source body hidden: the mass counts both, the STL one (clamp_R).
+        # A mirrored part that kept its source body hidden: the mass counts both, the STL one.
         geometry = self.cad_geometry(volume_scale=2.0)
         part = geometry["base_link"]["components"][0]
         part["hidden_bodies"] = [{"body": "Cut-Extrude1", "volume_m3": geometry["base_link"]["cad_volume_m3"] / 2}]

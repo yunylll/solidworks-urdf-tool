@@ -287,7 +287,7 @@ class JobChecks(unittest.TestCase):
             "[23:58:40] Opening private copy of the prepared model...",
             "[23:59:50] Exporting part URDF and STL... (18)",
             "[23:59:51]   1/18 base_link",
-            "[00:01:00]   18/18 gripper_z",
+            "[00:01:00]   18/18 link_z",
             "Exporter notice: unrelated text",
             "[00:02:10] Validating the export...",
         ])
@@ -314,9 +314,9 @@ class JobChecks(unittest.TestCase):
         record = self.running_record(directory)
         write_json(directory / "result.json", record)
         write_json(directory / "worker.json", process_identity(tool_service.os.getpid()))
-        write_json(directory / "output" / "progress.json", {"stage": "export_meshes", "detail": "gripper_z", "current": 7, "total": 18, "stage_started_at": "2026-10-08T05:50:14.1234567Z", "updated_at": "2026-10-08T05:51:00.0000000Z"})
+        write_json(directory / "output" / "progress.json", {"stage": "export_meshes", "detail": "link_z", "current": 7, "total": 18, "stage_started_at": "2026-10-08T05:50:14.1234567Z", "updated_at": "2026-10-08T05:51:00.0000000Z"})
         progress = get_job(identifier)["progress"]
-        self.assertEqual(progress["summary"], "Exporting STL meshes: 7/18 (gripper_z)")
+        self.assertEqual(progress["summary"], "Exporting STL meshes: 7/18 (link_z)")
         self.assertGreater(progress["stage_elapsed_seconds"], 0)
         self.assertIn("elapsed_seconds", progress)
 

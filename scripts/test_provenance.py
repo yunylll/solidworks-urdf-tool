@@ -2,10 +2,10 @@
 
 The motivating case: a configuration with absolute joint origins (recompute_kinematics=false) taken
 from the 2026-10-08 CAD was exported again on 2026-10-22, after the assembly had been saved with
-the whole model moved by (5.000, 80.000, 1.000) mm. The old flow reported succeeded/passed; the
+the whole model moved by a few centimetres. The old flow reported succeeded/passed; the
 checks below show what it missed and that the new checks catch it. The real jobs are read from
-validation/jobs (or SW_URDF_JOBS_DATA), with their ids and hashes in the untracked
-validation/private-fixture.json (or SW_URDF_PRIVATE_FIXTURE); those tests are skipped without them.
+validation/jobs (or SW_URDF_JOBS_DATA), with their ids, hashes, joint names and the measured move in
+the untracked validation/private-fixture.json (see private_fixture.py); those tests are skipped without them.
 """
 import copy
 import hashlib
@@ -23,21 +23,28 @@ import numpy as np
 import trimesh
 
 from configuration import native_config, validate_config
+import private_fixture
 import provenance
 import tool_service
 from validate_export import link_world_transforms, validate
 
 ROOT = Path(__file__).resolve().parent.parent
 JOBS_DATA = Path(os.environ.get("SW_URDF_JOBS_DATA", ROOT / "validation" / "jobs"))
-PRIVATE_FILE = Path(os.environ.get("SW_URDF_PRIVATE_FIXTURE", ROOT / "validation" / "private-fixture.json"))
-# Real-job ids, model hashes and package name stay out of the repository.
-PRIVATE = json.loads(PRIVATE_FILE.read_text(encoding="utf-8")) if PRIVATE_FILE.is_file() else {}
+# Real-job ids, model hashes, package and joint names stay out of the repository.
+PRIVATE = private_fixture.load()
 OLD_JOB, NEW_JOB = PRIVATE.get("old_job", "0" * 32), PRIVATE.get("new_job", "1" * 32)
 OLD_SHA, NEW_SHA = PRIVATE.get("old_sha", "0" * 64), PRIVATE.get("new_sha", "1" * 64)
 SAME_VERSION_JOB = PRIVATE.get("same_version_job", "2" * 32)
 PACKAGE = PRIVATE.get("package", "robot_description")
 # The move of the real model between the two CAD versions, measured from the two exports.
-MOVE_MM = np.array([5.000, 80.000, 1.000])
+MOVE_MM = np.array(PRIVATE.get("move_mm", [5.0, 40.0, 1.0]))
+# Its continuous joint whose axis the move pushed off (the axis is +Y: only X and Z of the move count),
+# the joints on the Link it drives, one joint the move left alone and one edited between the exports.
+ROTOR = PRIVATE.get("rotor_joint", "rotor_joint")
+ON_ROTOR = set(PRIVATE.get("joints_on_rotor", []))
+UNCHANGED_JOINT = PRIVATE.get("unchanged_joint", "unchanged_joint")
+EDITED_JOINT = PRIVATE.get("edited_joint", "edited_joint")
+JOINT_COUNT, MESH_COUNT = PRIVATE.get("joint_count", 0), PRIVATE.get("mesh_count", 0)
 ARM = ROOT / "vendor" / "solidworks_urdf_exporter" / "examples" / "3_DOF_ARM" / "3_DOF_ARM_description"
 HAVE_JOBS = all((JOBS_DATA / job / "result.json").is_file() for job in (OLD_JOB, NEW_JOB))
 
@@ -74,7 +81,7 @@ class RealJobs(unittest.TestCase):
         cls.new_request = read(job_file(NEW_JOB, "request.json"))
         cls.old_config = read(job_file(OLD_JOB, "robot-config.json"))
         cls.new_config = read(job_file(NEW_JOB, "robot-config.json"))
-        # The expensive part: 2 x 18 STL meshes of about 100 MB.
+        # The expensive part: both exports' STL meshes, about 100 MB.
         cls.against_previous = validate(urdf(NEW_JOB), urdf(OLD_JOB), "changes")
 
     def test_old_flow_reported_success(self):
@@ -112,39 +119,40 @@ class RealJobs(unittest.TestCase):
         self.assertFalse(result["passed"])
         mismatch = [e for e in result["errors"] if e.startswith("Mesh/joint-origin mismatch")]
         self.assertEqual(len(mismatch), 1, result["errors"])
-        self.assertIn("gripper_rotor_joint", mismatch[0])
+        self.assertIn(ROTOR, mismatch[0])
         motion = result["reference_motion"]
         self.assertTrue(motion["mesh_joint_mismatch"])
         np.testing.assert_allclose(motion["common_mesh_shift_mm"], MOVE_MM, atol=0.01)
         self.assertEqual(motion["largest_joint_origin_shift_mm"], 0.0)
-        # The rotor axis is +Y: only the X and Z parts of the move push it off the gripper (about 7 mm).
-        self.assertAlmostEqual(motion["rotation_axis_offset_mm"]["gripper_rotor_joint"], float(np.hypot(MOVE_MM[0], MOVE_MM[2])), delta=0.01)
+        self.assertAlmostEqual(motion["rotation_axis_offset_mm"][ROTOR], float(np.hypot(MOVE_MM[0], MOVE_MM[2])), delta=0.01)
         # Intended configuration edits since the previous export are listed, not failed.
-        self.assertTrue(any("finger_left_joint" in c for c in result["reference_changes"]))
-        self.assertFalse(any("finger_left_joint" in e for e in result["errors"]))
+        self.assertTrue(any(EDITED_JOINT in c for c in result["reference_changes"]))
+        self.assertFalse(any(EDITED_JOINT in e for e in result["errors"]))
 
     def test_kinematics_comparison_names_the_translation(self):
         config, move = self.old_config, MOVE_MM / 1000
         unchanged = provenance.compare_kinematics(config, provenance.configured_joints(config))
         self.assertTrue(unchanged["passed"])
-        self.assertEqual(unchanged["compared"], 17)
+        self.assertEqual(unchanged["compared"], JOINT_COUNT)
         comparison = provenance.compare_kinematics(config, moved(config, move))
         self.assertFalse(comparison["passed"])
-        self.assertEqual(comparison["differing"], 17)
+        self.assertEqual(comparison["differing"], JOINT_COUNT)
         np.testing.assert_allclose(comparison["rigid_translation_mm"], MOVE_MM, atol=1e-6)
-        rotor = next(r for r in comparison["joints"] if r["joint"] == "gripper_rotor_joint")
+        rotor = next(r for r in comparison["joints"] if r["joint"] == ROTOR)
         self.assertAlmostEqual(rotor["axis_line_offset_mm"], float(np.hypot(MOVE_MM[0], MOVE_MM[2])), delta=1e-3)
         text = provenance.describe_differences(comparison)
-        self.assertIn("rigid translation (5.000, 80.000, 1.000) mm", text)
-        self.assertIn("gripper_rotor_joint (continuous): origin (1000.000, -1500.000, -200.000) -> (1005.000, -1420.000, -199.000) mm", text)
+        self.assertIn("rigid translation ({:.3f}, {:.3f}, {:.3f}) mm".format(*MOVE_MM), text)
+        joint = next(j for j in provenance.configured_joints(config) if j["name"] == ROTOR)
+        origin = np.array(joint["xyz"], dtype=float) * 1000
+        self.assertIn("{} ({}): origin ({:.3f}, {:.3f}, {:.3f}) -> ({:.3f}, {:.3f}, {:.3f}) mm".format(ROTOR, joint["type"], *origin, *(origin + MOVE_MM)), text)
 
     def test_kinematics_comparison_when_only_the_rotor_follows_the_cad(self):
-        # If the exporter kept the prismatic frames at the assembly origin, only the rotor (and the fingers on it) move.
-        rotor = next(j for j in provenance.configured_joints(self.old_config) if j["name"] == "gripper_rotor_joint")
+        # If the exporter kept the prismatic frames at the assembly origin, only the rotor (and the joints on it) move.
+        rotor = next(j for j in provenance.configured_joints(self.old_config) if j["name"] == ROTOR)
         comparison = provenance.compare_kinematics(self.old_config, moved(self.old_config, MOVE_MM / 1000, {rotor["child"]}))
-        self.assertEqual({r["joint"] for r in comparison["joints"] if r["exceeds_tolerance"]}, {"gripper_rotor_joint", "gripper_finger_left_joint", "gripper_finger_right_joint"})
+        self.assertEqual({r["joint"] for r in comparison["joints"] if r["exceeds_tolerance"]}, {ROTOR} | ON_ROTOR)
         np.testing.assert_allclose(comparison["rigid_translation_mm"], MOVE_MM, atol=1e-6)
-        self.assertIn("Unchanged: gantry_x_joint", provenance.describe_differences(comparison))
+        self.assertIn("Unchanged: " + UNCHANGED_JOINT, provenance.describe_differences(comparison))
 
 
 SYNTHETIC_JOBS = Path(__file__).resolve().parent / "testdata" / "provenance-jobs"
@@ -230,14 +238,14 @@ class RealCorrected(unittest.TestCase):
         motion = result["reference_motion"]
         self.assertFalse(motion["mesh_joint_mismatch"])
         np.testing.assert_allclose(motion["common_mesh_shift_mm"], MOVE_MM, atol=0.01)
-        self.assertLess(motion["rotation_axis_offset_mm"]["gripper_rotor_joint"], 0.01)
-        self.assertTrue(any(c.startswith("Every Link mesh (18) moved") for c in result["reference_changes"]), result["reference_changes"])
+        self.assertLess(motion["rotation_axis_offset_mm"][ROTOR], 0.01)
+        self.assertTrue(any(c.startswith(f"Every Link mesh ({MESH_COUNT}) moved") for c in result["reference_changes"]), result["reference_changes"])
 
     def test_against_the_wrong_export(self):
         result = validate(urdf(FIXED_JOB), urdf(NEW_JOB), "changes")
         self.assertTrue(result["passed"], result["errors"])
         self.assertIsNone(result["reference_motion"]["common_mesh_shift_mm"])
-        np.testing.assert_allclose(result["reference_motion"]["joint_origin_shift_mm"]["gripper_rotor_joint"], MOVE_MM, atol=0.01)
+        np.testing.assert_allclose(result["reference_motion"]["joint_origin_shift_mm"][ROTOR], MOVE_MM, atol=0.01)
 
 
 class KinematicsComparison(unittest.TestCase):
@@ -327,16 +335,16 @@ class JobProvenance(unittest.TestCase):
         self.assertNotIn("component_poses", read(directory / "native-config.json"))
 
     def test_pose_check_is_explained(self):
-        # The real-model move as the native check would report it for three Links' reference components.
-        move = MOVE_MM / 1000
+        # A whole-model move as the native check would report it for three Links' reference components.
+        move = np.array([5.0, 40.0, 1.0]) / 1000
         rows = [{"link": name, "component": f"{name}-1", "old_translation": list(start), "new_translation": list(np.array(start) + move), "distance_m": float(np.linalg.norm(move)), "angle_deg": 0.0, "exceeds_tolerance": True}
-                for name, start in (("base_link", [2.1, -2.2, -0.2]), ("gantry_x", [2.4, -1.5, 0.0]), ("gripper_rotor", [2.41, -1.76, -0.19]))]
-        rows.append({"link": "cuvette_1", "component": "cuvette-1", "old_translation": [1, 1, 1], "new_translation": [1, 1, 1], "distance_m": 0.0, "angle_deg": 0.0, "exceeds_tolerance": False})
-        text = provenance.describe_pose_changes({"rows": rows, "not_compared": ["finger_slide"], "exceeded": True, "tolerance_m": 0.0001, "tolerance_deg": 0.1})
+                for name, start in (("base_link", [1.0, -1.0, 0.0]), ("slide_x", [1.2, -0.5, 0.1]), ("rotor", [1.3, -0.6, -0.1]))]
+        rows.append({"link": "tray_1", "component": "tray-1", "old_translation": [1, 1, 1], "new_translation": [1, 1, 1], "distance_m": 0.0, "angle_deg": 0.0, "exceeds_tolerance": False})
+        text = provenance.describe_pose_changes({"rows": rows, "not_compared": ["cover_slide"], "exceeded": True, "tolerance_m": 0.0001, "tolerance_deg": 0.1})
         self.assertIn("3 of 4 Links", text)
-        self.assertIn("same rigid translation (5.000, 80.000, 1.000) mm", text)
-        self.assertIn("Not moved: cuvette_1", text)
-        self.assertIn("Not compared (Link or its first component changed): finger_slide", text)
+        self.assertIn("same rigid translation (5.000, 40.000, 1.000) mm", text)
+        self.assertIn("Not moved: tray_1", text)
+        self.assertIn("Not compared (Link or its first component changed): cover_slide", text)
         rows[1]["angle_deg"] = 2.0
         self.assertNotIn("rigid translation", provenance.describe_pose_changes({"rows": rows, "exceeded": True, "tolerance_m": 0.0001, "tolerance_deg": 0.1}))
 

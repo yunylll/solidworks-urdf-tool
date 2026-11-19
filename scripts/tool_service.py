@@ -557,7 +557,7 @@ class ActivityMonitor:
         self.last_poll = now
         if gap > SUSPEND_GAP_SECONDS:
             # Sleep or standby froze SolidWorks and this worker alike: move the clocks past it. Before this
-            # rule, a check (job a0000007) was stopped as stalled for "3560 s" right after such a pause.
+            # rule, a check was stopped as stalled for "3560 s" right after such a pause.
             self.suspended_seconds += gap
             self.suspensions.append({"resumed_at": stamp(), "seconds": round(gap, 1)})
             self.last_activity += gap

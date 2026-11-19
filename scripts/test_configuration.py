@@ -3,8 +3,10 @@ import json
 from pathlib import Path
 import unittest
 from configuration import check_against_model, expand_subassemblies, native_config, needs_postprocess, skeleton_config, validate_config
+import private_fixture
 
 ROOT = Path(__file__).resolve().parent.parent
+PRIVATE = private_fixture.load()
 
 
 class ConfigChecks(unittest.TestCase):
@@ -100,10 +102,10 @@ class ConfigChecks(unittest.TestCase):
         self.assertTrue(validate_config(expanded)["passed"])
 
     def test_exclude_hidden_bodies(self):
-        self.config["exclude_hidden_bodies"] = ["gantry_z1_p05.SLDPRT", "gantry_z2_p05.sldprt"]
+        self.config["exclude_hidden_bodies"] = ["bracket_left.SLDPRT", "bracket_right.sldprt"]
         self.assertTrue(validate_config(self.config)["passed"])
-        self.assertEqual(native_config(self.config)["exclude_hidden_bodies"], ["gantry_z1_p05.SLDPRT", "gantry_z2_p05.sldprt"], "the native exporter applies it")
-        for wrong in (["gan\\gantry_z1_p05.SLDPRT"], ["gantry_z1_asm.SLDASM"], "gantry_z1_p05.SLDPRT", ["a.SLDPRT", "A.sldprt"]):
+        self.assertEqual(native_config(self.config)["exclude_hidden_bodies"], ["bracket_left.SLDPRT", "bracket_right.sldprt"], "the native exporter applies it")
+        for wrong in (["axis\\bracket_left.SLDPRT"], ["axis_z.SLDASM"], "bracket_left.SLDPRT", ["a.SLDPRT", "A.sldprt"]):
             self.config["exclude_hidden_bodies"] = wrong
             self.assertFalse(validate_config(self.config)["passed"], wrong)
 
@@ -130,7 +132,7 @@ class ModelChecks(unittest.TestCase):
         self.assertEqual(check_against_model(self.config, ARM_COMPONENTS)["errors"], [])
 
     def test_all_problems_at_once(self):
-        # Jobs a0000001/a0000004 (typo, failed seven times in CAD), a0000002 (part in no Link), plus an unknown hidden-body file.
+        # A typo that used to fail only in CAD, a part in no Link, plus an unknown hidden-body file.
         self.config["links"][1]["components"] = ["3_DOF_ARM_SEGMNT-1"]
         self.config["links"][-1]["components"] = []
         self.config["links"][-1]["frame_only"] = True
@@ -182,9 +184,15 @@ class ModelChecks(unittest.TestCase):
 
 
 class HistoricalJobs(unittest.TestCase):
-    """Configurations that failed in the CAD stage of earlier jobs now fail before it, with every problem listed."""
+    """Configurations that failed in the CAD stage of earlier jobs now fail before it, with every problem listed.
 
-    def job(self, prefix):
+    The jobs are the maintainer's, named under "historical_jobs" in the untracked private fixture (see private_fixture.py).
+    """
+
+    def job(self, role):
+        prefix = PRIVATE.get("historical_jobs", {}).get(role)
+        if not prefix:
+            self.skipTest(f"no {role} job in the private fixture")
         found = sorted((ROOT / "validation" / "jobs").glob(prefix + "*"))
         if not found or not (found[0] / "robot-config.json").is_file():
             self.skipTest(f"job {prefix} is not on this computer")
@@ -192,22 +200,22 @@ class HistoricalJobs(unittest.TestCase):
         return json.loads((found[0] / "robot-config.json").read_text(encoding="utf-8-sig")), record["bridge"]
 
     def test_misspelled_component(self):
-        config, bridge = self.job("a0000001")
+        config, bridge = self.job("misspelled_component")
         result = check_against_model(config, bridge["components"])
         self.assertIn("Link prox_link names component '3_DOF_ARM_SEGMNT-1', which is not in the assembly. Similar names: 3_DOF_ARM_SEGMENT-1", result["errors"][0])
 
     def test_unassigned_part(self):
-        config, bridge = self.job("a0000002")
+        config, bridge = self.job("unassigned_part")
         components = [dict(c, solid=True) if c["name"] in bridge["unassignedComponents"] else c for c in bridge["components"]]
         result = check_against_model(config, components)
         self.assertTrue(any("3_DOF_ARM_END_EFFECTOR-1" in e and "not assigned to any Link" in e for e in result["errors"]), result)
 
     def test_joint_types(self):
-        config, bridge = self.job("a0000003")
+        config, bridge = self.job("joint_types")
         first = {l["joint"]["name"]: l["components"][0] for l in config["links"] if l.get("joint")}
         result = check_against_model(config, bridge["components"], bridge["detectedJointTypes"], first)
         mismatched = sorted(i["where"].split(" ")[1] for i in result["issues"] if i["kind"] == "joint_type_mismatch")
-        self.assertEqual(mismatched, sorted(["upper_y_joint", "upper_x_joint", "stir_z_joint", "stir_rotor_joint", "lower_y_joint", "lower_x_joint", "camera_z_joint", "light_joint"]))
+        self.assertEqual(mismatched, sorted(PRIVATE["joint_type_mismatches"]))
         self.assertTrue(all(i["severity"] == "error" and i["actual"] == "fixed" for i in result["issues"] if i["kind"] == "joint_type_mismatch"))
 
 
